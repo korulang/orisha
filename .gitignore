@@ -1,0 +1,41 @@
+# Zig build artifacts
+zig-cache/
+zig-out/
+.zig-cache/
+
+# Koru compiler output
+*.zig
+backend.zig
+backend_output_emitted.zig
+build.zig
+build_backend.zig
+
+# Executables
+*.exe
+*.out
+a.out
+main
+server
+
+# Node.js (for examples that may use npm)
+node_modules/
+package-lock.json
+pnpm-lock.yaml
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Profiling data
+*.prof
+profile.json
