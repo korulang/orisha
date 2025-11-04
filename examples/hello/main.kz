@@ -1,0 +1,15 @@
+// Hello World HTTP server using Orisha
+~import "$orisha/eshu"
+
+// Define a GET route at /hello
+~orisha.eshu:route(method: "GET", path: "/hello")
+  http_context ctx |>
+    ~orisha.eshu:send_text(ctx, "Hello, World!")
+
+// Define a GET route at /
+~orisha.eshu:route(method: "GET", path: "/")
+  http_context ctx |>
+    ~orisha.eshu:send_text(ctx, "Welcome to Orisha!")
+
+// Start the HTTP server
+~orisha.eshu:listen(port: 3000)

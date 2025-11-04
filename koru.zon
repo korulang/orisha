@@ -4,9 +4,9 @@
     .description = "Web framework for Koru - inspired by Yoruba spiritual traditions",
     .paths = .{
         // Main framework path - allows ~import "$orisha/eshu", "$orisha/oya", etc.
-        .orisha = ".",
+        .orisha = "./src",
 
-        // Standard library (points to Koru's koru_std)
-        .std = "{KORU_ROOT}/koru_std",
+        // Standard library (relative path to Koru's koru_std)
+        .std = "../koru/koru_std",
     },
 }
