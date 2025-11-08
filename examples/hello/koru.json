@@ -1,0 +1,8 @@
+{
+  "name": "hello",
+  "version": "0.1.0",
+  "paths": {
+    "orisha": "../../src",
+    "std": "../../../koru/koru_std"
+  }
+}

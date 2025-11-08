@@ -1,15 +1,31 @@
 // Hello World HTTP server using Orisha
 ~import "$orisha/eshu"
+~import "$std/build"
 
 // Define a GET route at /hello
 ~orisha.eshu:route(method: "GET", path: "/hello")
-  http_context ctx |>
-    ~orisha.eshu:send_text(ctx, "Hello, World!")
+  | http_context ctx |>
+    orisha.eshu:send_text(ctx, "Hello, World!")
 
 // Define a GET route at /
 ~orisha.eshu:route(method: "GET", path: "/")
-  http_context ctx |>
-    ~orisha.eshu:send_text(ctx, "Welcome to Orisha!")
+  | http_context ctx |>
+    orisha.eshu:send_text(ctx, "Welcome to Orisha!")
 
 // Start the HTTP server
 ~orisha.eshu:listen(port: 3000)
+
+// ============================================================================
+// BUILD ORCHESTRATION using declarative build:step
+// ============================================================================
+
+// Step 1: Compile the backend
+~std.build:step(name: "compile") {
+    zig build-exe backend_output_emitted.zig -femit-bin=backend_tmp
+}
+
+// Step 2: Run the server (depends on compile)
+~[depends_on("compile")]
+std.build:step(name: "run") {
+    ./backend_tmp
+}

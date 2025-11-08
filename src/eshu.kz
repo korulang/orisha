@@ -1,0 +1,48 @@
+// Eshu - HTTP routing for Orisha
+// Guardian of the crossroads, handler of HTTP requests
+
+// ============================================================================
+// Pure Zig Types (before ~ leader)
+// ============================================================================
+
+const std = @import("std");
+
+// HTTP context struct - holds request/response data
+pub const HttpContext = struct {
+    method: []const u8,
+    path: []const u8,
+    // TODO: Add headers, body, response builder, etc.
+};
+
+// ============================================================================
+// Koru Events (after ~ leader)
+// ============================================================================
+~[comptime]
+
+// HTTP route declaration - collected at compile time
+~[comptime|norun]pub event route {
+    method: []const u8,
+    path: []const u8
+}
+| http_context { ctx: HttpContext }
+
+// Send text response
+~pub event send_text {
+    ctx: HttpContext,
+    content: []const u8
+}
+
+~proc send_text {
+    // TODO: Implement response sending
+    // For now, just a placeholder
+}
+
+// Start HTTP server
+~pub event listen {
+    port: u16
+}
+
+~proc listen {
+    // TODO: Implement server startup
+    // For now, just a placeholder
+}
