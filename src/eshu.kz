@@ -19,6 +19,8 @@ pub const HttpContext = struct {
 // ============================================================================
 ~[comptime]
 
+~import "$std/http"
+
 // HTTP route declaration - collected at compile time
 ~[comptime|norun]pub event route {
     method: []const u8,
@@ -26,23 +28,113 @@ pub const HttpContext = struct {
 }
 | http_context { ctx: HttpContext }
 
-// Send text response
+// Send text response - builds HTTP response and returns it
 ~pub event send_text {
     ctx: HttpContext,
     content: []const u8
 }
+| response { data: []const u8 }
 
 ~proc send_text {
-    // TODO: Implement response sending
-    // For now, just a placeholder
+    // Build simple HTTP 200 response
+    const allocator = std.heap.page_allocator;
+    const response = std.fmt.allocPrint(allocator,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{s}",
+        .{content.len, content}
+    ) catch "HTTP/1.1 500 Internal Server Error\r\n\r\nError";
+
+    return .{ .response = .{ .data = response } };
 }
 
-// Start HTTP server
+// Start HTTP server - real TCP implementation
 ~pub event listen {
     port: u16
 }
+| listening { server: *std.net.Server }
+| failed { msg: []const u8 }
 
 ~proc listen {
-    // TODO: Implement server startup
-    // For now, just a placeholder
+    const allocator = std.heap.page_allocator;
+    const address = std.net.Address.parseIp("127.0.0.1", port) catch {
+        return .{ .failed = .{ .msg = "Invalid address" } };
+    };
+
+    const server = address.listen(.{}) catch {
+        return .{ .failed = .{ .msg = "Failed to listen" } };
+    };
+
+    const server_ptr = allocator.create(std.net.Server) catch {
+        return .{ .failed = .{ .msg = "Failed to allocate server" } };
+    };
+    server_ptr.* = server;
+
+    std.debug.print("🌐 Orisha HTTP server listening on http://127.0.0.1:{}\n", .{port});
+    return .{ .listening = .{ .server = server_ptr } };
+}
+
+// Accept a connection
+~pub event accept { server: *std.net.Server }
+| connection { conn: *std.net.Server.Connection, server: *std.net.Server }
+| failed { msg: []const u8, server: *std.net.Server }
+
+~proc accept {
+    const conn = server.accept() catch {
+        return .{ .failed = .{ .msg = "Accept failed", .server = server } };
+    };
+
+    const allocator = std.heap.page_allocator;
+    const conn_ptr = allocator.create(std.net.Server.Connection) catch {
+        return .{ .failed = .{ .msg = "Failed to allocate connection", .server = server } };
+    };
+    conn_ptr.* = conn;
+
+    std.debug.print("📥 Connection accepted\n", .{});
+    return .{ .connection = .{ .conn = conn_ptr, .server = server } };
+}
+
+// Read data from connection
+~pub event read { conn: *std.net.Server.Connection }
+| data { bytes: []const u8, conn: *std.net.Server.Connection }
+| closed { conn: *std.net.Server.Connection }
+
+~proc read {
+    const allocator = std.heap.page_allocator;
+    var buffer: [4096]u8 = undefined; // Larger buffer for HTTP requests
+    const n = conn.stream.read(&buffer) catch {
+        return .{ .closed = .{ .conn = conn } };
+    };
+
+    if (n == 0) {
+        return .{ .closed = .{ .conn = conn } };
+    }
+
+    const bytes = allocator.dupe(u8, buffer[0..n]) catch {
+        return .{ .closed = .{ .conn = conn } };
+    };
+
+    std.debug.print("📨 Read {} bytes\n", .{n});
+    return .{ .data = .{ .bytes = bytes, .conn = conn } };
+}
+
+// Write data to connection
+~pub event write { conn: *std.net.Server.Connection, data: []const u8 }
+| sent { conn: *std.net.Server.Connection }
+| failed { msg: []const u8, conn: *std.net.Server.Connection }
+
+~proc write {
+    _ = conn.stream.writeAll(data) catch {
+        return .{ .failed = .{ .msg = "Write failed", .conn = conn } };
+    };
+    std.debug.print("📤 Sent {} bytes\n", .{data.len});
+    return .{ .sent = .{ .conn = conn } };
+}
+
+// Close connection
+~pub event close { conn: *std.net.Server.Connection }
+| done {}
+
+~proc close {
+    conn.stream.close();
+    std.debug.print("🔌 Connection closed\n", .{});
+    return .{ .done = .{} };
 }

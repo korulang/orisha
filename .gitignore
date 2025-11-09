@@ -9,6 +9,7 @@ backend.zig
 backend_output_emitted.zig
 build.zig
 build_backend.zig
+backend_tmp
 
 # Executables
 *.exe

@@ -1,19 +1,69 @@
 // Hello World HTTP server using Orisha
 ~import "$orisha/eshu"
 ~import "$std/build"
+~import "$std/http"
+
+const std = @import("std");
 
 // Define a GET route at /hello
 ~orisha.eshu:route(method: "GET", path: "/hello")
   | http_context ctx |>
-    orisha.eshu:send_text(ctx, "Hello, World!")
+    orisha.eshu:send_text(ctx: ctx, content: "Hello, World!")
 
 // Define a GET route at /
 ~orisha.eshu:route(method: "GET", path: "/")
   | http_context ctx |>
-    orisha.eshu:send_text(ctx, "Welcome to Orisha!")
+    orisha.eshu:send_text(ctx: ctx, content: "Welcome to Orisha!")
 
-// Start the HTTP server
+// Server loop - listen, accept, handle request, respond, repeat
 ~orisha.eshu:listen(port: 3000)
+| listening l |> #accept_loop orisha.eshu:accept(server: l.server)
+    | connection c |> orisha.eshu:read(conn: c.conn)
+        | data d |> std.http:parse_request(data: d.bytes)
+            | request req |> handle_request(method: req.method, path: req.path, conn: c.conn)
+                | responded |> orisha.eshu:close(conn: responded.conn)
+                    | done |> @accept_loop(server: c.server)
+            | invalid err |> send_400(conn: c.conn, msg: err.msg)
+                | sent s |> orisha.eshu:close(conn: s.conn)
+                    | done |> @accept_loop(server: c.server)
+        | closed |> @accept_loop(server: c.server)
+    | failed f |> @accept_loop(server: f.server)
+| failed err |> _
+
+// Handle an HTTP request by matching routes
+~event handle_request { method: []const u8, path: []const u8, conn: *std.net.Server.Connection }
+| responded { conn: *std.net.Server.Connection }
+
+~proc handle_request {
+    // Simple route matching
+    if (std.mem.eql(u8, path, "/")) {
+        const response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 18\r\n\r\nWelcome to Orisha!";
+        _ = conn.stream.writeAll(response) catch {};
+        return .{ .responded = .{ .conn = conn } };
+    }
+
+    if (std.mem.eql(u8, path, "/hello")) {
+        const response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 13\r\n\r\nHello, World!";
+        _ = conn.stream.writeAll(response) catch {};
+        return .{ .responded = .{ .conn = conn } };
+    }
+
+    // 404 Not Found
+    const response = "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 9\r\n\r\nNot Found";
+    _ = conn.stream.writeAll(response) catch {};
+    return .{ .responded = .{ .conn = conn } };
+}
+
+// Send 400 Bad Request
+~event send_400 { conn: *std.net.Server.Connection, msg: []const u8 }
+| sent { conn: *std.net.Server.Connection }
+
+~proc send_400 {
+    const response = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 11\r\n\r\nBad Request";
+    _ = conn.stream.writeAll(response) catch {};
+    std.debug.print("❌ Bad request: {s}\n", .{msg});
+    return .{ .sent = .{ .conn = conn } };
+}
 
 // ============================================================================
 // BUILD ORCHESTRATION using declarative build:step
