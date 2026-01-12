@@ -147,37 +147,17 @@ const routes = @import("generated/routes.zig");
 | not_found { conn: *Connection[open] }
 
 ~proc send_static {
-    // Lookup route from generated table
-    if (routes.lookup("GET", path)) |route| {
-        // Build response with etag and content-type from generated manifest
-        var response_buf: [16384]u8 = undefined;
-        const response = std.fmt.bufPrint(&response_buf,
-            "HTTP/1.1 200 OK\r\n" ++
-            "Content-Type: {s}\r\n" ++
-            "Content-Length: {}\r\n" ++
-            "ETag: {s}\r\n" ++
-            "Connection: close\r\n" ++
-            "\r\n",
-            .{ route.content_type, route.content_length, route.etag }
-        ) catch {
-            return .{ .not_found = .{ .conn = conn } };
-        };
-
-        // Send headers
+    // Lookup route - returns complete HTTP response blob (headers + body)
+    if (routes.lookup("GET", path)) |response| {
+        // ONE SYSCALL. ZERO FORMATTING. JUST DUMP THE BLOB.
         _ = conn.stream.writeAll(response) catch {
             return .{ .not_found = .{ .conn = conn } };
         };
-
-        // Send body (embedded at compile time!)
-        _ = conn.stream.writeAll(route.content) catch {
-            return .{ .not_found = .{ .conn = conn } };
-        };
-
         return .{ .sent = .{ .conn = conn } };
     }
 
     // 404 for anything else
-    const not_found_response = "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found";
+    const not_found_response = "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
     _ = conn.stream.writeAll(not_found_response) catch {};
     return .{ .not_found = .{ .conn = conn } };
 }
