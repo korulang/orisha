@@ -1,0 +1,9 @@
+{
+    "name": "orisha",
+    "version": "0.1.0",
+    "description": "Compile-time HTTP server for Koru",
+    "paths": {
+        "std": "../koru/koru_std",
+        "orisha": "src"
+    }
+}

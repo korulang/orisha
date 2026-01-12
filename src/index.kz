@@ -3,6 +3,8 @@
 // The index.html file is embedded INTO THE BINARY at compile time.
 // Zero disk I/O at runtime. The bytes are just... there.
 
+~import "$orisha/router"
+
 const std = @import("std");
 
 // ============================================================================
@@ -17,6 +19,33 @@ pub const Connection = struct {
     stream: std.net.Stream,
     address: std.net.Address,
 };
+
+// ============================================================================
+// DECLARATIVE ROUTES
+// ============================================================================
+
+~[norun]pub event route { route: Expression, source: Source }
+
+~route(GET /) {
+    "file": "public/index.html"
+}
+
+~route(GET /about) {
+    "file": "public/about.html"
+}
+
+~route(GET /api/health) {
+    "content-type": "application/json",
+    "body": "{\"status\": \"ok\"}"
+}
+
+// ============================================================================
+// ROUTE COLLECTOR (comptime)
+// ============================================================================
+
+// Invoke the collector from the module at compile time
+~orisha.router:collect_routes()
+| done |> _
 
 // ============================================================================
 // COMPILE-TIME EMBEDDED CONTENT
