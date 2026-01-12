@@ -1,12 +1,9 @@
 .{
     .name = "orisha",
     .version = "0.1.0",
-    .description = "Web framework for Koru - inspired by Yoruba spiritual traditions",
+    .description = "Compile-time HTTP server for Koru",
     .paths = .{
-        // Main framework path - allows ~import "$orisha/eshu", "$orisha/oya", etc.
-        .orisha = "./src",
-
-        // Standard library (relative path to Koru's koru_std)
+        // Standard library
         .std = "../koru/koru_std",
     },
 }

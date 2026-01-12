@@ -40,3 +40,5 @@ Thumbs.db
 # Profiling data
 *.prof
 profile.json
+orisha
+output_emitted.zig
