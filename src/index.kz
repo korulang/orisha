@@ -36,7 +36,7 @@ pub const Connection = struct {
 
 ~route(GET /api/health) {
     "content-type": "application/json",
-    "body": "{\"status\": \"ok\"}"
+    "body": "OK"
 }
 
 // ============================================================================
@@ -48,20 +48,12 @@ pub const Connection = struct {
 | done |> _
 
 // ============================================================================
-// COMPILE-TIME EMBEDDED CONTENT
+// GENERATED ROUTES - AUTO-GENERATED AT COMPILE TIME
 // ============================================================================
 
-// This is THE MAGIC: @embedFile runs at Zig compile time
-// The entire HTML file becomes const bytes in the binary
-const INDEX_HTML = @embedFile("public/index.html");
-
-// Pre-computed at compile time!
-const INDEX_RESPONSE = "HTTP/1.1 200 OK\r\n" ++
-    "Content-Type: text/html; charset=utf-8\r\n" ++
-    "Content-Length: " ++ std.fmt.comptimePrint("{}", .{INDEX_HTML.len}) ++ "\r\n" ++
-    "Connection: close\r\n" ++
-    "\r\n" ++
-    INDEX_HTML;
+// The route collector walks the AST, reads files, computes etags,
+// and generates this module with all content embedded
+const routes = @import("generated/routes.zig");
 
 // ============================================================================
 // MAIN FLOW
@@ -103,7 +95,7 @@ const INDEX_RESPONSE = "HTTP/1.1 200 OK\r\n" ++
     server_ptr.* = .{ .inner = server };
 
     std.debug.print("Orisha listening on http://0.0.0.0:{}\n", .{port});
-    std.debug.print("Serving {} bytes of embedded HTML\n", .{INDEX_HTML.len});
+    std.debug.print("Serving {} routes with compile-time embedded content\n", .{routes.routes.len});
     return .{ .listening = .{ .server = server_ptr } };
 }
 
@@ -155,12 +147,32 @@ const INDEX_RESPONSE = "HTTP/1.1 200 OK\r\n" ++
 | not_found { conn: *Connection[open] }
 
 ~proc send_static {
-    // Route matching - could be a compile-time generated table
-    if (std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/index.html")) {
-        // Send the pre-computed response (headers + body, all compile-time!)
-        _ = conn.stream.writeAll(INDEX_RESPONSE) catch {
+    // Lookup route from generated table
+    if (routes.lookup("GET", path)) |route| {
+        // Build response with etag and content-type from generated manifest
+        var response_buf: [16384]u8 = undefined;
+        const response = std.fmt.bufPrint(&response_buf,
+            "HTTP/1.1 200 OK\r\n" ++
+            "Content-Type: {s}\r\n" ++
+            "Content-Length: {}\r\n" ++
+            "ETag: {s}\r\n" ++
+            "Connection: close\r\n" ++
+            "\r\n",
+            .{ route.content_type, route.content_length, route.etag }
+        ) catch {
             return .{ .not_found = .{ .conn = conn } };
         };
+
+        // Send headers
+        _ = conn.stream.writeAll(response) catch {
+            return .{ .not_found = .{ .conn = conn } };
+        };
+
+        // Send body (embedded at compile time!)
+        _ = conn.stream.writeAll(route.content) catch {
+            return .{ .not_found = .{ .conn = conn } };
+        };
+
         return .{ .sent = .{ .conn = conn } };
     }
 
