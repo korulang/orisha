@@ -125,8 +125,8 @@ const AsyncConn = struct {
     var empty_events: [0]Kevent = undefined;
     _ = c.kevent(kq, &changes, 1, &empty_events, 0, null);
 
-    std.debug.print("Orisha ASYNC listening on http://0.0.0.0:{}\n", .{port});
-    std.debug.print("Serving {} routes with kqueue event loop\n", .{routes.routes.len});
+    std.debug.print("Orisha KEEPALIVE listening on http://0.0.0.0:{}\n", .{port});
+    std.debug.print("Serving {} routes with kqueue + TCP_NODELAY + keep-alive\n", .{routes.routes.len});
 
     // Connection pool
     var connections: [MAX_CONNECTIONS]?AsyncConn = .{null} ** MAX_CONNECTIONS;
@@ -146,6 +146,10 @@ const AsyncConn = struct {
                 while (true) {
                     const conn = server.accept() catch break;
                     const client_fd = conn.stream.handle;
+
+                    // TCP_NODELAY on client - critical for latency!
+                    const enable: i32 = 1;
+                    posix.setsockopt(client_fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, std.mem.asBytes(&enable)) catch {};
 
                     // Make client socket non-blocking
                     const client_flags = posix.fcntl(client_fd, posix.F.GETFL, 0) catch 0;
@@ -207,9 +211,27 @@ const AsyncConn = struct {
                         conn.state = .writing;
 
                         // Write response immediately (non-blocking)
-                        _ = posix.write(fd, conn.response.?) catch {};
-                        posix.close(fd);
-                        connections[slot] = null;
+                        _ = posix.write(fd, conn.response.?) catch {
+                            posix.close(fd);
+                            connections[slot] = null;
+                            continue;
+                        };
+
+                        // Keep-alive: re-register for next request
+                        conn.state = .reading;
+                        conn.response = null;
+                        var keep_alive_event: [1]Kevent = .{
+                            .{
+                                .ident = @intCast(fd),
+                                .filter = c.EVFILT.READ,
+                                .flags = c.EV.ADD | c.EV.ONESHOT,
+                                .fflags = 0,
+                                .data = 0,
+                                .udata = undefined,
+                            },
+                        };
+                        var keep_alive_empty: [0]Kevent = undefined;
+                        _ = c.kevent(kq, &keep_alive_event, 1, &keep_alive_empty, 0, null);
                     }
                 }
             }

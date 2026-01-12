@@ -211,7 +211,7 @@ fn buildHttpResponse(allocator: std.mem.Allocator, content: []const u8, content_
     try response.appendSlice(allocator, etag_buf[0..16]);  // First 16 chars of hash
     try response.appendSlice(allocator, "\"\r\n");
 
-    try response.appendSlice(allocator, "Connection: close\r\n");
+    try response.appendSlice(allocator, "Connection: keep-alive\r\n");
     try response.appendSlice(allocator, "\r\n");
 
     // Body
