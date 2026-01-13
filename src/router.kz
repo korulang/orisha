@@ -6,11 +6,23 @@
 // 3. Reads file content for file routes
 // 4. Computes SHA256 etags for cache validation
 // 5. Generates src/generated/routes.zig with all processed routes
+// 6. Compresses compressible content with gzip at compile time
+
+~import "$std/compiler"
+
+// Link zlib for compile-time compression
+~std.compiler:requires {
+    exe.linkSystemLibrary("z");
+    exe.linkLibC();
+}
 
 const std = @import("std");
 const ast = @import("ast");
 const Program = ast.Program;
 const Sha256 = std.crypto.hash.sha2.Sha256;
+const zlib = @cImport({
+    @cInclude("zlib.h");
+});
 
 // ============================================================================
 // DATA STRUCTURES
@@ -113,6 +125,17 @@ const ProcessedRoute = struct {
                     .response = http_resp.response,
                     .etag = http_resp.etag,
                 }) catch continue;
+
+                // Also map / to /index.html for directory roots
+                if (std.mem.eql(u8, entry.path, "index.html") and std.mem.eql(u8, path, "/")) {
+                    std.debug.print("    Route: / -> {s} (index alias)\n", .{file_path});
+                    routes.append(allocator, .{
+                        .method = method,
+                        .path = "/",
+                        .response = http_resp.response,
+                        .etag = http_resp.etag,
+                    }) catch continue;
+                }
             }
 
         } else if (config.file) |file_path| {
@@ -241,11 +264,62 @@ const HttpResponse = struct {
     etag: []const u8,
 };
 
+fn isCompressible(content_type: []const u8) bool {
+    // Compress text-based content types
+    if (std.mem.startsWith(u8, content_type, "text/")) return true;
+    if (std.mem.startsWith(u8, content_type, "application/javascript")) return true;
+    if (std.mem.startsWith(u8, content_type, "application/json")) return true;
+    if (std.mem.startsWith(u8, content_type, "image/svg")) return true;
+    return false;
+}
+
+fn gzipCompress(allocator: std.mem.Allocator, content: []const u8) ?[]const u8 {
+    if (content.len < 100) return null;  // Don't bother compressing tiny files
+
+    const max_output = zlib.compressBound(@intCast(content.len));
+    const output = allocator.alloc(u8, max_output) catch return null;
+
+    var strm: zlib.z_stream = std.mem.zeroes(zlib.z_stream);
+    strm.next_in = @constCast(content.ptr);
+    strm.avail_in = @intCast(content.len);
+    strm.next_out = output.ptr;
+    strm.avail_out = @intCast(output.len);
+
+    // windowBits = 15 + 16 = 31 for gzip format
+    if (zlib.deflateInit2(&strm, zlib.Z_DEFAULT_COMPRESSION, zlib.Z_DEFLATED, 15 + 16, 8, zlib.Z_DEFAULT_STRATEGY) != zlib.Z_OK) {
+        allocator.free(output);
+        return null;
+    }
+
+    const result = zlib.deflate(&strm, zlib.Z_FINISH);
+    const compressed_size = output.len - strm.avail_out;
+    _ = zlib.deflateEnd(&strm);
+
+    if (result != zlib.Z_STREAM_END) {
+        allocator.free(output);
+        return null;
+    }
+
+    // Only use compressed if it's actually smaller
+    if (compressed_size >= content.len) {
+        allocator.free(output);
+        return null;
+    }
+
+    return allocator.realloc(output, compressed_size) catch output[0..compressed_size];
+}
+
 fn buildHttpResponse(allocator: std.mem.Allocator, content: []const u8, content_type: []const u8) !HttpResponse {
-    // Compute etag
+    // Compute etag on ORIGINAL content (before compression)
     var etag_buf: [64]u8 = undefined;
     computeEtag(content, &etag_buf);
-    const etag = try allocator.dupe(u8, etag_buf[0..16]);  // First 16 chars of hash
+    const etag = try allocator.dupe(u8, etag_buf[0..16]);
+
+    // Try to compress if content type is compressible
+    const use_gzip = isCompressible(content_type);
+    const compressed = if (use_gzip) gzipCompress(allocator, content) else null;
+    const body = compressed orelse content;
+    const is_compressed = compressed != null;
 
     // Build complete HTTP response: headers + body as ONE BLOB
     var response: std.ArrayList(u8) = .empty;
@@ -259,9 +333,13 @@ fn buildHttpResponse(allocator: std.mem.Allocator, content: []const u8, content_
     try response.appendSlice(allocator, content_type);
     try response.appendSlice(allocator, "\r\n");
 
+    if (is_compressed) {
+        try response.appendSlice(allocator, "Content-Encoding: gzip\r\n");
+    }
+
     try response.appendSlice(allocator, "Content-Length: ");
     var len_buf: [20]u8 = undefined;
-    const len_str = std.fmt.bufPrint(&len_buf, "{}", .{content.len}) catch "0";
+    const len_str = std.fmt.bufPrint(&len_buf, "{}", .{body.len}) catch "0";
     try response.appendSlice(allocator, len_str);
     try response.appendSlice(allocator, "\r\n");
 
@@ -272,8 +350,8 @@ fn buildHttpResponse(allocator: std.mem.Allocator, content: []const u8, content_
     try response.appendSlice(allocator, "Connection: keep-alive\r\n");
     try response.appendSlice(allocator, "\r\n");
 
-    // Body
-    try response.appendSlice(allocator, content);
+    // Body (compressed or original)
+    try response.appendSlice(allocator, body);
 
     return .{ .response = response.items, .etag = etag };
 }
@@ -334,16 +412,22 @@ fn generateRoutesFile(allocator: std.mem.Allocator, routes: []const ProcessedRou
         // Route header
         try appendFmt(allocator, &output, "    .{{\n        .method = \"{s}\",\n        .path = \"{s}\",\n        .etag = \"{s}\",\n        .response = ", .{ route.method, route.path, route.etag });
 
-        // Response blob as escaped string
+        // Response blob as escaped string (handles binary gzip data)
         try output.append(allocator, '"');
-        for (route.response) |c| {
-            switch (c) {
+        for (route.response) |byte| {
+            switch (byte) {
                 '\n' => try output.appendSlice(allocator, "\\n"),
                 '\r' => try output.appendSlice(allocator, "\\r"),
                 '\t' => try output.appendSlice(allocator, "\\t"),
                 '"' => try output.appendSlice(allocator, "\\\""),
                 '\\' => try output.appendSlice(allocator, "\\\\"),
-                else => try output.append(allocator, c),
+                0x20...0x21, 0x23...0x5b, 0x5d...0x7e => try output.append(allocator, byte),  // printable (except " and \)
+                else => {
+                    // Escape as \xNN for binary bytes
+                    var hex_buf: [4]u8 = undefined;
+                    _ = std.fmt.bufPrint(&hex_buf, "\\x{x:0>2}", .{byte}) catch unreachable;
+                    try output.appendSlice(allocator, &hex_buf);
+                },
             }
         }
         try output.append(allocator, '"');

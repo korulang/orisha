@@ -1,0 +1,25 @@
+{
+  "name": "orisha",
+  "version": "1.0.0",
+  "description": "> *Spiritual power meets type safety*",
+  "main": "index.js",
+  "directories": {
+    "example": "examples",
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/COCPORN/orisha.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/COCPORN/orisha/issues"
+  },
+  "homepage": "https://github.com/COCPORN/orisha#readme"
+}

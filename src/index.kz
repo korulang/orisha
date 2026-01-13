@@ -4,7 +4,12 @@
 // Zero disk I/O at runtime. The bytes are just... there.
 
 ~import "$std/build"
+~import "$std/package"
 ~import "$orisha/router"
+~import "$koru/gzip"
+
+// Declare npm dependency on @korulang/gzip
+~std.package:requires.npm { "@korulang/gzip": "^0.0.1" }
 
 const std = @import("std");
 
