@@ -3,9 +3,41 @@
 // The index.html file is embedded INTO THE BINARY at compile time.
 // Zero disk I/O at runtime. The bytes are just... there.
 
+~import "$std/build"
 ~import "$orisha/router"
 
 const std = @import("std");
+
+// ============================================================================
+// BENCHMARK COMMANDS (run with: koruc src/index.kz <command>)
+// ============================================================================
+
+~std.build:command.sh(name: "bench", description: "Benchmark Orisha (50 connections, 10s)") {
+  echo "=== Orisha Benchmark (50 connections, 10s) ==="
+  wrk -t2 -c50 -d10s http://localhost:3000/
+}
+
+~std.build:command.sh(name: "bench-nginx", description: "Benchmark nginx (50 connections, 10s)") {
+  echo "=== nginx Benchmark (50 connections, 10s) ==="
+  wrk -t2 -c50 -d10s http://localhost:3001/
+}
+
+~std.build:command.sh(name: "compare", description: "Compare Orisha vs nginx performance") {
+  echo "=== ORISHA vs NGINX Comparison ==="
+  echo ""
+  echo "--- Orisha (1 thread) ---"
+  wrk -t2 -c50 -d10s http://localhost:3000/
+  echo ""
+  echo "--- nginx (optimized, all cores) ---"
+  wrk -t2 -c50 -d10s http://localhost:3001/
+}
+
+~std.build:command.sh(name: "start-nginx", description: "Start nginx with optimized config") {
+  echo "Starting nginx (optimized config)..."
+  pkill nginx 2>/dev/null || true
+  nginx -c /Users/larsde/src/orisha/nginx_benchmark.conf &
+  echo "nginx started on port 3001"
+}
 
 // ============================================================================
 // TYPE DEFINITIONS
@@ -26,14 +58,12 @@ pub const Connection = struct {
 
 ~[norun]pub event route { route: Expression, source: Source }
 
+// Serve entire public directory at root
 ~route(GET /) {
-    "file": "public/index.html"
+    "directory": "public"
 }
 
-~route(GET /about) {
-    "file": "public/about.html"
-}
-
+// API route with inline body
 ~route(GET /api/health) {
     "content-type": "application/json",
     "body": "OK"
@@ -72,6 +102,8 @@ const c = std.c;
 
 const MAX_EVENTS = 64;
 const MAX_CONNECTIONS = 1024;
+const NUM_WORKERS = 4;
+const CONNS_PER_WORKER = MAX_CONNECTIONS / NUM_WORKERS;
 
 // Use std.c.Kevent and constants
 const Kevent = c.Kevent;
@@ -82,6 +114,98 @@ const AsyncConn = struct {
     state: enum { reading, writing },
     response: ?[]const u8,
 };
+
+// Worker thread context
+const WorkerContext = struct {
+    id: usize,
+    kq: posix.fd_t,
+    connections: [CONNS_PER_WORKER]?AsyncConn,
+    running: *std.atomic.Value(bool),
+};
+
+// Worker thread function - handles events for its assigned connections
+fn workerLoop(ctx: *WorkerContext) void {
+    var events: [MAX_EVENTS]Kevent = undefined;
+    var no_changes: [0]Kevent = undefined;
+
+    while (ctx.running.load(.acquire)) {
+        // Wait for events with timeout (100ms) so we can check running flag
+        var timeout = std.posix.timespec{ .sec = 0, .nsec = 100_000_000 };
+        const n = c.kevent(ctx.kq, &no_changes, 0, &events, MAX_EVENTS, &timeout);
+        if (n <= 0) continue;
+
+        for (events[0..@intCast(n)]) |event| {
+            const fd: posix.fd_t = @intCast(event.ident);
+            const slot: usize = @intCast(@mod(fd, CONNS_PER_WORKER));
+
+            if (ctx.connections[slot]) |*conn| {
+                if (conn.state == .reading) {
+                    // Read request
+                    var buffer: [4096]u8 = undefined;
+                    const bytes_read = posix.read(fd, &buffer) catch 0;
+
+                    if (bytes_read == 0) {
+                        // Connection closed
+                        posix.close(fd);
+                        ctx.connections[slot] = null;
+                        continue;
+                    }
+
+                    // Parse request (minimal: just get path and If-None-Match)
+                    const request = buffer[0..bytes_read];
+                    var path: []const u8 = "/";
+                    var client_etag: ?[]const u8 = null;
+
+                    // Find path in "GET /path HTTP/1.1"
+                    if (std.mem.indexOf(u8, request, " ")) |start| {
+                        const after_method = request[start + 1..];
+                        if (std.mem.indexOf(u8, after_method, " ")) |end| {
+                            path = after_method[0..end];
+                        }
+                    }
+
+                    // Find If-None-Match header
+                    if (std.mem.indexOf(u8, request, "If-None-Match: \"")) |header_start| {
+                        const etag_start = header_start + 16;  // len("If-None-Match: \"")
+                        if (etag_start < request.len) {
+                            if (std.mem.indexOf(u8, request[etag_start..], "\"")) |etag_end| {
+                                client_etag = request[etag_start..etag_start + etag_end];
+                            }
+                        }
+                    }
+
+                    // Lookup response blob (handles If-None-Match -> 304)
+                    conn.response = routes.lookupWithEtag("GET", path, client_etag) orelse
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
+                    conn.state = .writing;
+
+                    // Write response immediately (non-blocking)
+                    _ = posix.write(fd, conn.response.?) catch {
+                        posix.close(fd);
+                        ctx.connections[slot] = null;
+                        continue;
+                    };
+
+                    // Keep-alive: re-register for next request
+                    conn.state = .reading;
+                    conn.response = null;
+                    var keep_alive_event: [1]Kevent = .{
+                        .{
+                            .ident = @intCast(fd),
+                            .filter = c.EVFILT.READ,
+                            .flags = c.EV.ADD | c.EV.ONESHOT,
+                            .fflags = 0,
+                            .data = 0,
+                            .udata = undefined,
+                        },
+                    };
+                    var keep_alive_empty: [0]Kevent = undefined;
+                    _ = c.kevent(ctx.kq, &keep_alive_event, 1, &keep_alive_empty, 0, null);
+                }
+            }
+        }
+    }
+}
 
 ~event listen_async { port: u16 }
 | listening {}
@@ -106,136 +230,77 @@ const AsyncConn = struct {
     const flags = posix.fcntl(listen_fd, posix.F.GETFL, 0) catch 0;
     _ = posix.fcntl(listen_fd, posix.F.SETFL, flags | O_NONBLOCK) catch {};
 
-    // Create kqueue
-    const kq = posix.kqueue() catch {
-        return .{ .failed = .{ .msg = "Failed to create kqueue" } };
-    };
+    // Shared running flag for graceful shutdown
+    var running = std.atomic.Value(bool).init(true);
 
-    // Register listening socket for read events (new connections)
-    var changes: [1]Kevent = .{
-        .{
-            .ident = @intCast(listen_fd),
-            .filter = c.EVFILT.READ,
-            .flags = c.EV.ADD,
-            .fflags = 0,
-            .data = 0,
-            .udata = undefined,
-        },
-    };
-    var empty_events: [0]Kevent = undefined;
-    _ = c.kevent(kq, &changes, 1, &empty_events, 0, null);
+    // Initialize worker contexts
+    var workers: [NUM_WORKERS]WorkerContext = undefined;
+    var worker_threads: [NUM_WORKERS]std.Thread = undefined;
+
+    for (0..NUM_WORKERS) |i| {
+        // Create kqueue for this worker
+        const worker_kq = posix.kqueue() catch {
+            return .{ .failed = .{ .msg = "Failed to create worker kqueue" } };
+        };
+
+        workers[i] = WorkerContext{
+            .id = i,
+            .kq = worker_kq,
+            .connections = .{null} ** CONNS_PER_WORKER,
+            .running = &running,
+        };
+
+        // Spawn worker thread
+        worker_threads[i] = std.Thread.spawn(.{}, workerLoop, .{&workers[i]}) catch {
+            return .{ .failed = .{ .msg = "Failed to spawn worker thread" } };
+        };
+    }
+
+    // Round-robin counter for distributing connections
+    var next_worker: usize = 0;
 
     std.debug.print("Orisha KEEPALIVE listening on http://0.0.0.0:{}\n", .{port});
-    std.debug.print("Serving {} routes with kqueue + TCP_NODELAY + keep-alive\n", .{routes.routes.len});
+    std.debug.print("Serving {} routes with {} workers + kqueue + TCP_NODELAY + keep-alive\n", .{ routes.routes.len, NUM_WORKERS });
 
-    // Connection pool
-    var connections: [MAX_CONNECTIONS]?AsyncConn = .{null} ** MAX_CONNECTIONS;
-
-    // Event loop
-    var events: [MAX_EVENTS]Kevent = undefined;
-    var no_changes: [0]Kevent = undefined;
+    // Main thread: accept loop only
     while (true) {
-        const n = c.kevent(kq, &no_changes, 0, &events, MAX_EVENTS, null);
-        if (n <= 0) continue;
+        const conn = server.accept() catch continue;
+        const client_fd = conn.stream.handle;
 
-        for (events[0..@intCast(n)]) |event| {
-            const fd: posix.fd_t = @intCast(event.ident);
+        // TCP_NODELAY on client - critical for latency!
+        const enable: i32 = 1;
+        posix.setsockopt(client_fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, std.mem.asBytes(&enable)) catch {};
 
-            if (fd == listen_fd) {
-                // New connection
-                while (true) {
-                    const conn = server.accept() catch break;
-                    const client_fd = conn.stream.handle;
+        // Make client socket non-blocking
+        const client_flags = posix.fcntl(client_fd, posix.F.GETFL, 0) catch 0;
+        _ = posix.fcntl(client_fd, posix.F.SETFL, client_flags | O_NONBLOCK) catch continue;
 
-                    // TCP_NODELAY on client - critical for latency!
-                    const enable: i32 = 1;
-                    posix.setsockopt(client_fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, std.mem.asBytes(&enable)) catch {};
+        // Round-robin select worker
+        const worker_id = next_worker;
+        next_worker = (next_worker + 1) % NUM_WORKERS;
+        const worker = &workers[worker_id];
 
-                    // Make client socket non-blocking
-                    const client_flags = posix.fcntl(client_fd, posix.F.GETFL, 0) catch 0;
-                    _ = posix.fcntl(client_fd, posix.F.SETFL, client_flags | O_NONBLOCK) catch continue;
+        // Store connection in worker's table
+        const slot: usize = @intCast(@mod(client_fd, CONNS_PER_WORKER));
+        worker.connections[slot] = .{
+            .fd = client_fd,
+            .state = .reading,
+            .response = null,
+        };
 
-                    // Store connection
-                    const slot: usize = @intCast(@mod(client_fd, MAX_CONNECTIONS));
-                    connections[slot] = .{
-                        .fd = client_fd,
-                        .state = .reading,
-                        .response = null,
-                    };
-
-                    // Register for read events
-                    var add_event: [1]Kevent = .{
-                        .{
-                            .ident = @intCast(client_fd),
-                            .filter = c.EVFILT.READ,
-                            .flags = c.EV.ADD | c.EV.ONESHOT,
-                            .fflags = 0,
-                            .data = 0,
-                            .udata = undefined,
-                        },
-                    };
-                    var no_events: [0]Kevent = undefined;
-                    _ = c.kevent(kq, &add_event, 1, &no_events, 0, null);
-                }
-            } else {
-                // Client socket event
-                const slot: usize = @intCast(@mod(fd, MAX_CONNECTIONS));
-                if (connections[slot]) |*conn| {
-                    if (conn.state == .reading) {
-                        // Read request
-                        var buffer: [4096]u8 = undefined;
-                        const bytes_read = posix.read(fd, &buffer) catch 0;
-
-                        if (bytes_read == 0) {
-                            // Connection closed
-                            posix.close(fd);
-                            connections[slot] = null;
-                            continue;
-                        }
-
-                        // Parse request (minimal: just get path)
-                        const request = buffer[0..bytes_read];
-                        var path: []const u8 = "/";
-
-                        // Find path in "GET /path HTTP/1.1"
-                        if (std.mem.indexOf(u8, request, " ")) |start| {
-                            const after_method = request[start + 1..];
-                            if (std.mem.indexOf(u8, after_method, " ")) |end| {
-                                path = after_method[0..end];
-                            }
-                        }
-
-                        // Lookup response blob
-                        conn.response = routes.lookup("GET", path) orelse
-                            "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
-                        conn.state = .writing;
-
-                        // Write response immediately (non-blocking)
-                        _ = posix.write(fd, conn.response.?) catch {
-                            posix.close(fd);
-                            connections[slot] = null;
-                            continue;
-                        };
-
-                        // Keep-alive: re-register for next request
-                        conn.state = .reading;
-                        conn.response = null;
-                        var keep_alive_event: [1]Kevent = .{
-                            .{
-                                .ident = @intCast(fd),
-                                .filter = c.EVFILT.READ,
-                                .flags = c.EV.ADD | c.EV.ONESHOT,
-                                .fflags = 0,
-                                .data = 0,
-                                .udata = undefined,
-                            },
-                        };
-                        var keep_alive_empty: [0]Kevent = undefined;
-                        _ = c.kevent(kq, &keep_alive_event, 1, &keep_alive_empty, 0, null);
-                    }
-                }
-            }
-        }
+        // Register with worker's kqueue
+        var add_event: [1]Kevent = .{
+            .{
+                .ident = @intCast(client_fd),
+                .filter = c.EVFILT.READ,
+                .flags = c.EV.ADD | c.EV.ONESHOT,
+                .fflags = 0,
+                .data = 0,
+                .udata = undefined,
+            },
+        };
+        var no_events: [0]Kevent = undefined;
+        _ = c.kevent(worker.kq, &add_event, 1, &no_events, 0, null);
     }
 
     return .{ .listening = .{} };

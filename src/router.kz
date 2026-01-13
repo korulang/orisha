@@ -20,12 +20,14 @@ const RouteConfig = struct {
     file: ?[]const u8 = null,
     body: ?[]const u8 = null,
     content_type: ?[]const u8 = null,
+    directory: ?[]const u8 = null,
 };
 
 const ProcessedRoute = struct {
     method: []const u8,
     path: []const u8,
     response: []const u8,  // Complete HTTP response: headers + body as ONE BLOB
+    etag: []const u8,      // Just the ETag value (for If-None-Match comparison)
 };
 
 // ============================================================================
@@ -67,7 +69,53 @@ const ProcessedRoute = struct {
         const config = parseSourceConfig(inv, allocator);
 
         // Process based on config type
-        if (config.file) |file_path| {
+        if (config.directory) |dir_path| {
+            std.debug.print("  Walking directory: {s}\n", .{dir_path});
+
+            // Walk directory recursively and add routes for each file
+            var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch |err| {
+                std.debug.print("  ERROR opening directory: {}\n", .{err});
+                continue;
+            };
+            defer dir.close();
+
+            var walker = dir.walk(allocator) catch |err| {
+                std.debug.print("  ERROR walking directory: {}\n", .{err});
+                continue;
+            };
+            defer walker.deinit();
+
+            while (walker.next() catch null) |entry| {
+                if (entry.kind != .file) continue;
+
+                // Build file path relative to cwd
+                const file_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.path }) catch continue;
+
+                // Build route path: base_path + file_path (strip leading slash if present)
+                const route_path = if (std.mem.eql(u8, path, "/"))
+                    std.fmt.allocPrint(allocator, "/{s}", .{entry.path}) catch continue
+                else
+                    std.fmt.allocPrint(allocator, "{s}/{s}", .{ path, entry.path }) catch continue;
+
+                std.debug.print("    Route: {s} -> {s}\n", .{ route_path, file_path });
+
+                const content = std.fs.cwd().readFileAlloc(allocator, file_path, 10 * 1024 * 1024) catch |err| {
+                    std.debug.print("    ERROR reading file: {}\n", .{err});
+                    continue;
+                };
+
+                const content_type = mimeTypeFromPath(file_path);
+                const http_resp = buildHttpResponse(allocator, content, content_type) catch continue;
+
+                routes.append(allocator, .{
+                    .method = method,
+                    .path = route_path,
+                    .response = http_resp.response,
+                    .etag = http_resp.etag,
+                }) catch continue;
+            }
+
+        } else if (config.file) |file_path| {
             std.debug.print("  Reading file: {s}\n", .{file_path});
             const content = std.fs.cwd().readFileAlloc(allocator, file_path, 10 * 1024 * 1024) catch |err| {
                 std.debug.print("  ERROR reading file: {}\n", .{err});
@@ -75,29 +123,31 @@ const ProcessedRoute = struct {
             };
 
             const content_type = config.content_type orelse mimeTypeFromPath(file_path);
-            const response = buildHttpResponse(allocator, content, content_type) catch continue;
+            const http_resp = buildHttpResponse(allocator, content, content_type) catch continue;
 
             routes.append(allocator, .{
                 .method = method,
                 .path = path,
-                .response = response,
+                .response = http_resp.response,
+                .etag = http_resp.etag,
             }) catch continue;
 
-            std.debug.print("  Response blob: {} bytes\n", .{response.len});
+            std.debug.print("  Response blob: {} bytes\n", .{http_resp.response.len});
 
         } else if (config.body) |body| {
             std.debug.print("  Inline body: {} bytes\n", .{body.len});
 
             const content_type = config.content_type orelse "text/plain";
-            const response = buildHttpResponse(allocator, body, content_type) catch continue;
+            const http_resp = buildHttpResponse(allocator, body, content_type) catch continue;
 
             routes.append(allocator, .{
                 .method = method,
                 .path = path,
-                .response = response,
+                .response = http_resp.response,
+                .etag = http_resp.etag,
             }) catch continue;
 
-            std.debug.print("  Response blob: {} bytes\n", .{response.len});
+            std.debug.print("  Response blob: {} bytes\n", .{http_resp.response.len});
         }
     }
 
@@ -148,6 +198,8 @@ fn parseSourceConfig(inv: ast.Invocation, allocator: std.mem.Allocator) RouteCon
                     config.body = extractQuotedValue(trimmed, allocator);
                 } else if (std.mem.indexOf(u8, trimmed, "\"content-type\"")) |_| {
                     config.content_type = extractQuotedValue(trimmed, allocator);
+                } else if (std.mem.indexOf(u8, trimmed, "\"directory\"")) |_| {
+                    config.directory = extractQuotedValue(trimmed, allocator);
                 }
             }
         }
@@ -184,10 +236,16 @@ fn computeEtag(content: []const u8, out: *[64]u8) void {
     }
 }
 
-fn buildHttpResponse(allocator: std.mem.Allocator, content: []const u8, content_type: []const u8) ![]const u8 {
+const HttpResponse = struct {
+    response: []const u8,
+    etag: []const u8,
+};
+
+fn buildHttpResponse(allocator: std.mem.Allocator, content: []const u8, content_type: []const u8) !HttpResponse {
     // Compute etag
     var etag_buf: [64]u8 = undefined;
     computeEtag(content, &etag_buf);
+    const etag = try allocator.dupe(u8, etag_buf[0..16]);  // First 16 chars of hash
 
     // Build complete HTTP response: headers + body as ONE BLOB
     var response: std.ArrayList(u8) = .empty;
@@ -208,7 +266,7 @@ fn buildHttpResponse(allocator: std.mem.Allocator, content: []const u8, content_
     try response.appendSlice(allocator, "\r\n");
 
     try response.appendSlice(allocator, "ETag: \"");
-    try response.appendSlice(allocator, etag_buf[0..16]);  // First 16 chars of hash
+    try response.appendSlice(allocator, etag);
     try response.appendSlice(allocator, "\"\r\n");
 
     try response.appendSlice(allocator, "Connection: keep-alive\r\n");
@@ -217,7 +275,7 @@ fn buildHttpResponse(allocator: std.mem.Allocator, content: []const u8, content_
     // Body
     try response.appendSlice(allocator, content);
 
-    return response.items;
+    return .{ .response = response.items, .etag = etag };
 }
 
 fn mimeTypeFromPath(path: []const u8) []const u8 {
@@ -261,7 +319,11 @@ fn generateRoutesFile(allocator: std.mem.Allocator, routes: []const ProcessedRou
         \\    method: []const u8,
         \\    path: []const u8,
         \\    response: []const u8,  // Complete HTTP response: status + headers + body
+        \\    etag: []const u8,      // ETag value for If-None-Match comparison
         \\};
+        \\
+        \\// Pre-computed 304 Not Modified response (same for all routes)
+        \\pub const response_304 = "HTTP/1.1 304 Not Modified\r\nConnection: keep-alive\r\n\r\n";
         \\
         \\pub const routes = [_]Route{
         \\
@@ -270,7 +332,7 @@ fn generateRoutesFile(allocator: std.mem.Allocator, routes: []const ProcessedRou
     // Write each route
     for (routes) |route| {
         // Route header
-        try appendFmt(allocator, &output, "    .{{\n        .method = \"{s}\",\n        .path = \"{s}\",\n        .response = ", .{ route.method, route.path });
+        try appendFmt(allocator, &output, "    .{{\n        .method = \"{s}\",\n        .path = \"{s}\",\n        .etag = \"{s}\",\n        .response = ", .{ route.method, route.path, route.etag });
 
         // Response blob as escaped string
         try output.append(allocator, '"');
@@ -298,6 +360,24 @@ fn generateRoutesFile(allocator: std.mem.Allocator, routes: []const ProcessedRou
         \\pub fn lookup(method: []const u8, path: []const u8) ?[]const u8 {
         \\    for (routes) |route| {
         \\        if (std.mem.eql(u8, route.method, method) and std.mem.eql(u8, route.path, path)) {
+        \\            return route.response;
+        \\        }
+        \\    }
+        \\    return null;
+        \\}
+        \\
+        \\/// Lookup route with If-None-Match support.
+        \\/// If client_etag matches, returns 304 response. Otherwise returns full response.
+        \\/// Returns null if route not found.
+        \\pub fn lookupWithEtag(method: []const u8, path: []const u8, client_etag: ?[]const u8) ?[]const u8 {
+        \\    for (routes) |route| {
+        \\        if (std.mem.eql(u8, route.method, method) and std.mem.eql(u8, route.path, path)) {
+        \\            // Check If-None-Match
+        \\            if (client_etag) |etag| {
+        \\                if (std.mem.eql(u8, etag, route.etag)) {
+        \\                    return response_304;
+        \\                }
+        \\            }
         \\            return route.response;
         \\        }
         \\    }
