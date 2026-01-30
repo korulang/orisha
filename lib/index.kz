@@ -63,7 +63,7 @@ pub const ConnHandle = struct {
 | failed { msg: []const u8 }
 
 ~proc listen {
-    const allocator = std.heap.page_allocator;
+    const allocator = std.heap.c_allocator;
 
     const address = std.net.Address.parseIp("0.0.0.0", port) catch {
         return .{ .failed = .{ .msg = "Invalid address" } };
