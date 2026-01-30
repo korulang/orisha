@@ -301,6 +301,15 @@ fn workerLoop(ctx: *WorkerContext) void {
         }
     }
 
+    // Find the expr argument from the invocation
+    var expr_value: []const u8 = "null";
+    for (flow.invocation.args) |arg| {
+        if (std.mem.eql(u8, arg.name, "expr")) {
+            expr_value = arg.value;
+            break;
+        }
+    }
+
     // Collect pattern branches from continuations
     var patterns: std.ArrayList([]const u8) = .empty;
     for (flow.continuations) |cont| {
@@ -313,13 +322,17 @@ fn workerLoop(ctx: *WorkerContext) void {
         return .{ .transformed = .{ .program = program } };
     }
 
-    std.debug.print("[ROUTER TRANSFORM] Found {} pattern branches\n", .{patterns.items.len});
+    std.debug.print("[ROUTER TRANSFORM] Found {} pattern branches, expr={s}\n", .{patterns.items.len, expr_value});
 
-    // Generate unique event name from hash of patterns
+    // Generate unique event name from hash of patterns + location + expr
     var hash: u64 = 0;
     for (patterns.items) |p| {
         for (p) |ch| hash = hash *% 31 +% ch;
     }
+    // Include location for uniqueness when same patterns used multiple times
+    hash = hash *% 31 +% flow.location.line;
+    hash = hash *% 31 +% flow.location.column;
+    for (expr_value) |ch| hash = hash *% 31 +% ch;
     var name_buf: [32]u8 = undefined;
     const event_name = std.fmt.bufPrint(&name_buf, "_router_{x}", .{hash}) catch "_router_gen";
 
@@ -352,14 +365,46 @@ fn workerLoop(ctx: *WorkerContext) void {
         .location = flow.location,
     };
 
-    // Generate proc body - for now just return first pattern
-    // TODO: Add actual runtime dispatch
+    // Generate proc body with pattern matching logic
     var proc_body: std.ArrayList(u8) = .empty;
+
+    // Track if we have a catch-all pattern
+    var catch_all_pattern: ?[]const u8 = null;
+
+    for (patterns.items) |pattern| {
+        // Parse pattern: [METHOD PATH] or [*]
+        if (std.mem.eql(u8, pattern, "[*]")) {
+            catch_all_pattern = pattern;
+            continue;  // Handle catch-all last
+        }
+
+        // Extract method and path from pattern like "[GET /users/:id]"
+        const inner = pattern[1 .. pattern.len - 1];  // Strip [ and ]
+        const space_idx = std.mem.indexOf(u8, inner, " ") orelse continue;
+        const method = inner[0..space_idx];
+        const path = inner[space_idx + 1 ..];
+
+        // Generate: if (std.mem.eql(u8, (EXPR).method, "METHOD") and std.mem.eql(u8, (EXPR).path, "PATH"))
+        proc_body.appendSlice(allocator, "if (std.mem.eql(u8, (") catch unreachable;
+        proc_body.appendSlice(allocator, expr_value) catch unreachable;
+        proc_body.appendSlice(allocator, ").method, \"") catch unreachable;
+        proc_body.appendSlice(allocator, method) catch unreachable;
+        proc_body.appendSlice(allocator, "\") and std.mem.eql(u8, (") catch unreachable;
+        proc_body.appendSlice(allocator, expr_value) catch unreachable;
+        proc_body.appendSlice(allocator, ").path, \"") catch unreachable;
+        proc_body.appendSlice(allocator, path) catch unreachable;
+        proc_body.appendSlice(allocator, "\")) { return .{ .@\"") catch unreachable;
+        proc_body.appendSlice(allocator, pattern) catch unreachable;
+        proc_body.appendSlice(allocator, "\" = .{} }; }\n") catch unreachable;
+    }
+
+    // Add catch-all at the end (or first pattern as fallback)
+    const fallback = catch_all_pattern orelse patterns.items[0];
     proc_body.appendSlice(allocator, "return .{ .@\"") catch unreachable;
-    proc_body.appendSlice(allocator, patterns.items[0]) catch unreachable;
+    proc_body.appendSlice(allocator, fallback) catch unreachable;
     proc_body.appendSlice(allocator, "\" = .{} };") catch unreachable;
 
-    std.debug.print("[ROUTER TRANSFORM] Proc body: {s}\n", .{proc_body.items});
+    std.debug.print("[ROUTER TRANSFORM] Generated dispatch:\n{s}\n", .{proc_body.items});
 
     // Create the proc declaration (same module_qualifier as event)
     const proc_decl = ast_mod.ProcDecl{

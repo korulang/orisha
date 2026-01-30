@@ -11,14 +11,25 @@ const TestRequest = struct {
     path: []const u8,
 };
 
-// Create a simple test request
-const test_req = TestRequest{
-    .method = "GET",
-    .path = "/",
-};
+// Test different routes
+const req_root = TestRequest{ .method = "GET", .path = "/" };
+const req_about = TestRequest{ .method = "GET", .path = "/about" };
+const req_post = TestRequest{ .method = "POST", .path = "/" };
 
-// Direct call to router with pattern branches
-~orisha:router(expr: &test_req)
-| [GET /] _ |> std.io:print.ln("matched /")
-| [GET /users/:id] _ |> std.io:print.ln("matched /users/:id")
-| [*] _ |> std.io:print.ln("catch-all")
+// Test 1: Should match [GET /]
+~orisha:router(expr: &req_root)
+| [GET /] _ |> std.io:print.ln("1: matched GET /")
+| [GET /about] _ |> std.io:print.ln("1: matched GET /about")
+| [*] _ |> std.io:print.ln("1: catch-all")
+
+// Test 2: Should match [GET /about]
+~orisha:router(expr: &req_about)
+| [GET /] _ |> std.io:print.ln("2: matched GET /")
+| [GET /about] _ |> std.io:print.ln("2: matched GET /about")
+| [*] _ |> std.io:print.ln("2: catch-all")
+
+// Test 3: Should fall through to catch-all
+~orisha:router(expr: &req_post)
+| [GET /] _ |> std.io:print.ln("3: matched GET /")
+| [GET /about] _ |> std.io:print.ln("3: matched GET /about")
+| [*] _ |> std.io:print.ln("3: catch-all")
