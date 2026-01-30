@@ -338,13 +338,97 @@ fn workerLoop(ctx: *WorkerContext) void {
 
     std.debug.print("[ROUTER TRANSFORM] Generating event: {s}\n", .{event_name});
 
-    // Create branches for the event (one per pattern)
-    const branches = allocator.alloc(ast_mod.Branch, patterns.items.len) catch unreachable;
-    for (patterns.items, 0..) |pattern, i| {
+    // Parsed pattern info
+    const ParsedPattern = struct {
+        raw: []const u8,        // Original pattern string "[GET /users/:id]"
+        method: []const u8,     // "GET"
+        path: []const u8,       // "/users/:id"
+        params: []const []const u8,  // ["id"]
+        is_catchall: bool,
+    };
+
+    // Parse all patterns
+    var parsed_patterns: std.ArrayList(ParsedPattern) = .empty;
+    for (patterns.items) |pattern| {
+        if (std.mem.eql(u8, pattern, "[*]")) {
+            parsed_patterns.append(allocator, .{
+                .raw = pattern,
+                .method = "*",
+                .path = "*",
+                .params = &.{},
+                .is_catchall = true,
+            }) catch unreachable;
+            continue;
+        }
+
+        // Extract method and path from "[GET /users/:id]"
+        const inner = pattern[1 .. pattern.len - 1];
+        const space_idx = std.mem.indexOf(u8, inner, " ") orelse continue;
+        const method = inner[0..space_idx];
+        const path = inner[space_idx + 1 ..];
+
+        // Extract params from path (segments starting with :)
+        var params_list: std.ArrayList([]const u8) = .empty;
+        var path_iter = std.mem.splitScalar(u8, path, '/');
+        while (path_iter.next()) |segment| {
+            if (segment.len > 1 and segment[0] == ':') {
+                params_list.append(allocator, segment[1..]) catch unreachable;
+            }
+        }
+
+        parsed_patterns.append(allocator, .{
+            .raw = pattern,
+            .method = method,
+            .path = path,
+            .params = params_list.toOwnedSlice(allocator) catch unreachable,
+            .is_catchall = false,
+        }) catch unreachable;
+
+        std.debug.print("[ROUTER] Pattern '{s}' has {} params\n", .{pattern, params_list.items.len});
+    }
+
+    // Create branches with proper payloads based on params
+    const branches = allocator.alloc(ast_mod.Branch, parsed_patterns.items.len) catch unreachable;
+    for (parsed_patterns.items, 0..) |pp, i| {
+        // Create payload fields for each param
+        const fields = allocator.alloc(ast_mod.Field, pp.params.len) catch unreachable;
+        for (pp.params, 0..) |param_name, j| {
+            fields[j] = ast_mod.Field{
+                .name = allocator.dupe(u8, param_name) catch unreachable,
+                .type = "[]const u8",
+            };
+        }
+
         branches[i] = ast_mod.Branch{
-            .name = allocator.dupe(u8, pattern) catch unreachable,
-            .payload = ast_mod.Shape{ .fields = &.{} },  // Empty payload
+            .name = allocator.dupe(u8, pp.raw) catch unreachable,
+            .payload = ast_mod.Shape{ .fields = fields },
         };
+    }
+
+    // Validate bindings match payloads (print warnings/errors)
+    for (flow.continuations) |cont| {
+        for (parsed_patterns.items) |pp| {
+            if (!std.mem.eql(u8, pp.raw, cont.branch)) continue;
+
+            const has_params = pp.params.len > 0;
+            const has_binding = cont.binding != null and !std.mem.eql(u8, cont.binding.?, "_");
+
+            if (has_params and cont.binding == null) {
+                std.debug.print("\n❌ [ROUTER] Pattern '{s}' has params (", .{pp.raw});
+                for (pp.params, 0..) |p, idx| {
+                    if (idx > 0) std.debug.print(", ", .{});
+                    std.debug.print("{s}", .{p});
+                }
+                std.debug.print(") but no binding.\n", .{});
+                std.debug.print("   Fix: | {s} p |>  or  | {s} _ |>\n\n", .{pp.raw, pp.raw});
+            }
+
+            if (!has_params and has_binding) {
+                std.debug.print("\n⚠️  [ROUTER] Pattern '{s}' has no params but binds '{s}'.\n", .{pp.raw, cont.binding.?});
+                std.debug.print("   Fix: | {s} |>  (no binding needed)\n\n", .{pp.raw});
+            }
+            break;
+        }
     }
 
     // Create the event declaration
@@ -368,38 +452,80 @@ fn workerLoop(ctx: *WorkerContext) void {
     // Generate proc body with pattern matching logic
     var proc_body: std.ArrayList(u8) = .empty;
 
-    // Track if we have a catch-all pattern
-    var catch_all_pattern: ?[]const u8 = null;
+    // Track catch-all for fallback
+    var catch_all: ?*const ParsedPattern = null;
 
-    for (patterns.items) |pattern| {
-        // Parse pattern: [METHOD PATH] or [*]
-        if (std.mem.eql(u8, pattern, "[*]")) {
-            catch_all_pattern = pattern;
-            continue;  // Handle catch-all last
+    for (parsed_patterns.items) |*pp| {
+        if (pp.is_catchall) {
+            catch_all = pp;
+            continue;
         }
 
-        // Extract method and path from pattern like "[GET /users/:id]"
-        const inner = pattern[1 .. pattern.len - 1];  // Strip [ and ]
-        const space_idx = std.mem.indexOf(u8, inner, " ") orelse continue;
-        const method = inner[0..space_idx];
-        const path = inner[space_idx + 1 ..];
-
-        // Generate: if (std.mem.eql(u8, (EXPR).method, "METHOD") and std.mem.eql(u8, (EXPR).path, "PATH"))
+        // Generate method check
         proc_body.appendSlice(allocator, "if (std.mem.eql(u8, (") catch unreachable;
         proc_body.appendSlice(allocator, expr_value) catch unreachable;
         proc_body.appendSlice(allocator, ").method, \"") catch unreachable;
-        proc_body.appendSlice(allocator, method) catch unreachable;
-        proc_body.appendSlice(allocator, "\") and std.mem.eql(u8, (") catch unreachable;
-        proc_body.appendSlice(allocator, expr_value) catch unreachable;
-        proc_body.appendSlice(allocator, ").path, \"") catch unreachable;
-        proc_body.appendSlice(allocator, path) catch unreachable;
-        proc_body.appendSlice(allocator, "\")) { return .{ .@\"") catch unreachable;
-        proc_body.appendSlice(allocator, pattern) catch unreachable;
-        proc_body.appendSlice(allocator, "\" = .{} }; }\n") catch unreachable;
+        proc_body.appendSlice(allocator, pp.method) catch unreachable;
+        proc_body.appendSlice(allocator, "\")") catch unreachable;
+
+        if (pp.params.len == 0) {
+            // No params - exact path match
+            proc_body.appendSlice(allocator, " and std.mem.eql(u8, (") catch unreachable;
+            proc_body.appendSlice(allocator, expr_value) catch unreachable;
+            proc_body.appendSlice(allocator, ").path, \"") catch unreachable;
+            proc_body.appendSlice(allocator, pp.path) catch unreachable;
+            proc_body.appendSlice(allocator, "\")) { return .{ .@\"") catch unreachable;
+            proc_body.appendSlice(allocator, pp.raw) catch unreachable;
+            proc_body.appendSlice(allocator, "\" = .{} }; }\n") catch unreachable;
+        } else {
+            // Has params - need segment matching
+            // Generate path prefix check and param extraction
+            // For "/users/:id" matching "/users/42", extract "42" as id
+
+            // Find the static prefix (e.g., "/users/" for "/users/:id")
+            var prefix_end: usize = 0;
+            var path_iter = std.mem.splitScalar(u8, pp.path, '/');
+            var segments: std.ArrayList([]const u8) = .empty;
+            while (path_iter.next()) |seg| {
+                segments.append(allocator, seg) catch unreachable;
+                if (seg.len > 0 and seg[0] == ':') break;
+                prefix_end += seg.len + 1;
+            }
+
+            // For now, simple prefix match + extract remainder
+            // TODO: Full segment-by-segment matching
+            const prefix = if (prefix_end > 0) pp.path[0..prefix_end] else "/";
+
+            proc_body.appendSlice(allocator, " and std.mem.startsWith(u8, (") catch unreachable;
+            proc_body.appendSlice(allocator, expr_value) catch unreachable;
+            proc_body.appendSlice(allocator, ").path, \"") catch unreachable;
+            proc_body.appendSlice(allocator, prefix) catch unreachable;
+            proc_body.appendSlice(allocator, "\")) {\n") catch unreachable;
+
+            // Extract param value (simple: everything after prefix)
+            // Use runtime bounds check to avoid compile-time evaluation issues
+            var len_buf: [10]u8 = undefined;
+            const prefix_len_str = std.fmt.bufPrint(&len_buf, "{}", .{prefix.len}) catch "0";
+            proc_body.appendSlice(allocator, "    const _p = (") catch unreachable;
+            proc_body.appendSlice(allocator, expr_value) catch unreachable;
+            proc_body.appendSlice(allocator, ").path;\n") catch unreachable;
+            proc_body.appendSlice(allocator, "    const _param = if (_p.len >= ") catch unreachable;
+            proc_body.appendSlice(allocator, prefix_len_str) catch unreachable;
+            proc_body.appendSlice(allocator, ") _p[") catch unreachable;
+            proc_body.appendSlice(allocator, prefix_len_str) catch unreachable;
+            proc_body.appendSlice(allocator, "..] else \"\";\n") catch unreachable;
+
+            // Return with extracted param
+            proc_body.appendSlice(allocator, "    return .{ .@\"") catch unreachable;
+            proc_body.appendSlice(allocator, pp.raw) catch unreachable;
+            proc_body.appendSlice(allocator, "\" = .{ .") catch unreachable;
+            proc_body.appendSlice(allocator, pp.params[0]) catch unreachable;
+            proc_body.appendSlice(allocator, " = _param } };\n}\n") catch unreachable;
+        }
     }
 
-    // Add catch-all at the end (or first pattern as fallback)
-    const fallback = catch_all_pattern orelse patterns.items[0];
+    // Add catch-all at the end
+    const fallback = if (catch_all) |ca| ca.raw else parsed_patterns.items[0].raw;
     proc_body.appendSlice(allocator, "return .{ .@\"") catch unreachable;
     proc_body.appendSlice(allocator, fallback) catch unreachable;
     proc_body.appendSlice(allocator, "\" = .{} };") catch unreachable;

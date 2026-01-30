@@ -14,22 +14,33 @@ const TestRequest = struct {
 // Test different routes
 const req_root = TestRequest{ .method = "GET", .path = "/" };
 const req_about = TestRequest{ .method = "GET", .path = "/about" };
+const req_user = TestRequest{ .method = "GET", .path = "/users/42" };
 const req_post = TestRequest{ .method = "POST", .path = "/" };
 
-// Test 1: Should match [GET /]
+// Test 1: Should match [GET /] - no binding (empty payload)
 ~orisha:router(expr: &req_root)
-| [GET /] _ |> std.io:print.ln("1: matched GET /")
-| [GET /about] _ |> std.io:print.ln("1: matched GET /about")
-| [*] _ |> std.io:print.ln("1: catch-all")
+| [GET /] |> std.io:print.ln("1: matched GET /")
+| [GET /about] |> std.io:print.ln("1: matched GET /about")
+| [GET /users/:id] _ |> std.io:print.ln("1: matched user (discarded)")
+| [*] |> std.io:print.ln("1: catch-all")
 
-// Test 2: Should match [GET /about]
+// Test 2: Should match [GET /about] - no binding
 ~orisha:router(expr: &req_about)
-| [GET /] _ |> std.io:print.ln("2: matched GET /")
-| [GET /about] _ |> std.io:print.ln("2: matched GET /about")
-| [*] _ |> std.io:print.ln("2: catch-all")
+| [GET /] |> std.io:print.ln("2: matched GET /")
+| [GET /about] |> std.io:print.ln("2: matched GET /about")
+| [GET /users/:id] _ |> std.io:print.ln("2: matched user (discarded)")
+| [*] |> std.io:print.ln("2: catch-all")
 
-// Test 3: Should fall through to catch-all
+// Test 3: Should match [GET /users/:id] with param extraction
+~orisha:router(expr: &req_user)
+| [GET /] |> std.io:print.ln("3: matched GET /")
+| [GET /about] |> std.io:print.ln("3: matched GET /about")
+| [GET /users/:id] p |> std.io:print.ln("3: matched user id={{ p.id:s }}")
+| [*] |> std.io:print.ln("3: catch-all")
+
+// Test 4: Should fall through to catch-all
 ~orisha:router(expr: &req_post)
-| [GET /] _ |> std.io:print.ln("3: matched GET /")
-| [GET /about] _ |> std.io:print.ln("3: matched GET /about")
-| [*] _ |> std.io:print.ln("3: catch-all")
+| [GET /] |> std.io:print.ln("4: matched GET /")
+| [GET /about] |> std.io:print.ln("4: matched GET /about")
+| [GET /users/:id] _ |> std.io:print.ln("4: matched user (discarded)")
+| [*] |> std.io:print.ln("4: catch-all")
