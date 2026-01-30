@@ -1,0 +1,24 @@
+// Test: Router transform with pattern branches - SIMPLIFIED
+
+~import "$orisha"
+~import "$std/io"
+
+const std = @import("std");
+
+// Define a test request struct (matches orisha.Request)
+const TestRequest = struct {
+    method: []const u8,
+    path: []const u8,
+};
+
+// Create a simple test request
+const test_req = TestRequest{
+    .method = "GET",
+    .path = "/",
+};
+
+// Direct call to router with pattern branches
+~orisha:router(expr: &test_req)
+| [GET /] _ |> std.io:print.ln("matched /")
+| [GET /users/:id] _ |> std.io:print.ln("matched /users/:id")
+| [*] _ |> std.io:print.ln("catch-all")

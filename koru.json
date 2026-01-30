@@ -4,7 +4,7 @@
     "description": "Compile-time HTTP server for Koru",
     "paths": {
         "std": "../koru/koru_std",
-        "orisha": "src",
+        "orisha": "lib",
         "koru": "../koru-libs"
     }
 }

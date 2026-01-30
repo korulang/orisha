@@ -1,0 +1,11 @@
+// Router Test Suite
+//
+// Run: koruc router_test.kz && zig test output_emitted.zig
+
+~import "$orisha/routing"
+~import "$std/testing"
+
+const std = @import("std");
+
+// Re-export router tests by importing the module
+// The ~test declarations in router.kz will be included

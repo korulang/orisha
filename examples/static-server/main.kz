@@ -1,0 +1,60 @@
+// Orisha Static Server Example
+//
+// High-performance static file server with compile-time embedded content.
+// All files are embedded INTO THE BINARY at compile time.
+// Zero disk I/O at runtime.
+//
+// Run: koruc main.kz && ./a.out
+// Bench: koruc main.kz bench
+
+~import "$orisha"
+~import "$std/build"
+~import "$std/package"
+
+~std.package:requires.npm { "@korulang/gzip": "^0.0.1" }
+
+const std = @import("std");
+
+// ============================================================================
+// BENCHMARK COMMANDS
+// ============================================================================
+
+~std.build:command.sh(name: "bench", description: "Benchmark Orisha (50 connections, 10s)") {
+  echo "=== Orisha Benchmark (50 connections, 10s) ==="
+  wrk -t2 -c50 -d10s http://localhost:3000/
+}
+
+~std.build:command.sh(name: "compare", description: "Compare Orisha vs nginx performance") {
+  echo "=== ORISHA vs NGINX Comparison ==="
+  echo ""
+  echo "--- Orisha ---"
+  wrk -t2 -c50 -d10s http://localhost:3000/
+  echo ""
+  echo "--- nginx ---"
+  wrk -t2 -c50 -d10s http://localhost:3001/
+}
+
+// ============================================================================
+// STATIC CONTENT - Embedded at compile time
+// ============================================================================
+
+// Serve entire public directory at root
+~orisha:static(path: "/", directory: "public")
+
+// ============================================================================
+// COMPILE-TIME ROUTE COLLECTION
+// ============================================================================
+
+~orisha:collect_routes()
+| done |> _
+
+// Import the generated routes
+const routes = @import("generated/routes.zig");
+
+// ============================================================================
+// SERVER
+// ============================================================================
+
+~orisha:serve(port: 3000, router: routes.lookupWithEtag)
+| listening |> _
+| failed |> _

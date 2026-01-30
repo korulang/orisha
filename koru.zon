@@ -6,6 +6,6 @@
         // Standard library
         .std = "../koru/koru_std",
         // Self-reference for module imports
-        .orisha = "src",
+        .orisha = "lib",
     },
 }

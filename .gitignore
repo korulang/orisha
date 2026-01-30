@@ -5,12 +5,9 @@ zig-out/
 
 # Koru compiler output
 *.zig
-backend.zig
-backend_output_emitted.zig
-build.zig
-build_backend.zig
 backend_tmp
-.claude/
+output_emitted
+backend_output_emitted
 
 # Executables
 *.exe
@@ -18,8 +15,16 @@ backend_tmp
 a.out
 main
 server
+orisha
 
-# Node.js (for examples that may use npm)
+# Rust build artifacts
+target/
+Cargo.lock
+
+# Go build artifacts
+go.sum
+
+# Node.js
 node_modules/
 package-lock.json
 pnpm-lock.yaml
@@ -31,6 +36,9 @@ pnpm-lock.yaml
 *.swo
 *~
 
+# Claude Code
+.claude/
+
 # OS
 .DS_Store
 Thumbs.db
@@ -41,5 +49,6 @@ Thumbs.db
 # Profiling data
 *.prof
 profile.json
-orisha
-output_emitted.zig
+
+# Generated files
+generated/

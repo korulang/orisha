@@ -1,0 +1,710 @@
+// Orisha - High-performance web framework for Koru
+//
+// Public API:
+//   ~orisha:serve(port)     - Start async server with kqueue/epoll
+//   ~orisha:router()        - Pattern-branch router (tree-structured routing)
+//   ~orisha:route           - Declare static routes (compile-time embedded)
+//
+// Example:
+//   ~import "$orisha"
+//
+//   ~orisha:serve(port: 3000)
+//   | listening |>
+//       orisha:router()
+//       | [GET /users/:id] r |> get_user(id: r.params.id)
+//       | [POST /users] r |> create_user(body: r.body)
+//   | failed |> _
+
+~import "$std/compiler"
+
+~std.compiler:requires {
+    exe.linkSystemLibrary("z");
+    exe.linkLibC();
+}
+
+const std = @import("std");
+const ast = @import("ast");
+const Program = ast.Program;
+const Sha256 = std.crypto.hash.sha2.Sha256;
+const zlib = @cImport({
+    @cInclude("zlib.h");
+});
+const posix = std.posix;
+const c = std.c;
+
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
+
+const MAX_EVENTS = 64;
+const MAX_CONNECTIONS = 1024;
+const NUM_WORKERS = 4;
+const CONNS_PER_WORKER = MAX_CONNECTIONS / NUM_WORKERS;
+
+// ============================================================================
+// PUBLIC TYPES
+// ============================================================================
+
+pub const Server = struct {
+    inner: std.net.Server,
+};
+
+pub const Connection = struct {
+    stream: std.net.Stream,
+    address: std.net.Address,
+};
+
+pub const Request = struct {
+    method: []const u8,
+    path: []const u8,
+    headers: []const Header,
+    body: ?[]const u8,
+    params: std.StringHashMap([]const u8),
+};
+
+pub const Header = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+pub const Response = struct {
+    status: u16 = 200,
+    headers: std.ArrayList(Header),
+    body: []const u8 = "",
+};
+
+pub const Handler = *const fn (*Request) Response;
+
+// ============================================================================
+// SERVE - Async server with kqueue
+// ============================================================================
+
+const RouterFn = *const fn ([]const u8, []const u8, ?[]const u8) ?[]const u8;
+
+~pub event serve { port: u16, router: ?RouterFn }
+| listening { port: u16 }
+| failed { msg: []const u8 }
+
+const Kevent = c.Kevent;
+
+const AsyncConn = struct {
+    fd: posix.fd_t,
+    state: enum { reading, writing },
+    response: ?[]const u8,
+};
+
+const WorkerContext = struct {
+    id: usize,
+    kq: posix.fd_t,
+    connections: [CONNS_PER_WORKER]?AsyncConn,
+    running: *std.atomic.Value(bool),
+    router: ?*const fn ([]const u8, []const u8, ?[]const u8) ?[]const u8,
+};
+
+~pub proc serve {
+    const address = std.net.Address.parseIp("0.0.0.0", port) catch {
+        return .{ .failed = .{ .msg = "Invalid address" } };
+    };
+
+    var server = address.listen(.{
+        .reuse_address = true,
+        .kernel_backlog = 512,
+    }) catch {
+        return .{ .failed = .{ .msg = "Failed to listen" } };
+    };
+
+    const O_NONBLOCK: u32 = 0x0004;
+    const listen_fd = server.stream.handle;
+    const flags = posix.fcntl(listen_fd, posix.F.GETFL, 0) catch 0;
+    _ = posix.fcntl(listen_fd, posix.F.SETFL, flags | O_NONBLOCK) catch {};
+
+    var running = std.atomic.Value(bool).init(true);
+    var workers: [NUM_WORKERS]WorkerContext = undefined;
+    var worker_threads: [NUM_WORKERS]std.Thread = undefined;
+
+    for (0..NUM_WORKERS) |i| {
+        const worker_kq = posix.kqueue() catch {
+            return .{ .failed = .{ .msg = "Failed to create worker kqueue" } };
+        };
+
+        workers[i] = WorkerContext{
+            .id = i,
+            .kq = worker_kq,
+            .connections = .{null} ** CONNS_PER_WORKER,
+            .running = &running,
+            .router = router,
+        };
+
+        worker_threads[i] = std.Thread.spawn(.{}, workerLoop, .{&workers[i]}) catch {
+            return .{ .failed = .{ .msg = "Failed to spawn worker thread" } };
+        };
+    }
+
+    var next_worker: usize = 0;
+
+    std.debug.print("Orisha listening on http://0.0.0.0:{}\n", .{port});
+    std.debug.print("Running with {} workers + kqueue + TCP_NODELAY + keep-alive\n", .{NUM_WORKERS});
+
+    while (true) {
+        const conn = server.accept() catch continue;
+        const client_fd = conn.stream.handle;
+
+        const enable: i32 = 1;
+        posix.setsockopt(client_fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, std.mem.asBytes(&enable)) catch {};
+
+        const client_flags = posix.fcntl(client_fd, posix.F.GETFL, 0) catch 0;
+        _ = posix.fcntl(client_fd, posix.F.SETFL, client_flags | O_NONBLOCK) catch continue;
+
+        const worker_id = next_worker;
+        next_worker = (next_worker + 1) % NUM_WORKERS;
+        const worker = &workers[worker_id];
+
+        const slot: usize = @intCast(@mod(client_fd, CONNS_PER_WORKER));
+        worker.connections[slot] = .{ .fd = client_fd, .state = .reading, .response = null };
+
+        var add_event: [1]Kevent = .{.{
+            .ident = @intCast(client_fd),
+            .filter = c.EVFILT.READ,
+            .flags = c.EV.ADD | c.EV.ONESHOT,
+            .fflags = 0, .data = 0, .udata = undefined,
+        }};
+        var no_events: [0]Kevent = undefined;
+        _ = c.kevent(worker.kq, &add_event, 1, &no_events, 0, null);
+    }
+
+    return .{ .listening = .{ .port = port } };
+}
+
+fn workerLoop(ctx: *WorkerContext) void {
+    var events: [MAX_EVENTS]Kevent = undefined;
+    var no_changes: [0]Kevent = undefined;
+
+    while (ctx.running.load(.acquire)) {
+        var timeout = std.posix.timespec{ .sec = 0, .nsec = 100_000_000 };
+        const n = c.kevent(ctx.kq, &no_changes, 0, &events, MAX_EVENTS, &timeout);
+        if (n <= 0) continue;
+
+        for (events[0..@intCast(n)]) |event| {
+            const fd: posix.fd_t = @intCast(event.ident);
+            const slot: usize = @intCast(@mod(fd, CONNS_PER_WORKER));
+
+            if (ctx.connections[slot]) |*conn| {
+                if (conn.state == .reading) {
+                    var buffer: [4096]u8 = undefined;
+                    const bytes_read = posix.read(fd, &buffer) catch 0;
+
+                    if (bytes_read == 0) {
+                        posix.close(fd);
+                        ctx.connections[slot] = null;
+                        continue;
+                    }
+
+                    const request = buffer[0..bytes_read];
+                    var method: []const u8 = "GET";
+                    var path: []const u8 = "/";
+                    var client_etag: ?[]const u8 = null;
+
+                    if (std.mem.indexOf(u8, request, " ")) |method_end| {
+                        method = request[0..method_end];
+                        const after_method = request[method_end + 1..];
+                        if (std.mem.indexOf(u8, after_method, " ")) |path_end| {
+                            path = after_method[0..path_end];
+                        }
+                    }
+
+                    if (std.mem.indexOf(u8, request, "If-None-Match: \"")) |header_start| {
+                        const etag_start = header_start + 16;
+                        if (etag_start < request.len) {
+                            if (std.mem.indexOf(u8, request[etag_start..], "\"")) |etag_end| {
+                                client_etag = request[etag_start..etag_start + etag_end];
+                            }
+                        }
+                    }
+
+                    conn.response = if (ctx.router) |router|
+                        router(method, path, client_etag)
+                    else
+                        null;
+
+                    if (conn.response == null) {
+                        conn.response = "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
+                    }
+
+                    conn.state = .writing;
+                    _ = posix.write(fd, conn.response.?) catch {
+                        posix.close(fd);
+                        ctx.connections[slot] = null;
+                        continue;
+                    };
+
+                    conn.state = .reading;
+                    conn.response = null;
+                    var keep_alive_event: [1]Kevent = .{.{
+                        .ident = @intCast(fd),
+                        .filter = c.EVFILT.READ,
+                        .flags = c.EV.ADD | c.EV.ONESHOT,
+                        .fflags = 0, .data = 0, .udata = undefined,
+                    }};
+                    var keep_alive_empty: [0]Kevent = undefined;
+                    _ = c.kevent(ctx.kq, &keep_alive_event, 1, &keep_alive_empty, 0, null);
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// HANDLER - Abstract event for request handling
+// ============================================================================
+// User implements this with pattern branches via router transform
+
+~[abstract] pub event handler { req: *Request }
+| ok { status: u16, body: []const u8 }
+| not_found {}
+
+// ============================================================================
+// ROUTER - Pattern-branch router transform
+// ============================================================================
+// Transforms pattern branches into dispatch logic using routing.match
+//
+// Usage:
+//   ~orisha:handler = orisha:router(req)
+//   | [GET /] _ |> ok { body: "Hello" }
+//   | [GET /users/:id] p |> ok { body: p.id }
+//   | [*] _ |> not_found {}
+
+~[comptime|transform] pub event router {
+    expr: Expression,
+    invocation: *const Invocation,
+    item: *const Item,
+    program: *const Program,
+    allocator: std.mem.Allocator
+}
+| transformed { program: *const Program }
+
+~proc router {
+    const ast_mod = @import("ast");
+    _ = @import("ast_functional");  // Available but not used currently
+
+    // Get the flow containing this router invocation
+    const flow = if (item.* == .flow)
+        &item.flow
+    else if (item.* == .subflow_impl and item.subflow_impl.body == .flow)
+        &item.subflow_impl.body.flow
+    else
+        return .{ .transformed = .{ .program = program } };
+
+    // Check if already transformed
+    for (flow.invocation.annotations) |ann| {
+        if (std.mem.startsWith(u8, ann, "@pass_ran")) {
+            return .{ .transformed = .{ .program = program } };
+        }
+    }
+
+    // Collect pattern branches from continuations
+    var patterns: std.ArrayList([]const u8) = .empty;
+    for (flow.continuations) |cont| {
+        if (cont.branch.len > 0 and cont.branch[0] == '[') {
+            patterns.append(allocator, cont.branch) catch unreachable;
+        }
+    }
+
+    if (patterns.items.len == 0) {
+        return .{ .transformed = .{ .program = program } };
+    }
+
+    std.debug.print("[ROUTER TRANSFORM] Found {} pattern branches\n", .{patterns.items.len});
+
+    // Generate unique event name from hash of patterns
+    var hash: u64 = 0;
+    for (patterns.items) |p| {
+        for (p) |ch| hash = hash *% 31 +% ch;
+    }
+    var name_buf: [32]u8 = undefined;
+    const event_name = std.fmt.bufPrint(&name_buf, "_router_{x}", .{hash}) catch "_router_gen";
+
+    std.debug.print("[ROUTER TRANSFORM] Generating event: {s}\n", .{event_name});
+
+    // Create branches for the event (one per pattern)
+    const branches = allocator.alloc(ast_mod.Branch, patterns.items.len) catch unreachable;
+    for (patterns.items, 0..) |pattern, i| {
+        branches[i] = ast_mod.Branch{
+            .name = allocator.dupe(u8, pattern) catch unreachable,
+            .payload = ast_mod.Shape{ .fields = &.{} },  // Empty payload
+        };
+    }
+
+    // Create the event declaration
+    // Use program.main_module_name as module_qualifier (like parser does)
+    const event_decl = ast_mod.EventDecl{
+        .path = ast_mod.DottedPath{
+            .module_qualifier = allocator.dupe(u8, program.main_module_name) catch unreachable,
+            .segments = blk: {
+                const segs = allocator.alloc([]const u8, 1) catch unreachable;
+                segs[0] = allocator.dupe(u8, event_name) catch unreachable;
+                break :blk segs;
+            },
+        },
+        .input = ast_mod.Shape{ .fields = &.{} },  // No input for now
+        .branches = branches,
+        .is_public = false,
+        .module = flow.module,
+        .location = flow.location,
+    };
+
+    // Generate proc body - for now just return first pattern
+    // TODO: Add actual runtime dispatch
+    var proc_body: std.ArrayList(u8) = .empty;
+    proc_body.appendSlice(allocator, "return .{ .@\"") catch unreachable;
+    proc_body.appendSlice(allocator, patterns.items[0]) catch unreachable;
+    proc_body.appendSlice(allocator, "\" = .{} };") catch unreachable;
+
+    std.debug.print("[ROUTER TRANSFORM] Proc body: {s}\n", .{proc_body.items});
+
+    // Create the proc declaration (same module_qualifier as event)
+    const proc_decl = ast_mod.ProcDecl{
+        .path = ast_mod.DottedPath{
+            .module_qualifier = allocator.dupe(u8, program.main_module_name) catch unreachable,
+            .segments = blk: {
+                const segs = allocator.alloc([]const u8, 1) catch unreachable;
+                segs[0] = allocator.dupe(u8, event_name) catch unreachable;
+                break :blk segs;
+            },
+        },
+        .body = proc_body.toOwnedSlice(allocator) catch unreachable,
+        .module = flow.module,
+        .location = flow.location,
+    };
+
+    // Create new invocation pointing to generated event
+    const new_inv_annotations = allocator.alloc([]const u8, flow.invocation.annotations.len + 1) catch unreachable;
+    for (flow.invocation.annotations, 0..) |ann, j| {
+        new_inv_annotations[j] = ann;
+    }
+    new_inv_annotations[flow.invocation.annotations.len] = allocator.dupe(u8, "@pass_ran(\"transform\")") catch unreachable;
+
+    const new_invocation = ast_mod.Invocation{
+        .path = ast_mod.DottedPath{
+            .module_qualifier = allocator.dupe(u8, program.main_module_name) catch unreachable,
+            .segments = blk: {
+                const segs = allocator.alloc([]const u8, 1) catch unreachable;
+                segs[0] = allocator.dupe(u8, event_name) catch unreachable;
+                break :blk segs;
+            },
+        },
+        .args = &.{},  // No args
+        .annotations = new_inv_annotations,
+    };
+
+    // Create transformed flow calling the generated event
+    const transformed_flow = ast_mod.Flow{
+        .invocation = new_invocation,
+        .continuations = flow.continuations,  // Keep original continuations
+        .annotations = flow.annotations,
+        .module = flow.module,
+        .location = flow.location,
+    };
+
+    std.debug.print("[ROUTER TRANSFORM] Transformed flow has {} continuations\n", .{transformed_flow.continuations.len});
+    for (transformed_flow.continuations) |cont| {
+        std.debug.print("[ROUTER TRANSFORM]   Branch: '{s}'\n", .{cont.branch});
+    }
+
+    // Build new program items: add event, proc, replace flow
+    var new_items: std.ArrayList(ast_mod.Item) = .empty;
+    new_items.append(allocator, ast_mod.Item{ .event_decl = event_decl }) catch unreachable;
+    new_items.append(allocator, ast_mod.Item{ .proc_decl = proc_decl }) catch unreachable;
+
+    // Copy all items, replacing the original flow
+    for (program.items) |prog_item| {
+        if (prog_item == .flow) {
+            // Check if this is our flow by comparing locations
+            if (prog_item.flow.location.line == flow.location.line and
+                prog_item.flow.location.column == flow.location.column and
+                std.mem.eql(u8, prog_item.flow.location.file, flow.location.file)) {
+                new_items.append(allocator, ast_mod.Item{ .flow = transformed_flow }) catch unreachable;
+                continue;
+            }
+        }
+        new_items.append(allocator, prog_item) catch unreachable;
+    }
+
+    // Create new program
+    const new_program = allocator.create(ast_mod.Program) catch unreachable;
+    new_program.* = ast_mod.Program{
+        .items = new_items.toOwnedSlice(allocator) catch unreachable,
+        .module_annotations = program.module_annotations,
+        .main_module_name = program.main_module_name,
+        .allocator = allocator,
+    };
+
+    std.debug.print("[ROUTER TRANSFORM] Created new program with {} items\n", .{new_program.items.len});
+
+    return .{ .transformed = .{ .program = new_program } };
+}
+
+// ============================================================================
+// STATIC FILE SERVING
+// ============================================================================
+
+// Serve a directory at a path (GET only, implicit)
+~[norun]pub event static { path: []const u8, directory: ?[]const u8, file: ?[]const u8 }
+
+~[comptime] pub event collect_routes {
+    program: *const Program,
+    allocator: std.mem.Allocator
+}
+| done { route_count: usize }
+
+// ============================================================================
+// ROUTE COLLECTOR (comptime)
+// ============================================================================
+
+const ProcessedRoute = struct {
+    method: []const u8,
+    path: []const u8,
+    response: []const u8,
+    etag: []const u8,
+};
+
+fn stripQuotes(s: []const u8) []const u8 {
+    if (s.len >= 2 and s[0] == '"' and s[s.len - 1] == '"') {
+        return s[1 .. s.len - 1];
+    }
+    return s;
+}
+
+~[comptime] pub proc collect_routes {
+    std.debug.print("\n=== ORISHA STATIC COLLECTOR ===\n", .{});
+
+    var routes: std.ArrayList(ProcessedRoute) = .empty;
+    defer routes.deinit(allocator);
+
+    for (program.items) |item| {
+        if (item != .flow) continue;
+        const inv = item.flow.invocation;
+        if (inv.path.segments.len == 0) continue;
+        const last_segment = inv.path.segments[inv.path.segments.len - 1];
+        if (!std.mem.eql(u8, last_segment, "static")) continue;
+
+        // Parse args: path, directory, file
+        var path: []const u8 = "/";
+        var directory: ?[]const u8 = null;
+        var file: ?[]const u8 = null;
+
+        for (inv.args) |arg| {
+            if (std.mem.eql(u8, arg.name, "path")) path = stripQuotes(arg.value);
+            if (std.mem.eql(u8, arg.name, "directory")) directory = stripQuotes(arg.value);
+            if (std.mem.eql(u8, arg.name, "file")) file = stripQuotes(arg.value);
+        }
+
+        std.debug.print("Static: {s}\n", .{path});
+
+        if (directory) |dir_path| {
+            processDirectory(allocator, &routes, "GET", path, dir_path);
+        } else if (file) |file_path| {
+            processFile(allocator, &routes, "GET", path, file_path, null);
+        }
+    }
+
+    std.debug.print("\n=== Generating routes.zig ({} routes) ===\n", .{routes.items.len});
+
+    generateRoutesFile(allocator, routes.items) catch |err| {
+        std.debug.print("ERROR generating routes.zig: {}\n", .{err});
+        return .{ .done = .{ .route_count = 0 } };
+    };
+
+    return .{ .done = .{ .route_count = routes.items.len } };
+}
+
+fn processDirectory(allocator: std.mem.Allocator, routes: *std.ArrayList(ProcessedRoute), method: []const u8, base_path: []const u8, dir_path: []const u8) void {
+    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
+    defer dir.close();
+    var walker = dir.walk(allocator) catch return;
+    defer walker.deinit();
+
+    while (walker.next() catch null) |entry| {
+        if (entry.kind != .file) continue;
+        const file_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.path }) catch continue;
+        const route_path = if (std.mem.eql(u8, base_path, "/"))
+            std.fmt.allocPrint(allocator, "/{s}", .{entry.path}) catch continue
+        else
+            std.fmt.allocPrint(allocator, "{s}/{s}", .{ base_path, entry.path }) catch continue;
+
+        const content = std.fs.cwd().readFileAlloc(allocator, file_path, 10 * 1024 * 1024) catch continue;
+        const http_resp = buildHttpResponse(allocator, content, mimeTypeFromPath(file_path)) catch continue;
+
+        routes.append(allocator, .{ .method = method, .path = route_path, .response = http_resp.response, .etag = http_resp.etag }) catch continue;
+
+        if (std.mem.eql(u8, entry.path, "index.html") and std.mem.eql(u8, base_path, "/")) {
+            routes.append(allocator, .{ .method = method, .path = "/", .response = http_resp.response, .etag = http_resp.etag }) catch continue;
+        }
+    }
+}
+
+fn processFile(allocator: std.mem.Allocator, routes: *std.ArrayList(ProcessedRoute), method: []const u8, path: []const u8, file_path: []const u8, content_type_override: ?[]const u8) void {
+    const content = std.fs.cwd().readFileAlloc(allocator, file_path, 10 * 1024 * 1024) catch return;
+    const content_type = content_type_override orelse mimeTypeFromPath(file_path);
+    const http_resp = buildHttpResponse(allocator, content, content_type) catch return;
+    routes.append(allocator, .{ .method = method, .path = path, .response = http_resp.response, .etag = http_resp.etag }) catch return;
+}
+
+fn processBody(allocator: std.mem.Allocator, routes: *std.ArrayList(ProcessedRoute), method: []const u8, path: []const u8, body: []const u8, content_type_override: ?[]const u8) void {
+    const content_type = content_type_override orelse "text/plain";
+    const http_resp = buildHttpResponse(allocator, body, content_type) catch return;
+    routes.append(allocator, .{ .method = method, .path = path, .response = http_resp.response, .etag = http_resp.etag }) catch return;
+}
+
+fn computeEtag(content: []const u8, out: *[64]u8) void {
+    var hash: [32]u8 = undefined;
+    Sha256.hash(content, &hash, .{});
+    const hex_chars = "0123456789abcdef";
+    for (hash, 0..) |byte, i| {
+        out[i * 2] = hex_chars[byte >> 4];
+        out[i * 2 + 1] = hex_chars[byte & 0x0f];
+    }
+}
+
+const HttpResponse = struct { response: []const u8, etag: []const u8 };
+
+fn isCompressible(content_type: []const u8) bool {
+    if (std.mem.startsWith(u8, content_type, "text/")) return true;
+    if (std.mem.startsWith(u8, content_type, "application/javascript")) return true;
+    if (std.mem.startsWith(u8, content_type, "application/json")) return true;
+    if (std.mem.startsWith(u8, content_type, "image/svg")) return true;
+    return false;
+}
+
+fn gzipCompress(allocator: std.mem.Allocator, content: []const u8) ?[]const u8 {
+    if (content.len < 100) return null;
+    const max_output = zlib.compressBound(@intCast(content.len));
+    const output = allocator.alloc(u8, max_output) catch return null;
+
+    var strm: zlib.z_stream = std.mem.zeroes(zlib.z_stream);
+    strm.next_in = @constCast(content.ptr);
+    strm.avail_in = @intCast(content.len);
+    strm.next_out = output.ptr;
+    strm.avail_out = @intCast(output.len);
+
+    if (zlib.deflateInit2(&strm, zlib.Z_DEFAULT_COMPRESSION, zlib.Z_DEFLATED, 15 + 16, 8, zlib.Z_DEFAULT_STRATEGY) != zlib.Z_OK) {
+        allocator.free(output);
+        return null;
+    }
+
+    const result = zlib.deflate(&strm, zlib.Z_FINISH);
+    const compressed_size = output.len - strm.avail_out;
+    _ = zlib.deflateEnd(&strm);
+
+    if (result != zlib.Z_STREAM_END or compressed_size >= content.len) {
+        allocator.free(output);
+        return null;
+    }
+
+    return allocator.realloc(output, compressed_size) catch output[0..compressed_size];
+}
+
+fn buildHttpResponse(allocator: std.mem.Allocator, content: []const u8, content_type: []const u8) !HttpResponse {
+    var etag_buf: [64]u8 = undefined;
+    computeEtag(content, &etag_buf);
+    const etag = try allocator.dupe(u8, etag_buf[0..16]);
+
+    const compressed = if (isCompressible(content_type)) gzipCompress(allocator, content) else null;
+    const body = compressed orelse content;
+
+    var response: std.ArrayList(u8) = .empty;
+    try response.appendSlice(allocator, "HTTP/1.1 200 OK\r\nContent-Type: ");
+    try response.appendSlice(allocator, content_type);
+    try response.appendSlice(allocator, "\r\n");
+    if (compressed != null) try response.appendSlice(allocator, "Content-Encoding: gzip\r\n");
+    try response.appendSlice(allocator, "Content-Length: ");
+    var len_buf: [20]u8 = undefined;
+    try response.appendSlice(allocator, std.fmt.bufPrint(&len_buf, "{}", .{body.len}) catch "0");
+    try response.appendSlice(allocator, "\r\nETag: \"");
+    try response.appendSlice(allocator, etag);
+    try response.appendSlice(allocator, "\"\r\nConnection: keep-alive\r\n\r\n");
+    try response.appendSlice(allocator, body);
+
+    return .{ .response = response.items, .etag = etag };
+}
+
+fn mimeTypeFromPath(path: []const u8) []const u8 {
+    if (std.mem.endsWith(u8, path, ".html")) return "text/html; charset=utf-8";
+    if (std.mem.endsWith(u8, path, ".css")) return "text/css; charset=utf-8";
+    if (std.mem.endsWith(u8, path, ".js")) return "application/javascript; charset=utf-8";
+    if (std.mem.endsWith(u8, path, ".json")) return "application/json";
+    if (std.mem.endsWith(u8, path, ".png")) return "image/png";
+    if (std.mem.endsWith(u8, path, ".jpg") or std.mem.endsWith(u8, path, ".jpeg")) return "image/jpeg";
+    if (std.mem.endsWith(u8, path, ".gif")) return "image/gif";
+    if (std.mem.endsWith(u8, path, ".svg")) return "image/svg+xml";
+    if (std.mem.endsWith(u8, path, ".ico")) return "image/x-icon";
+    if (std.mem.endsWith(u8, path, ".woff")) return "font/woff";
+    if (std.mem.endsWith(u8, path, ".woff2")) return "font/woff2";
+    return "application/octet-stream";
+}
+
+fn generateRoutesFile(allocator: std.mem.Allocator, routes: []const ProcessedRoute) !void {
+    std.fs.cwd().makeDir("generated") catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(allocator);
+
+    try output.appendSlice(allocator,
+        \\// AUTO-GENERATED by Orisha
+        \\const std = @import("std");
+        \\pub const Route = struct { method: []const u8, path: []const u8, response: []const u8, etag: []const u8 };
+        \\pub const response_304 = "HTTP/1.1 304 Not Modified\r\nConnection: keep-alive\r\n\r\n";
+        \\pub const routes = [_]Route{
+        \\
+    );
+
+    for (routes) |route| {
+        try appendFmt(allocator, &output, "    .{{ .method = \"{s}\", .path = \"{s}\", .etag = \"{s}\", .response = ", .{ route.method, route.path, route.etag });
+        try output.append(allocator, '"');
+        for (route.response) |byte| {
+            switch (byte) {
+                '\n' => try output.appendSlice(allocator, "\\n"),
+                '\r' => try output.appendSlice(allocator, "\\r"),
+                '\t' => try output.appendSlice(allocator, "\\t"),
+                '"' => try output.appendSlice(allocator, "\\\""),
+                '\\' => try output.appendSlice(allocator, "\\\\"),
+                0x20...0x21, 0x23...0x5b, 0x5d...0x7e => try output.append(allocator, byte),
+                else => {
+                    var hex_buf: [4]u8 = undefined;
+                    _ = std.fmt.bufPrint(&hex_buf, "\\x{x:0>2}", .{byte}) catch unreachable;
+                    try output.appendSlice(allocator, &hex_buf);
+                },
+            }
+        }
+        try output.appendSlice(allocator, "\" },\n");
+    }
+
+    try output.appendSlice(allocator,
+        \\};
+        \\pub fn lookup(method: []const u8, path: []const u8) ?[]const u8 {
+        \\    for (routes) |r| if (std.mem.eql(u8, r.method, method) and std.mem.eql(u8, r.path, path)) return r.response;
+        \\    return null;
+        \\}
+        \\pub fn lookupWithEtag(method: []const u8, path: []const u8, client_etag: ?[]const u8) ?[]const u8 {
+        \\    for (routes) |r| {
+        \\        if (std.mem.eql(u8, r.method, method) and std.mem.eql(u8, r.path, path)) {
+        \\            if (client_etag) |e| if (std.mem.eql(u8, e, r.etag)) return response_304;
+        \\            return r.response;
+        \\        }
+        \\    }
+        \\    return null;
+        \\}
+        \\
+    );
+
+    const file = try std.fs.cwd().createFile("generated/routes.zig", .{});
+    defer file.close();
+    try file.writeAll(output.items);
+}
+
+fn appendFmt(allocator: std.mem.Allocator, list: *std.ArrayList(u8), comptime fmt: []const u8, args: anytype) !void {
+    var buf: [4096]u8 = undefined;
+    try list.appendSlice(allocator, std.fmt.bufPrint(&buf, fmt, args) catch return error.OutOfMemory);
+}

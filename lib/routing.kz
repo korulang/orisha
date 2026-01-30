@@ -1,0 +1,180 @@
+// Orisha Router - Pattern-matching HTTP router
+//
+// Standalone module for testing and benchmarking routing logic
+// without network overhead.
+//
+// Usage:
+//   ~test(Route matching) {
+//       ~router.match = ok { path: "/users/42", pattern: "/users/:id" }
+//       ~router.match(path: "/users/42", pattern: "/users/:id")
+//       | ok m |> assert.ok()
+//   }
+
+~import "$std/testing"
+
+const router_std = @import("std");
+
+// ============================================================================
+// TYPES
+// ============================================================================
+
+pub const RouteMatch = struct {
+    matched: bool,
+    params: [8]Param,
+    param_count: usize,
+
+    pub const Param = struct {
+        name: []const u8,
+        value: []const u8,
+    };
+
+    pub fn getParam(self: *const RouteMatch, name: []const u8) ?[]const u8 {
+        for (self.params[0..self.param_count]) |p| {
+            if (router_std.mem.eql(u8, p.name, name)) return p.value;
+        }
+        return null;
+    }
+};
+
+pub const Route = struct {
+    method: []const u8,
+    pattern: []const u8,
+    segments: []const Segment,
+
+    pub const Segment = union(enum) {
+        literal: []const u8,
+        param: []const u8,
+        wildcard: void,
+    };
+};
+
+// ============================================================================
+// PATTERN MATCHING
+// ============================================================================
+
+// Match a path against a pattern like "/users/:id/posts/:post_id"
+// Returns match result with extracted parameters
+~pub event match { path: []const u8, pattern: []const u8 }
+| ok { result: RouteMatch }
+| no_match {}
+
+~[pure] pub proc match {
+    var result = RouteMatch{
+        .matched = false,
+        .params = undefined,
+        .param_count = 0,
+    };
+
+    // Parse pattern into segments
+    var pattern_iter = router_std.mem.splitScalar(u8, pattern, '/');
+    var path_iter = router_std.mem.splitScalar(u8, path, '/');
+
+    while (true) {
+        const pattern_seg = pattern_iter.next();
+        const path_seg = path_iter.next();
+
+        // Both exhausted = match
+        if (pattern_seg == null and path_seg == null) {
+            result.matched = true;
+            return .{ .ok = .{ .result = result } };
+        }
+
+        // One exhausted but not other = no match
+        if (pattern_seg == null or path_seg == null) {
+            return .{ .no_match = .{} };
+        }
+
+        const p = pattern_seg.?;
+        const s = path_seg.?;
+
+        // Empty segments (from leading/trailing slashes)
+        if (p.len == 0 and s.len == 0) continue;
+
+        // Wildcard matches anything
+        if (p.len == 1 and p[0] == '*') {
+            // Wildcard consumes rest of path
+            result.matched = true;
+            return .{ .ok = .{ .result = result } };
+        }
+
+        // Parameter segment
+        if (p.len > 0 and p[0] == ':') {
+            const param_name = p[1..];
+            if (result.param_count < 8) {
+                result.params[result.param_count] = .{
+                    .name = param_name,
+                    .value = s,
+                };
+                result.param_count += 1;
+            }
+            continue;
+        }
+
+        // Literal segment - must match exactly
+        if (!router_std.mem.eql(u8, p, s)) {
+            return .{ .no_match = .{} };
+        }
+    }
+}
+
+// TODO: match_route needs cross-event call support
+// The @This().match_event pattern doesn't work inside nested event structs
+// ~pub event match_route { method: []const u8, path: []const u8, route_method: []const u8, pattern: []const u8 }
+// | ok { result: RouteMatch }
+// | no_match {}
+
+// ============================================================================
+// TESTS
+// ============================================================================
+
+~test(Exact path matches) {
+    ~match(path: "/", pattern: "/")
+    | ok |> assert.ok()
+    | no_match |> assert.fail()
+}
+
+~test(Exact path with segments) {
+    ~match(path: "/users", pattern: "/users")
+    | ok |> assert.ok()
+    | no_match |> assert.fail()
+}
+
+~test(Parameter extraction) {
+    ~match(path: "/users/42", pattern: "/users/:id")
+    | ok |> assert.ok()
+    | no_match |> assert.fail()
+}
+
+~test(Multiple parameters) {
+    ~match(path: "/users/42/posts/123", pattern: "/users/:user_id/posts/:post_id")
+    | ok |> assert.ok()
+    | no_match |> assert.fail()
+}
+
+~test(No match different path) {
+    ~match(path: "/posts/42", pattern: "/users/:id")
+    | ok |> assert.fail()
+    | no_match |> assert.ok()
+}
+
+~test(No match shorter path) {
+    ~match(path: "/users", pattern: "/users/:id")
+    | ok |> assert.fail()
+    | no_match |> assert.ok()
+}
+
+~test(No match longer path) {
+    ~match(path: "/users/42/extra", pattern: "/users/:id")
+    | ok |> assert.fail()
+    | no_match |> assert.ok()
+}
+
+~test(Wildcard matches all) {
+    ~match(path: "/static/css/style.css", pattern: "/static/*")
+    | ok |> assert.ok()
+    | no_match |> assert.fail()
+}
+
+// TODO: match_route tests need mocking since it calls match internally
+// ~test(Method matching) { ... }
+// ~test(Method mismatch) { ... }

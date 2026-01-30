@@ -1,0 +1,6 @@
+server,url,requests_per_sec
+Orisha,http://localhost:3000/,110717.96
+nginx,http://localhost:3001/,95137.82
+Go,http://localhost:3002/,59071.80
+Bun,http://localhost:3003/,65521.79
+actix-web,http://localhost:3004/,95748.89
