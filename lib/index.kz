@@ -16,7 +16,7 @@
 //
 //   // Start the server
 //   ~orisha:serve(port: 3000)
-//   | listening |> io.println(message: "Server running on port 3000")
+//   | shutdown s |> io.println(message: s.reason)
 //   | failed f |> io.println(message: f.msg)
 
 ~import "$std/compiler"
@@ -221,9 +221,12 @@ pub const ConnHandle = struct {
 // ============================================================================
 
 ~pub event serve { port: u16 }
-| listening { server: *ServerHandle }
+| shutdown { reason: []const u8 }
 | failed { msg: []const u8 }
 
+// serve delegates to listen, then loops forever accepting requests.
+// Currently only returns 'failed' if listen fails.
+// 'shutdown' will be returned when graceful shutdown is implemented.
 ~serve = listen(port)
 | listening l |> #accept_loop accept(server: l.server)
     | request r |> handler(req: r.req)

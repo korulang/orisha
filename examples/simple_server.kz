@@ -9,5 +9,5 @@
 
 // Start the server
 ~orisha:serve(port: 3001)
-| listening _ |> std.io:println(text: "Server running!")
-| failed _ |> std.io:println(text: "Failed to start server")
+| shutdown s |> std.io:println(text: s.reason)
+| failed f |> std.io:println(text: f.msg)
