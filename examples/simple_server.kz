@@ -1,0 +1,13 @@
+// Simple Orisha server test
+// Tests the new Koru-flow-based server architecture
+
+~import "$orisha"
+~import "$std/io"
+
+// Implement the handler - just return Hello World for everything
+~orisha:handler = response { status: 200, body: "Hello from Koru!" }
+
+// Start the server
+~orisha:serve(port: 3001)
+| listening _ |> std.io:println(text: "Server running!")
+| failed _ |> std.io:println(text: "Failed to start server")
