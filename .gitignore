@@ -24,6 +24,19 @@ Cargo.lock
 # Go build artifacts
 go.sum
 
+# .NET build artifacts
+bin/
+obj/
+*.dll
+*.pdb
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
 # Node.js
 node_modules/
 package-lock.json

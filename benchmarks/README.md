@@ -1,6 +1,6 @@
 # Orisha Benchmark Suite
 
-Compares Orisha against nginx, Go, Bun, and Rust actix-web for both static and dynamic endpoints.
+Compares Orisha against nginx, Go, Bun, Rust actix-web, .NET, and mrhttp for both static and dynamic endpoints.
 
 ## Quick Start
 
@@ -26,6 +26,8 @@ Compares Orisha against nginx, Go, Bun, and Rust actix-web for both static and d
 - `cargo` - Rust compiler (for actix-web benchmark)
 - `nginx` - nginx server (for nginx benchmark)
 - `koruc` - Koru compiler (for Orisha benchmark)
+- `dotnet` - .NET 8 SDK (for .NET benchmark)
+- `python3` + `mrhttp` - Python with mrhttp (`pip install mrhttp`)
 
 ## Endpoints Tested
 
@@ -47,6 +49,8 @@ All servers implement the same API:
 | Go | 3002 |
 | Bun | 3003 |
 | actix-web | 3004 |
+| .NET | 3005 |
+| mrhttp | 3006 |
 
 ## Configuration
 
@@ -76,6 +80,8 @@ Results are saved to `results/` as CSV files with timestamps.
 | **Go** | embed.FS | Prefix tree | encoding/json |
 | **Bun** | File read at startup | Regex match | Response.json() |
 | **actix-web** | include_str!() | Macro-generated tree | serde_json |
+| **.NET** | ReadAllText at startup | Minimal API tree | Manual string |
+| **mrhttp** | Read at startup | uvloop + httptools | Manual f-string |
 
 ## Why Orisha Should Win (Static)
 

@@ -31,6 +31,8 @@ PORT_NGINX=3001
 PORT_GO=3002
 PORT_BUN=3003
 PORT_ACTIX=3004
+PORT_DOTNET=3005
+PORT_MRHTTP=3006
 
 log() { echo -e "${BLUE}==>${NC} $1"; }
 success() { echo -e "${GREEN}✓${NC} $1"; }
@@ -46,6 +48,8 @@ check_deps() {
     command -v cargo >/dev/null 2>&1 || warn "cargo not found - Rust benchmark will be skipped"
     command -v nginx >/dev/null 2>&1 || warn "nginx not found - nginx benchmark will be skipped"
     command -v koruc >/dev/null 2>&1 || warn "koruc not found - Orisha benchmark will be skipped"
+    command -v dotnet >/dev/null 2>&1 || warn "dotnet not found - .NET benchmark will be skipped"
+    command -v python3 >/dev/null 2>&1 || warn "python3 not found - mrhttp benchmark will be skipped"
 
     success "Dependency check complete"
 }
@@ -81,6 +85,14 @@ build_all() {
         success "Orisha dynamic server built"
     fi
 
+    # Build .NET
+    if command -v dotnet >/dev/null 2>&1; then
+        log "Building .NET server..."
+        (cd "$SCRIPT_DIR/dynamic/dotnet" && dotnet publish -c Release -o bin/publish 2>/dev/null)
+        success ".NET server built"
+    fi
+
+    # mrhttp doesn't need building (Python)
     # Bun doesn't need building
     success "All servers built"
 }
@@ -89,7 +101,9 @@ kill_servers() {
     log "Stopping any running servers..."
     pkill -f "nginx.*benchmark" 2>/dev/null || true
     pkill -f "orisha-benchmark" 2>/dev/null || true
-    lsof -ti:$PORT_ORISHA,$PORT_NGINX,$PORT_GO,$PORT_BUN,$PORT_ACTIX 2>/dev/null | xargs kill 2>/dev/null || true
+    pkill -f "dotnet-benchmark" 2>/dev/null || true
+    pkill -f "mrhttp.*server" 2>/dev/null || true
+    lsof -ti:$PORT_ORISHA,$PORT_NGINX,$PORT_GO,$PORT_BUN,$PORT_ACTIX,$PORT_DOTNET,$PORT_MRHTTP 2>/dev/null | xargs kill 2>/dev/null || true
     sleep 1
 }
 
@@ -178,6 +192,28 @@ run_static_benchmark() {
         warn "actix-web server not found"
     fi
 
+    # .NET
+    if [ -x "$SCRIPT_DIR/dynamic/dotnet/bin/publish/dotnet-benchmark" ]; then
+        log "Starting .NET server on :$PORT_DOTNET..."
+        (cd "$SCRIPT_DIR/dynamic/dotnet" && ./bin/publish/dotnet-benchmark) &
+        sleep 2
+        benchmark_endpoint ".NET" "http://localhost:$PORT_DOTNET/" "$output_file"
+        kill_servers
+    else
+        warn ".NET server not found"
+    fi
+
+    # mrhttp (Python)
+    if command -v python3 >/dev/null 2>&1 && python3 -c "import mrhttp" 2>/dev/null; then
+        log "Starting mrhttp server on :$PORT_MRHTTP..."
+        (cd "$SCRIPT_DIR/dynamic/mrhttp" && python3 server.py) &
+        sleep 2
+        benchmark_endpoint "mrhttp" "http://localhost:$PORT_MRHTTP/" "$output_file"
+        kill_servers
+    else
+        warn "mrhttp not found (pip install mrhttp)"
+    fi
+
     echo ""
     success "Static benchmark complete. Results: $output_file"
     cat "$output_file"
@@ -214,6 +250,24 @@ run_dynamic_benchmark() {
         "$SCRIPT_DIR/dynamic/rust-actix/target/release/orisha-benchmark-actix" &
         sleep 2
         benchmark_endpoint "actix-web" "http://localhost:$PORT_ACTIX/api/users/42" "$output_file"
+        kill_servers
+    fi
+
+    # .NET
+    if [ -x "$SCRIPT_DIR/dynamic/dotnet/bin/publish/dotnet-benchmark" ]; then
+        log "Starting .NET server on :$PORT_DOTNET..."
+        (cd "$SCRIPT_DIR/dynamic/dotnet" && ./bin/publish/dotnet-benchmark) &
+        sleep 2
+        benchmark_endpoint ".NET" "http://localhost:$PORT_DOTNET/api/users/42" "$output_file"
+        kill_servers
+    fi
+
+    # mrhttp (Python)
+    if command -v python3 >/dev/null 2>&1 && python3 -c "import mrhttp" 2>/dev/null; then
+        log "Starting mrhttp server on :$PORT_MRHTTP..."
+        (cd "$SCRIPT_DIR/dynamic/mrhttp" && python3 server.py) &
+        sleep 2
+        benchmark_endpoint "mrhttp" "http://localhost:$PORT_MRHTTP/api/users/42" "$output_file"
         kill_servers
     fi
 
