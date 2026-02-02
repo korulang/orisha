@@ -1,14 +1,19 @@
-server,endpoint,requests_per_sec,response_bytes,notes
-Orisha,/ (static gzip),168404,929,compile-time embedded + pre-gzipped
-Orisha,/api/users/42 (dynamic),173422,varies,thread-local buffer
-nginx,/ (static gzip_static),132400,940,sendfile + gzip_static
-actix-web,/ (static),134268,2807,include_str uncompressed
-actix-web,/api/users/42,132899,varies,serde_json
-Go,/ (static),88735,2807,embed.FS uncompressed
-Go,/api/users/42,90428,varies,fmt.Fprintf
-Bun,/ (static),86685,2807,file read at startup
-Bun,/api/users/42,91872,varies,Response.json()
-.NET,/ (static),73756,2807,ReadAllText at startup
-.NET,/api/users/42,77409,varies,string interpolation
-actix-web,/ (gzip runtime),75174,~940,Compress middleware - 45% overhead
-nginx,/ (gzip on-the-fly),132400,940,would be slower without gzip_static
+server,endpoint,requests_per_sec,connections,response_bytes,notes
+Orisha,/ (static gzip),168404,50,929,compile-time embedded + pre-gzipped
+Orisha,/ (static gzip),160551,256,929,scales well with connections
+Orisha,/api/users/42 (dynamic),173422,50,varies,thread-local buffer
+nginx,/ (static gzip_static),132400,50,940,sendfile + gzip_static
+actix-web (original),/ (static),134268,50,2807,include_str uncompressed
+actix-web (original),/api/users/42,132899,50,varies,serde_json
+actix-web (TechEmpower),/ (static),131248,50,2807,snmalloc + simd-json + static bytes
+actix-web (TechEmpower),/plaintext,133288,50,13,Bytes::from_static
+actix-web (TechEmpower),/plaintext,136076,256,13,scales modestly
+actix-web (gzip runtime),/ (static),75174,50,~940,Compress middleware - 45% overhead
+.NET (original),/ (static),73756,50,2807,ReadAllText at startup
+.NET (TechEmpower),/ (static),136212,50,2807,ClearProviders + Kestrel config
+.NET (TechEmpower),/plaintext,135907,50,13,direct string return
+.NET (TechEmpower),/api/users/42,140520,50,varies,anonymous type JSON
+Go,/ (static),88735,50,2807,embed.FS uncompressed
+Go,/api/users/42,90428,50,varies,fmt.Fprintf
+Bun,/ (static),86685,50,2807,file read at startup
+Bun,/api/users/42,91872,50,varies,Response.json()
