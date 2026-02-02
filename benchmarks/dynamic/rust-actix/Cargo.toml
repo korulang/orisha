@@ -4,11 +4,15 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-actix-web = { version = "4", features = ["compress-gzip"] }
+actix-web = "4"
+bytes = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+simd-json = "0.14"
+simd-json-derive = "0.15"
+snmalloc-rs = "0.3"
 
 [profile.release]
 lto = true
+opt-level = 3
 codegen-units = 1
 panic = "abort"
