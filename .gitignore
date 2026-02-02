@@ -15,7 +15,7 @@ backend_output_emitted
 a.out
 main
 server
-orisha
+/orisha
 
 # Rust build artifacts
 target/
