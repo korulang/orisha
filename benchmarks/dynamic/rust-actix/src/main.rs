@@ -3,7 +3,7 @@
 // Run: ./target/release/orisha-benchmark-actix
 // Serves on port 3004
 
-use actix_web::{get, web, App, HttpResponse, HttpServer};
+use actix_web::{get, middleware::Compress, web, App, HttpResponse, HttpServer};
 use serde::Serialize;
 
 // Embed files at compile time (like Orisha)
@@ -54,6 +54,7 @@ async fn main() -> std::io::Result<()> {
     println!("actix-web server listening on :3004");
     HttpServer::new(|| {
         App::new()
+            .wrap(Compress::default())
             .service(index)
             .service(about)
             .service(health)

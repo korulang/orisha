@@ -10,3 +10,5 @@ Bun,/ (static),86685,2807,file read at startup
 Bun,/api/users/42,91872,varies,Response.json()
 .NET,/ (static),73756,2807,ReadAllText at startup
 .NET,/api/users/42,77409,varies,string interpolation
+actix-web,/ (gzip runtime),75174,~940,Compress middleware - 45% overhead
+nginx,/ (gzip on-the-fly),132400,940,would be slower without gzip_static
