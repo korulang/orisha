@@ -1,0 +1,12 @@
+server,endpoint,requests_per_sec,response_bytes,notes
+Orisha,/ (static gzip),168404,929,compile-time embedded + pre-gzipped
+Orisha,/api/users/42 (dynamic),173422,varies,thread-local buffer
+nginx,/ (static gzip_static),132400,940,sendfile + gzip_static
+actix-web,/ (static),134268,2807,include_str uncompressed
+actix-web,/api/users/42,132899,varies,serde_json
+Go,/ (static),88735,2807,embed.FS uncompressed
+Go,/api/users/42,90428,varies,fmt.Fprintf
+Bun,/ (static),86685,2807,file read at startup
+Bun,/api/users/42,91872,varies,Response.json()
+.NET,/ (static),73756,2807,ReadAllText at startup
+.NET,/api/users/42,77409,varies,string interpolation
