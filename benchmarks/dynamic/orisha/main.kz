@@ -1,92 +1,21 @@
-// Orisha Dynamic Server Benchmark
+// Orisha Dynamic Benchmark - Using the Router DSL
 //
-// Handles both static files and dynamic API endpoints.
-// Static: / (embedded HTML)
-// Dynamic: /api/users/:id, /api/health
+// Tests the ~orisha:router pattern-matching syntax with a real server
+// Endpoints: /plaintext, /json, /api/health, /api/users/:id
 //
 // Run: koruc main.kz && ./a.out
 
 ~import "$orisha"
-~import "$std/build"
 
-const std = @import("std");
+// Implement the handler as a subflow with router
+~orisha:handler = orisha:router(req)
+| [GET /plaintext] |> response { status: 200, body: "Hello, World!" }
+| [GET /json] |> response { status: 200, body: "{\"message\":\"Hello, World!\"}" }
+| [GET /api/health] |> response { status: 200, body: "{\"status\":\"ok\"}" }
+| [GET /api/users/:id] p |> response { status: 200, body: p.id }
+| [*] |> response { status: 404, body: "Not Found" }
 
-// ============================================================================
-// STATIC CONTENT (compile-time embedded)
-// ============================================================================
-
-~orisha:static(path: "/", directory: "public")
-
-~orisha:collect_routes()
-| done |> _
-
-const static_routes = @import("generated/routes.zig");
-
-// ============================================================================
-// DYNAMIC ROUTING
-// ============================================================================
-
-// Pre-computed response for /api/health (it's constant)
-const health_response = "HTTP/1.1 200 OK\r\n" ++
-    "Content-Type: application/json\r\n" ++
-    "Content-Length: 15\r\n" ++
-    "Connection: keep-alive\r\n\r\n" ++
-    "{\"status\":\"ok\"}";
-
-// Combined router: static lookup + dynamic patterns
-fn combinedRouter(method: []const u8, path: []const u8, client_etag: ?[]const u8) ?[]const u8 {
-    // 1. Try static routes first (O(n) for now, could be hash)
-    if (static_routes.lookupWithEtag(method, path, client_etag)) |response| {
-        return response;
-    }
-
-    // 2. Dynamic patterns
-    if (std.mem.eql(u8, method, "GET")) {
-        // /api/health - constant response
-        if (std.mem.eql(u8, path, "/api/health")) {
-            return health_response;
-        }
-
-        // /api/users/:id - dynamic response
-        if (path.len > 11 and std.mem.startsWith(u8, path, "/api/users/")) {
-            const id = path[11..];
-            // Validate: no more slashes (it's the final segment)
-            if (std.mem.indexOf(u8, id, "/") == null and id.len > 0) {
-                return buildUserResponse(id);
-            }
-        }
-    }
-
-    return null;
-}
-
-// Build JSON response for /api/users/:id
-// Uses thread-local buffer to avoid allocation
-fn buildUserResponse(id: []const u8) []const u8 {
-    const S = struct {
-        threadlocal var buf: [512]u8 = undefined;
-    };
-
-    // Calculate body length: {"id":"<id>","name":"User <id>"}
-    // Base: {"id":"","name":"User "} = 24 chars + 2*id.len
-    const body_len = 24 + id.len * 2;
-
-    const response = std.fmt.bufPrint(&S.buf,
-        "HTTP/1.1 200 OK\r\n" ++
-        "Content-Type: application/json\r\n" ++
-        "Content-Length: {d}\r\n" ++
-        "Connection: keep-alive\r\n\r\n" ++
-        "{{\"id\":\"{s}\",\"name\":\"User {s}\"}}",
-        .{ body_len, id, id }
-    ) catch return "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
-
-    return response;
-}
-
-// ============================================================================
-// SERVER
-// ============================================================================
-
-~orisha:serve(port: 3000, router: combinedRouter)
-| listening |> _
-| failed |> _
+// Start the server
+~orisha:serve(port: 3000)
+| shutdown _ |> _
+| failed _ |> _
