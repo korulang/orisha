@@ -164,34 +164,25 @@ pub const ConnHandle = struct {
     var response_buf: std.ArrayList(u8) = .empty;
     defer response_buf.deinit(allocator);
 
-    // Status line
-    const status_text = switch (status) {
-        200 => "OK",
-        201 => "Created",
-        204 => "No Content",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        403 => "Forbidden",
-        404 => "Not Found",
-        500 => "Internal Server Error",
-        else => "Unknown",
-    };
-
-    response_buf.appendSlice(allocator, "HTTP/1.1 ") catch {};
-    var status_buf: [3]u8 = undefined;
-    _ = std.fmt.bufPrint(&status_buf, "{}", .{status}) catch {};
-    response_buf.appendSlice(allocator, &status_buf) catch {};
-    response_buf.appendSlice(allocator, " ") catch {};
-    response_buf.appendSlice(allocator, status_text) catch {};
-    response_buf.appendSlice(allocator, "\r\n") catch {};
-
-    // Headers
-    response_buf.appendSlice(allocator, "Content-Type: text/plain\r\n") catch {};
-    response_buf.appendSlice(allocator, "Content-Length: ") catch {};
     var len_buf: [20]u8 = undefined;
     const len_str = std.fmt.bufPrint(&len_buf, "{}", .{body.len}) catch "0";
-    response_buf.appendSlice(allocator, len_str) catch {};
-    response_buf.appendSlice(allocator, "\r\nConnection: close\r\n\r\n") catch {};
+    if (headerPrefixClose(status)) |prefix| {
+        response_buf.appendSlice(allocator, prefix) catch {};
+        response_buf.appendSlice(allocator, len_str) catch {};
+        response_buf.appendSlice(allocator, "\r\nConnection: close\r\n\r\n") catch {};
+    } else {
+        response_buf.appendSlice(allocator, "HTTP/1.1 ") catch {};
+        var status_buf: [3]u8 = undefined;
+        _ = std.fmt.bufPrint(&status_buf, "{}", .{status}) catch {};
+        response_buf.appendSlice(allocator, &status_buf) catch {};
+        response_buf.appendSlice(allocator, " ") catch {};
+        response_buf.appendSlice(allocator, statusText(status)) catch {};
+        response_buf.appendSlice(allocator, "\r\n") catch {};
+        response_buf.appendSlice(allocator, "Content-Type: text/plain\r\n") catch {};
+        response_buf.appendSlice(allocator, "Content-Length: ") catch {};
+        response_buf.appendSlice(allocator, len_str) catch {};
+        response_buf.appendSlice(allocator, "\r\nConnection: close\r\n\r\n") catch {};
+    }
 
     // Body
     response_buf.appendSlice(allocator, body) catch {};
@@ -257,6 +248,34 @@ fn statusText(status: u16) []const u8 {
         404 => "Not Found",
         500 => "Internal Server Error",
         else => "Unknown",
+    };
+}
+
+fn headerPrefixClose(status: u16) ?[]const u8 {
+    return switch (status) {
+        200 => "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ",
+        201 => "HTTP/1.1 201 Created\r\nContent-Type: text/plain\r\nContent-Length: ",
+        204 => "HTTP/1.1 204 No Content\r\nContent-Type: text/plain\r\nContent-Length: ",
+        400 => "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: ",
+        401 => "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain\r\nContent-Length: ",
+        403 => "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: ",
+        404 => "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: ",
+        500 => "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: ",
+        else => null,
+    };
+}
+
+fn headerPrefixKeepAlive(status: u16) ?[]const u8 {
+    return switch (status) {
+        200 => "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ",
+        201 => "HTTP/1.1 201 Created\r\nContent-Type: text/plain\r\nContent-Length: ",
+        204 => "HTTP/1.1 204 No Content\r\nContent-Type: text/plain\r\nContent-Length: ",
+        400 => "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: ",
+        401 => "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain\r\nContent-Length: ",
+        403 => "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: ",
+        404 => "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: ",
+        500 => "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: ",
+        else => null,
     };
 }
 
@@ -330,11 +349,15 @@ fn workerLoop(ctx: *WorkerContext) void {
                         }
                     } else {
                         var header_buf: [256]u8 = undefined;
-                        const header = std.fmt.bufPrint(
-                            &header_buf,
-                            "HTTP/1.1 {d} {s}\r\nContent-Type: text/plain\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n",
-                            .{ res.status, statusText(res.status), res.body.len },
-                        ) catch "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        const header = if (headerPrefixKeepAlive(res.status)) |prefix|
+                            std.fmt.bufPrint(&header_buf, "{s}{d}\r\nConnection: keep-alive\r\n\r\n", .{ prefix, res.body.len }) catch
+                                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        else
+                            std.fmt.bufPrint(
+                                &header_buf,
+                                "HTTP/1.1 {d} {s}\r\nContent-Type: text/plain\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n",
+                                .{ res.status, statusText(res.status), res.body.len },
+                            ) catch "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
                         if (!writeAll(fd, header) or !writeAll(fd, res.body)) {
                             posix.close(fd);

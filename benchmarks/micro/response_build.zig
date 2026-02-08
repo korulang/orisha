@@ -1,10 +1,21 @@
 const std = @import("std");
 
-fn buildResponse(allocator: std.mem.Allocator, status: u16, body: []const u8) usize {
-    var response_buf: std.ArrayList(u8) = .empty;
-    defer response_buf.deinit(allocator);
+fn headerPrefixClose(status: u16) ?[]const u8 {
+    return switch (status) {
+        200 => "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ",
+        201 => "HTTP/1.1 201 Created\r\nContent-Type: text/plain\r\nContent-Length: ",
+        204 => "HTTP/1.1 204 No Content\r\nContent-Type: text/plain\r\nContent-Length: ",
+        400 => "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: ",
+        401 => "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain\r\nContent-Length: ",
+        403 => "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: ",
+        404 => "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: ",
+        500 => "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: ",
+        else => null,
+    };
+}
 
-    const status_text = switch (status) {
+fn statusText(status: u16) []const u8 {
+    return switch (status) {
         200 => "OK",
         201 => "Created",
         204 => "No Content",
@@ -15,21 +26,31 @@ fn buildResponse(allocator: std.mem.Allocator, status: u16, body: []const u8) us
         500 => "Internal Server Error",
         else => "Unknown",
     };
+}
 
-    response_buf.appendSlice(allocator, "HTTP/1.1 ") catch {};
-    var status_buf: [3]u8 = undefined;
-    _ = std.fmt.bufPrint(&status_buf, "{}", .{status}) catch {};
-    response_buf.appendSlice(allocator, &status_buf) catch {};
-    response_buf.appendSlice(allocator, " ") catch {};
-    response_buf.appendSlice(allocator, status_text) catch {};
-    response_buf.appendSlice(allocator, "\r\n") catch {};
+fn buildResponse(allocator: std.mem.Allocator, status: u16, body: []const u8) usize {
+    var response_buf: std.ArrayList(u8) = .empty;
+    defer response_buf.deinit(allocator);
 
-    response_buf.appendSlice(allocator, "Content-Type: text/plain\r\n") catch {};
-    response_buf.appendSlice(allocator, "Content-Length: ") catch {};
     var len_buf: [20]u8 = undefined;
     const len_str = std.fmt.bufPrint(&len_buf, "{}", .{body.len}) catch "0";
-    response_buf.appendSlice(allocator, len_str) catch {};
-    response_buf.appendSlice(allocator, "\r\nConnection: close\r\n\r\n") catch {};
+    if (headerPrefixClose(status)) |prefix| {
+        response_buf.appendSlice(allocator, prefix) catch {};
+        response_buf.appendSlice(allocator, len_str) catch {};
+        response_buf.appendSlice(allocator, "\r\nConnection: close\r\n\r\n") catch {};
+    } else {
+        response_buf.appendSlice(allocator, "HTTP/1.1 ") catch {};
+        var status_buf: [3]u8 = undefined;
+        _ = std.fmt.bufPrint(&status_buf, "{}", .{status}) catch {};
+        response_buf.appendSlice(allocator, &status_buf) catch {};
+        response_buf.appendSlice(allocator, " ") catch {};
+        response_buf.appendSlice(allocator, statusText(status)) catch {};
+        response_buf.appendSlice(allocator, "\r\n") catch {};
+        response_buf.appendSlice(allocator, "Content-Type: text/plain\r\n") catch {};
+        response_buf.appendSlice(allocator, "Content-Length: ") catch {};
+        response_buf.appendSlice(allocator, len_str) catch {};
+        response_buf.appendSlice(allocator, "\r\nConnection: close\r\n\r\n") catch {};
+    }
 
     response_buf.appendSlice(allocator, body) catch {};
 

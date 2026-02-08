@@ -49,7 +49,7 @@ Notes:
 parseLoop:      6.86 ns/op
 parseIndexOf:   2.23 ns/op
 router_dispatch: 56.16 ns/op
-response_build: 5359.89 ns/op
+response_build: 4509.20 ns/op
 ```
 
 Notes:
