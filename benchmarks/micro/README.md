@@ -22,7 +22,7 @@ Bench: `router_dispatch.zig`
 Run (ensure generated code exists first):
 ```sh
 koruc benchmarks/dynamic/orisha/main.kz
-zig run benchmarks/micro/router_dispatch.zig -O ReleaseFast -- 10000000
+zig run benchmarks/micro/router_dispatch.zig -O ReleaseFast -Mbackend=benchmarks/dynamic/orisha/output_emitted.zig -- 10000000
 ```
 
 Notes:
@@ -42,3 +42,15 @@ zig run benchmarks/micro/response_build.zig -O ReleaseFast -- 1000000
 Notes:
 - Measures response string building (status line + headers + body).
 - Does **not** include syscalls or network write.
+
+## Latest run (2026-02-08, local)
+
+```
+parseLoop:      6.86 ns/op
+parseIndexOf:   2.23 ns/op
+router_dispatch: 56.16 ns/op
+response_build: 5359.89 ns/op
+```
+
+Notes:
+- These are local measurements on this machine; treat as directional.

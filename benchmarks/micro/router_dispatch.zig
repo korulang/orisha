@@ -1,12 +1,13 @@
 const std = @import("std");
 
 // Uses the generated code from the dynamic Orisha benchmark.
-const backend = @import("../dynamic/orisha/output_emitted.zig");
+// Run with: zig run ... -Mbackend=benchmarks/dynamic/orisha/output_emitted.zig
+const backend = @import("backend");
 
 fn runBench(
     label: []const u8,
     handler: anytype,
-    requests: []backend.main_module.orisha.Request,
+    requests: []const backend.koru_orisha.Request,
     iterations: usize,
 ) !void {
     var timer = try std.time.Timer.start();
@@ -51,7 +52,7 @@ pub fn main() !void {
         iterations = try std.fmt.parseInt(usize, args[1], 10);
     }
 
-    const requests = [_]backend.main_module.orisha.Request{
+    const requests = [_]backend.koru_orisha.Request{
         .{ .method = "GET", .path = "/plaintext", .body = null, .allocator = allocator },
         .{ .method = "GET", .path = "/json", .body = null, .allocator = allocator },
         .{ .method = "GET", .path = "/api/health", .body = null, .allocator = allocator },
@@ -59,6 +60,6 @@ pub fn main() !void {
         .{ .method = "GET", .path = "/nope", .body = null, .allocator = allocator },
     };
 
-    const handler = backend.main_module.orisha.handler_event.handler;
+    const handler = backend.koru_orisha.handler_event.handler;
     try runBench("router_dispatch", handler, &requests, iterations);
 }
