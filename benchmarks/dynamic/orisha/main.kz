@@ -6,13 +6,23 @@
 // Run: koruc main.kz && ./a.out
 
 ~import "$orisha"
+const std = @import("std");
+
+// Build JSON body for /api/users/:id (upstream formatting)
+fn userJsonBody(id: []const u8) []const u8 {
+    const S = struct {
+        threadlocal var buf: [256]u8 = undefined;
+    };
+
+    return std.fmt.bufPrint(&S.buf, "{{\"id\":\"{s}\",\"name\":\"User {s}\"}}", .{ id, id }) catch id;
+}
 
 // Implement the handler as a subflow with router
 ~orisha:handler = orisha:router(req)
 | [GET /plaintext] |> response { status: 200, body: "Hello, World!" }
 | [GET /json] |> response { status: 200, body: "{\"message\":\"Hello, World!\"}" }
 | [GET /api/health] |> response { status: 200, body: "{\"status\":\"ok\"}" }
-| [GET /api/users/:id] p |> response { status: 200, body: p.id }
+| [GET /api/users/:id] p |> response { status: 200, body: main_module.userJsonBody(p.id) }
 | [*] |> response { status: 404, body: "Not Found" }
 
 // Start the server
