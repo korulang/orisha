@@ -34,9 +34,12 @@ fn buildResponse(allocator: std.mem.Allocator, status: u16, body: []const u8) us
 
     var len_buf: [20]u8 = undefined;
     const len_str = std.fmt.bufPrint(&len_buf, "{}", .{body.len}) catch "0";
+    const ct = "text/plain";
     if (headerPrefixClose(status)) |prefix| {
         response_buf.appendSlice(allocator, prefix) catch {};
         response_buf.appendSlice(allocator, len_str) catch {};
+        response_buf.appendSlice(allocator, "\r\nContent-Type: ") catch {};
+        response_buf.appendSlice(allocator, ct) catch {};
         response_buf.appendSlice(allocator, "\r\nConnection: close\r\n\r\n") catch {};
     } else {
         response_buf.appendSlice(allocator, "HTTP/1.1 ") catch {};
@@ -46,7 +49,9 @@ fn buildResponse(allocator: std.mem.Allocator, status: u16, body: []const u8) us
         response_buf.appendSlice(allocator, " ") catch {};
         response_buf.appendSlice(allocator, statusText(status)) catch {};
         response_buf.appendSlice(allocator, "\r\n") catch {};
-        response_buf.appendSlice(allocator, "Content-Type: text/plain\r\n") catch {};
+        response_buf.appendSlice(allocator, "Content-Type: ") catch {};
+        response_buf.appendSlice(allocator, ct) catch {};
+        response_buf.appendSlice(allocator, "\r\n") catch {};
         response_buf.appendSlice(allocator, "Content-Length: ") catch {};
         response_buf.appendSlice(allocator, len_str) catch {};
         response_buf.appendSlice(allocator, "\r\nConnection: close\r\n\r\n") catch {};

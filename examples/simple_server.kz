@@ -5,7 +5,7 @@
 ~import "$std/io"
 
 // Implement the handler - just return Hello World for everything
-~orisha:handler = response { status: 200, body: "Hello from Koru!" }
+~orisha:handler = response { status: 200, body: "Hello from Koru!", content_type: "text/plain" }
 
 // Start the server
 ~orisha:serve(port: 3001)

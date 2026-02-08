@@ -10,9 +10,9 @@
 //
 //   // Implement the handler with routing
 //   ~orisha:handler = orisha:router(req)
-//   | [GET /] _ |> response { status: 200, body: "Hello World" }
-//   | [GET /users/:id] p |> response { status: 200, body: p.id }
-//   | [*] _ |> response { status: 404, body: "Not Found" }
+//   | [GET /] _ |> response { status: 200, body: "Hello World", content_type: "text/plain" }
+//   | [GET /users/:id] p |> response { status: 200, body: p.id, content_type: "text/plain" }
+//   | [*] _ |> response { status: 404, body: "Not Found", content_type: "text/plain" }
 //
 //   // Start the server
 //   ~orisha:serve(port: 3000)
@@ -153,12 +153,13 @@ pub const ConnHandle = struct {
 // SEND - Send HTTP response and close connection
 // ============================================================================
 
-~pub event send { conn: *ConnHandle, status: u16, body: []const u8 }
+~pub event send { conn: *ConnHandle, status: u16, body: []const u8, content_type: ?[]const u8 }
 | sent {}
 | failed { msg: []const u8 }
 
 ~proc send {
     const allocator = conn.allocator;
+    const ct = if (content_type) |ct_str| ct_str else "text/plain";
 
     // Build HTTP response
     var response_buf: std.ArrayList(u8) = .empty;
@@ -169,6 +170,8 @@ pub const ConnHandle = struct {
     if (headerPrefixClose(status)) |prefix| {
         response_buf.appendSlice(allocator, prefix) catch {};
         response_buf.appendSlice(allocator, len_str) catch {};
+        response_buf.appendSlice(allocator, "\r\nContent-Type: ") catch {};
+        response_buf.appendSlice(allocator, ct) catch {};
         response_buf.appendSlice(allocator, "\r\nConnection: close\r\n\r\n") catch {};
     } else {
         response_buf.appendSlice(allocator, "HTTP/1.1 ") catch {};
@@ -178,7 +181,9 @@ pub const ConnHandle = struct {
         response_buf.appendSlice(allocator, " ") catch {};
         response_buf.appendSlice(allocator, statusText(status)) catch {};
         response_buf.appendSlice(allocator, "\r\n") catch {};
-        response_buf.appendSlice(allocator, "Content-Type: text/plain\r\n") catch {};
+        response_buf.appendSlice(allocator, "Content-Type: ") catch {};
+        response_buf.appendSlice(allocator, ct) catch {};
+        response_buf.appendSlice(allocator, "\r\n") catch {};
         response_buf.appendSlice(allocator, "Content-Length: ") catch {};
         response_buf.appendSlice(allocator, len_str) catch {};
         response_buf.appendSlice(allocator, "\r\nConnection: close\r\n\r\n") catch {};
@@ -203,10 +208,10 @@ pub const ConnHandle = struct {
 // Users implement this to handle requests. Default returns 404.
 
 ~[abstract]pub event handler { req: *Request }
-| response { status: u16, body: []const u8 }
+| response { status: u16, body: []const u8, content_type: ?[]const u8 }
 
 // Default implementation - 404 for everything
-~handler = response { status: 404, body: "Not Found" }
+~handler = response { status: 404, body: "Not Found", content_type: null }
 
 // ============================================================================
 // SERVE - Main server flow (calls handler for each request)
@@ -338,6 +343,7 @@ fn workerLoop(ctx: *WorkerContext) void {
                     const res = switch (result) {
                         .response => |r| r,
                     };
+                    const res_ct = if (res.content_type) |ct_str| ct_str else "text/plain";
 
                     conn.state = .writing;
 
@@ -350,13 +356,13 @@ fn workerLoop(ctx: *WorkerContext) void {
                     } else {
                         var header_buf: [256]u8 = undefined;
                         const header = if (headerPrefixKeepAlive(res.status)) |prefix|
-                            std.fmt.bufPrint(&header_buf, "{s}{d}\r\nConnection: keep-alive\r\n\r\n", .{ prefix, res.body.len }) catch
+                            std.fmt.bufPrint(&header_buf, "{s}{d}\r\nContent-Type: {s}\r\nConnection: keep-alive\r\n\r\n", .{ prefix, res.body.len, res_ct }) catch
                                 "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                         else
                             std.fmt.bufPrint(
                                 &header_buf,
-                                "HTTP/1.1 {d} {s}\r\nContent-Type: text/plain\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n",
-                                .{ res.status, statusText(res.status), res.body.len },
+                                "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n",
+                                .{ res.status, statusText(res.status), res_ct, res.body.len },
                             ) catch "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
                         if (!writeAll(fd, header) or !writeAll(fd, res.body)) {
@@ -465,9 +471,9 @@ fn workerLoop(ctx: *WorkerContext) void {
 //
 // Usage:
 //   ~orisha:handler = orisha:router(req)
-//   | [GET /] _ |> response { status: 200, body: "Hello" }
-//   | [GET /users/:id] p |> response { status: 200, body: p.id }
-//   | [*] _ |> response { status: 404, body: "Not Found" }
+//   | [GET /] _ |> response { status: 200, body: "Hello", content_type: "text/plain" }
+//   | [GET /users/:id] p |> response { status: 200, body: p.id, content_type: "text/plain" }
+//   | [*] _ |> response { status: 404, body: "Not Found", content_type: "text/plain" }
 
 ~[comptime|transform]pub event router {
     invocation: *const Invocation,
