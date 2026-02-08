@@ -1,0 +1,5 @@
+server,url,requests_per_sec
+Bun,http://localhost:3003/api/users/42,94355.93
+actix-web,http://localhost:3004/api/users/42,131150.16
+.NET,http://localhost:3005/api/users/42,142762.94
+Orisha,http://localhost:3000/api/users/42,150798.40

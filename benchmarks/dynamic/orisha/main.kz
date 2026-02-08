@@ -19,10 +19,11 @@ fn userJsonBody(id: []const u8) []const u8 {
 
 // Implement the handler as a subflow with router
 ~orisha:handler = orisha:router(req)
-| [GET /plaintext] |> response { status: 200, body: "Hello, World!", content_type: "text/plain" }
+// Log-guided order based on access.log (most frequent first)
+| [GET /api/users/:id] p |> response { status: 200, body: main_module.userJsonBody(p.id), content_type: "application/json" }
 | [GET /json] |> response { status: 200, body: "{\"message\":\"Hello, World!\"}", content_type: "application/json" }
 | [GET /api/health] |> response { status: 200, body: "{\"status\":\"ok\"}", content_type: "application/json" }
-| [GET /api/users/:id] p |> response { status: 200, body: main_module.userJsonBody(p.id), content_type: "application/json" }
+| [GET /plaintext] |> response { status: 200, body: "Hello, World!", content_type: "text/plain" }
 | [*] |> response { status: 404, body: "Not Found", content_type: "text/plain" }
 
 // Start the server
