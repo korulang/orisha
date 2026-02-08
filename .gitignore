@@ -8,6 +8,7 @@ zig-out/
 backend_tmp
 output_emitted
 backend_output_emitted
+!benchmarks/micro/*.zig
 
 # Executables
 *.exe
