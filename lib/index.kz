@@ -457,6 +457,7 @@ fn workerLoop(ctx: *WorkerContext) void {
 ~proc router {
     const ast_mod = @import("ast");
     const ast_functional = @import("ast_functional");
+    const continuation_codegen = @import("continuation_codegen");
 
     // Get the flow containing this router invocation
     const flow = if (item.* == .flow)
@@ -481,10 +482,20 @@ fn workerLoop(ctx: *WorkerContext) void {
     }
 
     // Collect pattern branches from continuations
+    const PatternCont = struct {
+        pattern: []const u8,
+        cont: *const ast_mod.Continuation,
+    };
+
     var patterns: std.ArrayList([]const u8) = .empty;
-    for (flow.continuations) |cont| {
+    var pattern_conts: std.ArrayList(PatternCont) = .empty;
+    for (flow.continuations, 0..) |*cont, i| {
         if (cont.branch.len > 0 and cont.branch[0] == '[') {
             patterns.append(allocator, cont.branch) catch unreachable;
+            pattern_conts.append(allocator, .{
+                .pattern = cont.branch,
+                .cont = &flow.continuations[i],
+            }) catch unreachable;
         }
     }
 
@@ -539,33 +550,25 @@ fn workerLoop(ctx: *WorkerContext) void {
         }) catch unreachable;
     }
 
-    // Build inline_body: a Zig block expression that dispatches on the route
+    // Build inline_body: direct control flow with branch bodies inlined.
     // This runs inline (in scope), so runtime values like the expr are accessible.
     var ib: std.ArrayList(u8) = .empty;
-    ib.appendSlice(allocator, "blk: {\n") catch unreachable;
-
-    // Define the route result union type inline
-    ib.appendSlice(allocator, "    const RouteResult = union(enum) {\n") catch unreachable;
-    for (parsed_patterns.items) |pp| {
-        ib.appendSlice(allocator, "        @\"") catch unreachable;
-        ib.appendSlice(allocator, pp.raw) catch unreachable;
-        ib.appendSlice(allocator, "\": struct {") catch unreachable;
-        for (pp.params) |param_name| {
-            ib.appendSlice(allocator, " ") catch unreachable;
-            ib.appendSlice(allocator, param_name) catch unreachable;
-            ib.appendSlice(allocator, ": []const u8,") catch unreachable;
-        }
-        ib.appendSlice(allocator, " },\n") catch unreachable;
-    }
-    ib.appendSlice(allocator, "    };\n") catch unreachable;
+    ib.appendSlice(allocator, "//@koru:inline_stmt\n") catch unreachable;
 
     // Dispatch logic (group by method to reduce repeated checks)
     var catch_all: ?*const ParsedPattern = null;
+    var catch_all_cont: ?*const ast_mod.Continuation = null;
 
     var methods: std.ArrayList([]const u8) = .empty;
     for (parsed_patterns.items) |*pp| {
         if (pp.is_catchall) {
             catch_all = pp;
+            for (pattern_conts.items) |pc| {
+                if (std.mem.eql(u8, pc.pattern, pp.raw)) {
+                    catch_all_cont = pc.cont;
+                    break;
+                }
+            }
             continue;
         }
         var seen = false;
@@ -579,6 +582,8 @@ fn workerLoop(ctx: *WorkerContext) void {
             methods.append(allocator, pp.method) catch unreachable;
         }
     }
+
+    var result_counter: usize = 0;
 
     for (methods.items) |method_name| {
         ib.appendSlice(allocator, "    if (std.mem.eql(u8, (") catch unreachable;
@@ -597,9 +602,22 @@ fn workerLoop(ctx: *WorkerContext) void {
                 ib.appendSlice(allocator, ").path, \"") catch unreachable;
                 ib.appendSlice(allocator, pp.path) catch unreachable;
                 ib.appendSlice(allocator, "\")) {\n") catch unreachable;
-                ib.appendSlice(allocator, "            break :blk RouteResult{ .@\"") catch unreachable;
-                ib.appendSlice(allocator, pp.raw) catch unreachable;
-                ib.appendSlice(allocator, "\" = .{} };\n        }\n") catch unreachable;
+                if (find_cont: {
+                    for (pattern_conts.items) |pc| {
+                        if (std.mem.eql(u8, pc.pattern, pp.raw)) break :find_cont pc.cont;
+                    }
+                    break :find_cont null;
+                }) |cont| {
+                    const code = continuation_codegen.generateContinuationChain(
+                        allocator,
+                        cont,
+                        program.main_module_name,
+                        &result_counter,
+                        3,
+                    ) catch unreachable;
+                    ib.appendSlice(allocator, code) catch unreachable;
+                }
+                ib.appendSlice(allocator, "        }\n") catch unreachable;
             } else {
                 var prefix_end: usize = 0;
                 var path_iter = std.mem.splitScalar(u8, pp.path, '/');
@@ -626,11 +644,31 @@ fn workerLoop(ctx: *WorkerContext) void {
                 ib.appendSlice(allocator, ") _p[") catch unreachable;
                 ib.appendSlice(allocator, prefix_len_str) catch unreachable;
                 ib.appendSlice(allocator, "..] else \"\";\n") catch unreachable;
-                ib.appendSlice(allocator, "            break :blk RouteResult{ .@\"") catch unreachable;
-                ib.appendSlice(allocator, pp.raw) catch unreachable;
-                ib.appendSlice(allocator, "\" = .{ .") catch unreachable;
-                ib.appendSlice(allocator, pp.params[0]) catch unreachable;
-                ib.appendSlice(allocator, " = _param } };\n        }\n") catch unreachable;
+                if (find_cont: {
+                    for (pattern_conts.items) |pc| {
+                        if (std.mem.eql(u8, pc.pattern, pp.raw)) break :find_cont pc.cont;
+                    }
+                    break :find_cont null;
+                }) |cont| {
+                    if (cont.binding) |binding| {
+                        if (!(binding.len > 0 and binding[0] == '_')) {
+                            ib.appendSlice(allocator, "            const ") catch unreachable;
+                            ib.appendSlice(allocator, binding) catch unreachable;
+                            ib.appendSlice(allocator, " = .{ .") catch unreachable;
+                            ib.appendSlice(allocator, pp.params[0]) catch unreachable;
+                            ib.appendSlice(allocator, " = _param };\n") catch unreachable;
+                        }
+                    }
+                    const code = continuation_codegen.generateContinuationChain(
+                        allocator,
+                        cont,
+                        program.main_module_name,
+                        &result_counter,
+                        3,
+                    ) catch unreachable;
+                    ib.appendSlice(allocator, code) catch unreachable;
+                }
+                ib.appendSlice(allocator, "        }\n") catch unreachable;
             }
         }
 
@@ -638,9 +676,23 @@ fn workerLoop(ctx: *WorkerContext) void {
     }
 
     const fallback = if (catch_all) |ca| ca.raw else parsed_patterns.items[0].raw;
-    ib.appendSlice(allocator, "    break :blk RouteResult{ .@\"") catch unreachable;
-    ib.appendSlice(allocator, fallback) catch unreachable;
-    ib.appendSlice(allocator, "\" = .{} };\n}") catch unreachable;
+    const fallback_cont = catch_all_cont orelse blk: {
+        for (pattern_conts.items) |pc| {
+            if (std.mem.eql(u8, pc.pattern, fallback)) break :blk pc.cont;
+        }
+        break :blk null;
+    };
+
+    if (fallback_cont) |cont| {
+        const code = continuation_codegen.generateContinuationChain(
+            allocator,
+            cont,
+            program.main_module_name,
+            &result_counter,
+            1,
+        ) catch unreachable;
+        ib.appendSlice(allocator, code) catch unreachable;
+    }
 
     const inline_body_str = ib.toOwnedSlice(allocator) catch unreachable;
     std.debug.print("[ROUTER TRANSFORM] Generated inline dispatch:\n{s}\n", .{inline_body_str});
@@ -658,9 +710,11 @@ fn workerLoop(ctx: *WorkerContext) void {
         .annotations = new_inv_annotations,
     };
 
+    const empty_conts = allocator.alloc(ast_mod.Continuation, 0) catch unreachable;
+
     const transformed_flow = ast_mod.Flow{
         .invocation = new_invocation,
-        .continuations = flow.continuations,
+        .continuations = empty_conts,
         .annotations = flow.annotations,
         .pre_label = flow.pre_label,
         .post_label = flow.post_label,
