@@ -22,7 +22,7 @@ Bench: `router_dispatch.zig`
 Run (ensure generated code exists first):
 ```sh
 koruc benchmarks/dynamic/orisha/main.kz
-zig run benchmarks/micro/router_dispatch.zig -O ReleaseFast -Mbackend=benchmarks/dynamic/orisha/output_emitted.zig -- 10000000
+zig run --dep backend -Mroot=benchmarks/micro/router_dispatch.zig -Mbackend=benchmarks/dynamic/orisha/output_emitted.zig -O ReleaseFast -- 10000000
 ```
 
 Notes:
