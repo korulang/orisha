@@ -108,3 +108,14 @@ koruc main.kz --optimize-routes=access.log
 ```
 
 This is architecturally impossible for runtime frameworks that don't know routes at compile time.
+
+### Local experiment (log-guided manual order)
+
+We ran a one-off test by reordering the router branches in
+`benchmarks/dynamic/orisha/main.kz` based on an `access.log` sample (nginx combined).
+Results are saved in:
+
+- `benchmarks/results/dynamic_json_ct_logorder_20260208_192541.csv`
+- `benchmarks/results/dynamic_json_ct_logorder_retry_20260208_195229.csv`
+
+This test does **not** involve compiler changes; it’s a manual, honest reorder.
