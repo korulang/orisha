@@ -9,13 +9,16 @@ const std = @import("std");
 const TestRequest = struct {
     method: []const u8,
     path: []const u8,
+    body: ?[]const u8,
+    allocator: std.mem.Allocator,
 };
 
 // Test different routes
-const req_root = TestRequest{ .method = "GET", .path = "/" };
-const req_about = TestRequest{ .method = "GET", .path = "/about" };
-const req_user = TestRequest{ .method = "GET", .path = "/users/42" };
-const req_post = TestRequest{ .method = "POST", .path = "/" };
+const req_root = TestRequest{ .method = "GET", .path = "/", .body = null, .allocator = std.heap.page_allocator };
+const req_about = TestRequest{ .method = "GET", .path = "/about", .body = null, .allocator = std.heap.page_allocator };
+const req_user = TestRequest{ .method = "GET", .path = "/users/42", .body = null, .allocator = std.heap.page_allocator };
+const req_post = TestRequest{ .method = "POST", .path = "/", .body = null, .allocator = std.heap.page_allocator };
+const req_post_echo = TestRequest{ .method = "POST", .path = "/api/echo", .body = "{\"name\":\"test\"}", .allocator = std.heap.page_allocator };
 
 // Test 1: Should match [GET /] - no binding (empty payload)
 ~orisha:router(req: &req_root)
@@ -38,9 +41,15 @@ const req_post = TestRequest{ .method = "POST", .path = "/" };
 | [GET /users/:id] p |> std.io:print.ln("3: matched user id={{ p.id:s }}")
 | [*] |> std.io:print.ln("3: catch-all")
 
-// Test 4: Should fall through to catch-all
+// Test 4: Should fall through to catch-all (POST with no POST routes)
 ~orisha:router(req: &req_post)
 | [GET /] |> std.io:print.ln("4: matched GET /")
 | [GET /about] |> std.io:print.ln("4: matched GET /about")
 | [GET /users/:id] _ |> std.io:print.ln("4: matched user (discarded)")
 | [*] |> std.io:print.ln("4: catch-all")
+
+// Test 5: Should match [POST /api/echo] - POST route with body
+~orisha:router(req: &req_post_echo)
+| [GET /] |> std.io:print.ln("5: matched GET /")
+| [POST /api/echo] |> std.io:print.ln("5: matched POST /api/echo")
+| [*] |> std.io:print.ln("5: catch-all")

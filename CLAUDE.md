@@ -1,17 +1,17 @@
 - NEVER SUGGEST NOT FIXING THINGS PROPERLY, THE TOOLCHAIN IS THE ONLY THING OF VALUE.
 
 ## 🧬 Project Consciousness
-Optimizing and benchmarking Orisha's performance against industry-standard frameworks while refining the router DSL and server lifecycle semantics.
+Optimize Orisha webserver performance to exceed industry-standard frameworks (Actix, .NET, Go) using aggressive compile-time specialization and log-guided routing.
 
 ### Decisions
-- **Refactor `orisha:router` to use inline body codegen with Zig block expressions (`blk: { ... }`).**: Improves performance by reducing event-dispatch overhead and allows the router to directly access runtime values from the call-site scope.
-- **Prioritize compile-time pre-compression over runtime compression for static assets.**: Benchmarks showed runtime compression costs ~45% performance. Pre-compression allows Orisha to outperform Nginx (gzip_static) by 27%.
-- **Adopt TechEmpower-style optimizations (snmalloc, SIMD-json, zero-copy) for Orisha benchmarks.**: To establish a high-performance baseline against industry leaders like Actix-web and .NET Kestrel under high concurrency.
-- **Replace 'listening' branch with 'shutdown' and 'failed' semantics in the server 'serve' event.**: The 'listening' branch was misleading as the server enters an infinite accept loop; 'shutdown' provides honest semantics for the server lifecycle.
-- **Rename the router's input parameter from `expr` to `req`.**: Improves API clarity and domain alignment with HTTP requests.
-- **Implement string-based deduplication in `compiler_requires.zig`.**: Prevents 'file exists in modules' and 'redefinition' errors when multiple Koru files require the same dependency.
-- **Update `runtime.kz` dispatcher to return `error.EventDenied` for missing events.**: Aligns runtime behavior with test suite expectations for sandboxed execution security.
-- **Treat multi-part blocks (try/catch/finally, switch/case) as atomic units for [norun|expand] annotations.**: Simplifies the parser and prevents ambiguous states where a 'try' runs but its 'catch' is marked 'norun'.
+- **Replaced the synchronous server loop with a high-performance kqueue-based worker pool in lib/index.kz.**: To achieve performance parity with high-performance frameworks like Actix and .NET while maintaining the Koru DSL DX.
+- **Modified the router transform to emit direct inline statement blocks (if/return chains) instead of a RouteResult union and switch.**: To eliminate the overhead of union tagging and switching, allowing the router to compile down to straight-line Zig control flow.
+- **Modified the Koru compiler (visitor_emitter.zig) to support a '//@koru:inline_stmt' marker for raw statement emission.**: To allow transforms to inject multi-statement blocks (like if/return chains) into the generated Zig without the emitter forcing invalid trailing semicolons.
+- **Adopted a 'compile-time/upstream' approach to JSON formatting using thread-local buffers and precomputed header prefixes.**: To ensure 'honest' performance comparisons with other frameworks by matching payload size and Content-Type while leveraging Zig's efficiency.
+- **Implemented an experiment for log-guided route reordering based on nginx access logs.**: To test the impact of PGO-style optimizations where the most frequent routes are checked first in the generated if-chain.
+- **Precompute and cache response headers as static byte slices.**: Microbenchmarks revealed that string formatting and header construction during the request lifecycle were significant bottlenecks. Precomputing them moves the cost to startup/compile-time.
+- **Introduce granular microbenchmarks for request parsing, router dispatch, and response building.**: To isolate performance gains at the function level, ensuring that DSL changes don't introduce regressions that are masked by network jitter in macro-benchmarks.
+- **Standardize benchmark responses to use Content-Type: application/json and real JSON payloads for dynamic routes.**: To ensure 'apples-to-apples' comparisons with TechEmpower-style frameworks which typically serve JSON, and to measure the impact of SIMD-json integration.
 - **Established /usr/local/lib/koru as the global system path for Koru compiler sources and standard library.**: Allows the compiler to behave as a standard system tool and fixes fragility of 'koruc run' outside the repo root.
 - **Remove `const` and `var` from `std.types` and focus it strictly on type declarations (struct, enum, union).**: Value declarations are handled by raw Zig or `~const` in `control.kz`. Keeping `types.kz` focused on structural definitions is semantically cleaner.
 - **Standardize on Liquid-style `{{ var }}` and `{% if %}` syntax across the entire language, deprecating `${var}`.**: To avoid developer confusion and provide a unified, powerful metaprogramming interface.
@@ -36,10 +36,11 @@ This project uses `prose` to maintain a cross-session semantic memory of decisio
 - **Misleading server lifecycle events (e.g., a 'listening' branch that is never reached due to the infinite accept loop).**: Refactor event branches to 'shutdown' and 'failed' to reflect honest execution semantics.
 - **Runtime compression (Gzip) significantly degrades performance (up to 45% in some frameworks).**: Prioritize compile-time pre-compression or static file serving with pre-compressed assets (gzip_static) to maintain high throughput.
 - **Duplicate module definitions in generated Zig code when multiple Koru files require the same dependency.**: Implement string-based deduplication in the CompilerRequiresCollector using a StringHashMap.
-- **Zig keyword escaping collisions (e.g., @\"@\"error\"\") in the backend emitter.**: Refine escaping logic in the Zig emitter and update runtime.kz error names to avoid reserved keywords.
-- **The router transformation previously generated separate events, causing scope issues for local variables.**: Use inline body codegen (Zig 'blk: {}' expressions) so runtime values from the call-site scope are directly accessible.
+- **Zig keyword escaping collisions (e.g., @\"@\"error\"\\\") in the backend emitter.**: Refine escaping logic in the Zig emitter and update runtime.kz error names to avoid reserved keywords.
+- **The router transformation previously generated separate events, causing scope issues for local variables.**: Use inline body codegen (Zig 'blk: {}' expressions) or the '//@koru:inline_stmt' marker so runtime values from the call-site scope are directly accessible.
+- **Importing modules containing ~test blocks can break the build of the importing module due to missing event definitions.**: Ensure the compiler properly handles or strips test-related events when a module is imported as a dependency.
 
 
 > [!NOTE]
 > This file is automatically generated from `CLAUDE.md.template` by `prose`.
-> Last updated: 2/7/2026, 7:25:47 PM
+> Last updated: 2/9/2026, 2:57:16 PM

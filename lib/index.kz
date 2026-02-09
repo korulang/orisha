@@ -127,15 +127,25 @@ pub const ConnHandle = struct {
         }
     }
 
+    // Parse body from request data
+    var body: ?[]const u8 = null;
+    if (std.mem.indexOf(u8, request_data, "\r\n\r\n")) |header_end| {
+        const body_start = header_end + 4;
+        if (body_start < request_data.len) {
+            body = request_data[body_start..];
+        }
+    }
+
     // Allocate request
     const req = allocator.create(Request) catch {
         conn.stream.close();
         return .{ .failed = .{ .msg = "Failed to allocate request", .server = server } };
     };
+    const duped_body: ?[]const u8 = if (body) |b| allocator.dupe(u8, b) catch b else null;
     req.* = .{
         .method = allocator.dupe(u8, method) catch method,
         .path = allocator.dupe(u8, path) catch path,
-        .body = null,
+        .body = duped_body,
         .allocator = allocator,
     };
 
@@ -332,10 +342,18 @@ fn workerLoop(ctx: *WorkerContext) void {
                         }
                     }
 
+                    var body: ?[]const u8 = null;
+                    if (std.mem.indexOf(u8, request, "\r\n\r\n")) |header_end| {
+                        const body_start = header_end + 4;
+                        if (body_start < request.len) {
+                            body = request[body_start..];
+                        }
+                    }
+
                     var req = Request{
                         .method = method,
                         .path = path,
-                        .body = null,
+                        .body = body,
                         .allocator = std.heap.page_allocator,
                     };
 
