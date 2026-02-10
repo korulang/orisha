@@ -17,7 +17,7 @@
 ~pub event greet { name: []const u8 }
 | greeted []const u8
 
-~greet = std.fmt:ln("Hello, {{name}}!")
+~greet = std.fmt:ln("Hello, {{name:s}}!")
 | line l |> greeted l.text
 
 ~pub event add { a: i64, b: i64 }
@@ -41,7 +41,7 @@
 ~orisha:handler = orisha:router(req)
 | [GET /] |> response { status: 200, body: "Orisha Interpreter Server - POST Koru source to /eval", content_type: "text/plain" }
 | [POST /eval] _ |> std.runtime:run(source: req.body orelse "", scope: "api", budget: 1000)
-    | result r |> std.fmt:ln("{\"branch\":\"{{ r.value.branch:s }}\",\"budget_used\":{{ r.used }}}")
+    | result r |> std.fmt:ln("{\"result\":{{ r.value.toJsonBuf():s }},\"budget_used\":{{ r.used }}}")
         | line l |> response { status: 200, body: l.text, content_type: "application/json" }
     | exhausted e |> std.fmt:ln("{\"error\":\"budget_exhausted\",\"used\":{{ e.used }},\"last_event\":\"{{ e.last_event:s }}\"}")
         | line l |> response { status: 429, body: l.text, content_type: "application/json" }
