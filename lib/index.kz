@@ -268,28 +268,28 @@ fn statusText(status: u16) []const u8 {
 
 fn headerPrefixClose(status: u16) ?[]const u8 {
     return switch (status) {
-        200 => "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ",
-        201 => "HTTP/1.1 201 Created\r\nContent-Type: text/plain\r\nContent-Length: ",
-        204 => "HTTP/1.1 204 No Content\r\nContent-Type: text/plain\r\nContent-Length: ",
-        400 => "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: ",
-        401 => "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain\r\nContent-Length: ",
-        403 => "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: ",
-        404 => "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: ",
-        500 => "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: ",
+        200 => "HTTP/1.1 200 OK\r\nContent-Length: ",
+        201 => "HTTP/1.1 201 Created\r\nContent-Length: ",
+        204 => "HTTP/1.1 204 No Content\r\nContent-Length: ",
+        400 => "HTTP/1.1 400 Bad Request\r\nContent-Length: ",
+        401 => "HTTP/1.1 401 Unauthorized\r\nContent-Length: ",
+        403 => "HTTP/1.1 403 Forbidden\r\nContent-Length: ",
+        404 => "HTTP/1.1 404 Not Found\r\nContent-Length: ",
+        500 => "HTTP/1.1 500 Internal Server Error\r\nContent-Length: ",
         else => null,
     };
 }
 
 fn headerPrefixKeepAlive(status: u16) ?[]const u8 {
     return switch (status) {
-        200 => "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ",
-        201 => "HTTP/1.1 201 Created\r\nContent-Type: text/plain\r\nContent-Length: ",
-        204 => "HTTP/1.1 204 No Content\r\nContent-Type: text/plain\r\nContent-Length: ",
-        400 => "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: ",
-        401 => "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain\r\nContent-Length: ",
-        403 => "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: ",
-        404 => "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: ",
-        500 => "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: ",
+        200 => "HTTP/1.1 200 OK\r\nContent-Length: ",
+        201 => "HTTP/1.1 201 Created\r\nContent-Length: ",
+        204 => "HTTP/1.1 204 No Content\r\nContent-Length: ",
+        400 => "HTTP/1.1 400 Bad Request\r\nContent-Length: ",
+        401 => "HTTP/1.1 401 Unauthorized\r\nContent-Length: ",
+        403 => "HTTP/1.1 403 Forbidden\r\nContent-Length: ",
+        404 => "HTTP/1.1 404 Not Found\r\nContent-Length: ",
+        500 => "HTTP/1.1 500 Internal Server Error\r\nContent-Length: ",
         else => null,
     };
 }
@@ -597,148 +597,136 @@ fn workerLoop(ctx: *WorkerContext) void {
         }) catch unreachable;
     }
 
-    // Build inline_body: direct control flow with branch bodies inlined.
+    // Build inline_body: flat if-else-if-else chain with branch bodies inlined.
     // This runs inline (in scope), so runtime values like the expr are accessible.
+    // Using a proper if-else chain means Zig can prove all paths are covered
+    // (when a catch-all [*] exists), without needing unreachable.
     var ib: std.ArrayList(u8) = .empty;
     ib.appendSlice(allocator, "//@koru:inline_stmt\n") catch unreachable;
-    ib.appendSlice(allocator, "    var __koru_router_matched = false;\n") catch unreachable;
 
-    // Dispatch logic (group by method to reduce repeated checks)
-    var catch_all: ?*const ParsedPattern = null;
+    // Find catch-all pattern and its continuation
     var catch_all_cont: ?*const ast_mod.Continuation = null;
-
-    var methods: std.ArrayList([]const u8) = .empty;
     for (parsed_patterns.items) |*pp| {
         if (pp.is_catchall) {
-            catch_all = pp;
             for (pattern_conts.items) |pc| {
                 if (std.mem.eql(u8, pc.pattern, pp.raw)) {
                     catch_all_cont = pc.cont;
                     break;
                 }
             }
-            continue;
-        }
-        var seen = false;
-        for (methods.items) |m| {
-            if (std.mem.eql(u8, m, pp.method)) {
-                seen = true;
-                break;
-            }
-        }
-        if (!seen) {
-            methods.append(allocator, pp.method) catch unreachable;
         }
     }
 
     var result_counter: usize = 0;
+    var first_branch = true;
 
-    for (methods.items) |method_name| {
-        ib.appendSlice(allocator, "    if (!__koru_router_matched and std.mem.eql(u8, (") catch unreachable;
+    // Emit flat if / else if chain for all non-catchall patterns
+    for (parsed_patterns.items) |*pp| {
+        if (pp.is_catchall) continue;
+
+        // Find continuation for this pattern
+        const cont = find_cont: {
+            for (pattern_conts.items) |pc| {
+                if (std.mem.eql(u8, pc.pattern, pp.raw)) break :find_cont pc.cont;
+            }
+            break :find_cont null;
+        };
+
+        // Emit if / else if
+        if (first_branch) {
+            ib.appendSlice(allocator, "    if (") catch unreachable;
+            first_branch = false;
+        } else {
+            ib.appendSlice(allocator, " else if (") catch unreachable;
+        }
+
+        // Condition: method AND path
+        ib.appendSlice(allocator, "std.mem.eql(u8, (") catch unreachable;
         ib.appendSlice(allocator, req_expr) catch unreachable;
         ib.appendSlice(allocator, ").method, \"") catch unreachable;
-        ib.appendSlice(allocator, method_name) catch unreachable;
-        ib.appendSlice(allocator, "\")) {\n") catch unreachable;
+        ib.appendSlice(allocator, pp.method) catch unreachable;
+        ib.appendSlice(allocator, "\") and ") catch unreachable;
 
-        for (parsed_patterns.items) |*pp| {
-            if (pp.is_catchall) continue;
-            if (!std.mem.eql(u8, pp.method, method_name)) continue;
+        if (pp.params.len == 0) {
+            // Exact path match
+            ib.appendSlice(allocator, "std.mem.eql(u8, (") catch unreachable;
+            ib.appendSlice(allocator, req_expr) catch unreachable;
+            ib.appendSlice(allocator, ").path, \"") catch unreachable;
+            ib.appendSlice(allocator, pp.path) catch unreachable;
+            ib.appendSlice(allocator, "\")") catch unreachable;
+        } else {
+            // Prefix match for parameterized routes
+            var prefix_end: usize = 0;
+            var path_iter = std.mem.splitScalar(u8, pp.path, '/');
+            while (path_iter.next()) |seg| {
+                if (seg.len > 0 and seg[0] == ':') break;
+                prefix_end += seg.len + 1;
+            }
+            const prefix = if (prefix_end > 0) pp.path[0..prefix_end] else "/";
 
-            if (pp.params.len == 0) {
-                ib.appendSlice(allocator, "        if (!__koru_router_matched and std.mem.eql(u8, (") catch unreachable;
-                ib.appendSlice(allocator, req_expr) catch unreachable;
-                ib.appendSlice(allocator, ").path, \"") catch unreachable;
-                ib.appendSlice(allocator, pp.path) catch unreachable;
-                ib.appendSlice(allocator, "\")) {\n") catch unreachable;
-                ib.appendSlice(allocator, "            __koru_router_matched = true;\n") catch unreachable;
-                if (find_cont: {
-                    for (pattern_conts.items) |pc| {
-                        if (std.mem.eql(u8, pc.pattern, pp.raw)) break :find_cont pc.cont;
+            ib.appendSlice(allocator, "std.mem.startsWith(u8, (") catch unreachable;
+            ib.appendSlice(allocator, req_expr) catch unreachable;
+            ib.appendSlice(allocator, ").path, \"") catch unreachable;
+            ib.appendSlice(allocator, prefix) catch unreachable;
+            ib.appendSlice(allocator, "\")") catch unreachable;
+        }
+
+        ib.appendSlice(allocator, ") {\n") catch unreachable;
+
+        // Parameter extraction for parameterized routes
+        if (pp.params.len > 0) {
+            if (cont) |param_cont| {
+                const needs_param = if (param_cont.binding) |binding|
+                    !(binding.len > 0 and binding[0] == '_')
+                else
+                    false;
+
+                if (needs_param) {
+                    var prefix_end2: usize = 0;
+                    var path_iter2 = std.mem.splitScalar(u8, pp.path, '/');
+                    while (path_iter2.next()) |seg| {
+                        if (seg.len > 0 and seg[0] == ':') break;
+                        prefix_end2 += seg.len + 1;
                     }
-                    break :find_cont null;
-                }) |cont| {
-                    const code = continuation_codegen.generateContinuationChain(
-                        allocator,
-                        cont,
-                        program.main_module_name,
-                        &result_counter,
-                        3,
-                    ) catch unreachable;
-                    ib.appendSlice(allocator, code) catch unreachable;
+                    const prefix2 = if (prefix_end2 > 0) pp.path[0..prefix_end2] else "/";
+
+                    var len_buf: [10]u8 = undefined;
+                    const prefix_len_str = std.fmt.bufPrint(&len_buf, "{}", .{prefix2.len}) catch "0";
+                    ib.appendSlice(allocator, "        const _p = (") catch unreachable;
+                    ib.appendSlice(allocator, req_expr) catch unreachable;
+                    ib.appendSlice(allocator, ").path;\n") catch unreachable;
+                    ib.appendSlice(allocator, "        const _param = if (_p.len >= ") catch unreachable;
+                    ib.appendSlice(allocator, prefix_len_str) catch unreachable;
+                    ib.appendSlice(allocator, ") _p[") catch unreachable;
+                    ib.appendSlice(allocator, prefix_len_str) catch unreachable;
+                    ib.appendSlice(allocator, "..] else \"\";\n") catch unreachable;
+                    ib.appendSlice(allocator, "        const ") catch unreachable;
+                    ib.appendSlice(allocator, param_cont.binding.?) catch unreachable;
+                    ib.appendSlice(allocator, " = .{ .") catch unreachable;
+                    ib.appendSlice(allocator, pp.params[0]) catch unreachable;
+                    ib.appendSlice(allocator, " = _param };\n") catch unreachable;
                 }
-                ib.appendSlice(allocator, "        }\n") catch unreachable;
-            } else {
-                var prefix_end: usize = 0;
-                var path_iter = std.mem.splitScalar(u8, pp.path, '/');
-                while (path_iter.next()) |seg| {
-                    if (seg.len > 0 and seg[0] == ':') break;
-                    prefix_end += seg.len + 1;
-                }
-
-                const prefix = if (prefix_end > 0) pp.path[0..prefix_end] else "/";
-
-                ib.appendSlice(allocator, "        if (!__koru_router_matched and std.mem.startsWith(u8, (") catch unreachable;
-                ib.appendSlice(allocator, req_expr) catch unreachable;
-                ib.appendSlice(allocator, ").path, \"") catch unreachable;
-                ib.appendSlice(allocator, prefix) catch unreachable;
-                ib.appendSlice(allocator, "\")) {\n") catch unreachable;
-                ib.appendSlice(allocator, "            __koru_router_matched = true;\n") catch unreachable;
-
-                if (find_cont: {
-                    for (pattern_conts.items) |pc| {
-                        if (std.mem.eql(u8, pc.pattern, pp.raw)) break :find_cont pc.cont;
-                    }
-                    break :find_cont null;
-                }) |cont| {
-                    // Only emit parameter extraction if binding is used
-                    const needs_param = if (cont.binding) |binding|
-                        !(binding.len > 0 and binding[0] == '_')
-                    else
-                        false;
-
-                    if (needs_param) {
-                        var len_buf: [10]u8 = undefined;
-                        const prefix_len_str = std.fmt.bufPrint(&len_buf, "{}", .{prefix.len}) catch "0";
-                        ib.appendSlice(allocator, "            const _p = (") catch unreachable;
-                        ib.appendSlice(allocator, req_expr) catch unreachable;
-                        ib.appendSlice(allocator, ").path;\n") catch unreachable;
-                        ib.appendSlice(allocator, "            const _param = if (_p.len >= ") catch unreachable;
-                        ib.appendSlice(allocator, prefix_len_str) catch unreachable;
-                        ib.appendSlice(allocator, ") _p[") catch unreachable;
-                        ib.appendSlice(allocator, prefix_len_str) catch unreachable;
-                        ib.appendSlice(allocator, "..] else \"\";\n") catch unreachable;
-                        ib.appendSlice(allocator, "            const ") catch unreachable;
-                        ib.appendSlice(allocator, cont.binding.?) catch unreachable;
-                        ib.appendSlice(allocator, " = .{ .") catch unreachable;
-                        ib.appendSlice(allocator, pp.params[0]) catch unreachable;
-                        ib.appendSlice(allocator, " = _param };\n") catch unreachable;
-                    }
-                    const code = continuation_codegen.generateContinuationChain(
-                        allocator,
-                        cont,
-                        program.main_module_name,
-                        &result_counter,
-                        3,
-                    ) catch unreachable;
-                    ib.appendSlice(allocator, code) catch unreachable;
-                }
-                ib.appendSlice(allocator, "        }\n") catch unreachable;
             }
         }
 
-        ib.appendSlice(allocator, "    }\n") catch unreachable;
+        // Continuation code
+        if (cont) |active_cont| {
+            const code = continuation_codegen.generateContinuationChain(
+                allocator,
+                active_cont,
+                program.main_module_name,
+                &result_counter,
+                2,
+            ) catch unreachable;
+            ib.appendSlice(allocator, code) catch unreachable;
+        }
+
+        ib.appendSlice(allocator, "    }") catch unreachable;
     }
 
-    const fallback = if (catch_all) |ca| ca.raw else parsed_patterns.items[0].raw;
-    const fallback_cont = catch_all_cont orelse blk: {
-        for (pattern_conts.items) |pc| {
-            if (std.mem.eql(u8, pc.pattern, fallback)) break :blk pc.cont;
-        }
-        break :blk null;
-    };
-
-    if (fallback_cont) |cont| {
-        ib.appendSlice(allocator, "    if (!__koru_router_matched) {\n") catch unreachable;
+    // Catch-all as else (guarantees all paths covered for Zig control flow)
+    if (catch_all_cont) |cont| {
+        ib.appendSlice(allocator, " else {\n") catch unreachable;
         const code = continuation_codegen.generateContinuationChain(
             allocator,
             cont,
@@ -748,6 +736,8 @@ fn workerLoop(ctx: *WorkerContext) void {
         ) catch unreachable;
         ib.appendSlice(allocator, code) catch unreachable;
         ib.appendSlice(allocator, "    }\n") catch unreachable;
+    } else {
+        ib.appendSlice(allocator, "\n") catch unreachable;
     }
 
     const inline_body_str = ib.toOwnedSlice(allocator) catch unreachable;

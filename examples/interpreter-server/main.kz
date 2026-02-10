@@ -1,0 +1,64 @@
+// Interpreter Server - Koru event continuations as the wire protocol
+//
+// Clients POST Koru source code, the server evaluates it through the
+// budgeted interpreter, and returns the result as JSON.
+//
+// Run: koruc main.kz && ./a.out
+
+~import "$orisha"
+~import "$std/runtime"
+~import "$std/io"
+~import "$std/fmt"
+
+// ============================================================================
+// API EVENTS - These are compiled Zig procs, NOT interpreted
+// ============================================================================
+
+~pub event greet { name: []const u8 }
+| greeted []const u8
+
+~greet = std.fmt:ln("Hello, {{name}}!")
+| line l |> greeted l.text
+
+~pub event add { a: i64, b: i64 }
+| sum i64
+
+~add = sum a + b
+
+// ============================================================================
+// REGISTER SCOPE - maps event names to compiled implementations with costs
+// ============================================================================
+
+~std.runtime:register(scope: "api") {
+    greet(5)   // 5 budget per call
+    add(2)     // 2 budget per call
+}
+
+// ============================================================================
+// SERVER
+// ============================================================================
+
+~orisha:handler = orisha:router(req)
+| [GET /] |> response { status: 200, body: "Orisha Interpreter Server - POST Koru source to /eval", content_type: "text/plain" }
+| [POST /eval] _ |> std.runtime:run(source: req.body orelse "", scope: "api", budget: 1000)
+    | result r |> std.fmt:ln("{\"branch\":\"{{ r.value.branch:s }}\",\"budget_used\":{{ r.used }}}")
+        | line l |> response { status: 200, body: l.text, content_type: "application/json" }
+    | exhausted e |> std.fmt:ln("{\"error\":\"budget_exhausted\",\"used\":{{ e.used }},\"last_event\":\"{{ e.last_event:s }}\"}")
+        | line l |> response { status: 429, body: l.text, content_type: "application/json" }
+    | parse_error e |> std.fmt:ln("{\"error\":\"parse_error\",\"message\":\"{{ e.message:s }}\"}")
+        | line l |> response { status: 400, body: l.text, content_type: "application/json" }
+    | validation_error e |> std.fmt:ln("{\"error\":\"validation_error\",\"message\":\"{{ e.message:s }}\"}")
+        | line l |> response { status: 400, body: l.text, content_type: "application/json" }
+    | shape_error e |> std.fmt:ln("{\"error\":\"shape_error\",\"branch\":\"{{ e.branch:s }}\"}")
+        | line l |> response { status: 400, body: l.text, content_type: "application/json" }
+    | event_denied e |> std.fmt:ln("{\"error\":\"event_denied\",\"name\":\"{{ e.name:s }}\"}")
+        | line l |> response { status: 403, body: l.text, content_type: "application/json" }
+    | dispatch_error e |> std.fmt:ln("{\"error\":\"dispatch_error\",\"event\":\"{{ e.event_name:s }}\"}")
+        | line l |> response { status: 500, body: l.text, content_type: "application/json" }
+    | scope_not_found e |> std.fmt:ln("{\"error\":\"scope_not_found\",\"scope\":\"{{ e.scope_name:s }}\"}")
+        | line l |> response { status: 500, body: l.text, content_type: "application/json" }
+| [*] |> response { status: 404, body: "{\"error\":\"not_found\"}", content_type: "application/json" }
+
+~orisha:serve(port: 3000)
+| shutdown _ |> _
+| failed f |> std.io:println(text: f.msg)
