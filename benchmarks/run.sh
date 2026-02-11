@@ -85,6 +85,13 @@ build_all() {
         success "Orisha dynamic server built"
     fi
 
+    # Build Orisha interpreter server
+    if command -v koruc >/dev/null 2>&1 && [ -d "$SCRIPT_DIR/../examples/interpreter-server" ]; then
+        log "Building Orisha interpreter server..."
+        (cd "$SCRIPT_DIR/../examples/interpreter-server" && koruc main.kz 2>/dev/null)
+        success "Orisha interpreter server built"
+    fi
+
     # Build .NET
     if command -v dotnet >/dev/null 2>&1; then
         log "Building .NET server..."
@@ -95,6 +102,48 @@ build_all() {
     # mrhttp doesn't need building (Python)
     # Bun doesn't need building
     success "All servers built"
+}
+
+build_dynamic() {
+    log "Building dynamic servers..."
+
+    if command -v go >/dev/null 2>&1; then
+        log "Building Go server..."
+        (cd "$SCRIPT_DIR/dynamic/go" && go build -o server main.go)
+        success "Go server built"
+    fi
+
+    if command -v cargo >/dev/null 2>&1; then
+        log "Building Rust actix-web server (this may take a while)..."
+        (cd "$SCRIPT_DIR/dynamic/rust-actix" && cargo build --release 2>/dev/null)
+        success "Rust actix-web server built"
+    fi
+
+    if command -v koruc >/dev/null 2>&1 && [ -d "$SCRIPT_DIR/dynamic/orisha" ]; then
+        log "Building Orisha dynamic server..."
+        (cd "$SCRIPT_DIR/dynamic/orisha" && koruc main.kz 2>/dev/null)
+        success "Orisha dynamic server built"
+    fi
+
+    if command -v dotnet >/dev/null 2>&1; then
+        log "Building .NET server..."
+        (cd "$SCRIPT_DIR/dynamic/dotnet" && dotnet publish -c Release -o bin/publish 2>/dev/null)
+        success ".NET server built"
+    fi
+
+    success "Dynamic servers built"
+}
+
+build_wire() {
+    log "Building wire protocol server..."
+
+    if command -v koruc >/dev/null 2>&1 && [ -d "$SCRIPT_DIR/../examples/interpreter-server" ]; then
+        log "Building Orisha interpreter server..."
+        (cd "$SCRIPT_DIR/../examples/interpreter-server" && koruc main.kz 2>/dev/null)
+        success "Orisha interpreter server built"
+    else
+        warn "Interpreter server not found"
+    fi
 }
 
 kill_servers() {
@@ -121,6 +170,25 @@ benchmark_endpoint() {
     echo "$result"
 
     # Extract requests/sec
+    local rps=$(echo "$result" | grep "Requests/sec" | awk '{print $2}')
+    echo "$name,$url,$rps" >> "$output_file"
+
+    echo "$rps"
+}
+
+benchmark_endpoint_post() {
+    local name="$1"
+    local url="$2"
+    local output_file="$3"
+    local script="$4"
+
+    echo ""
+    log "Benchmarking $name: $url"
+    echo "    Duration: $DURATION, Connections: $CONNECTIONS, Threads: $THREADS"
+
+    local result=$(wrk -t$THREADS -c$CONNECTIONS -d$DURATION -s "$script" "$url" 2>&1)
+    echo "$result"
+
     local rps=$(echo "$result" | grep "Requests/sec" | awk '{print $2}')
     echo "$name,$url,$rps" >> "$output_file"
 
@@ -287,6 +355,34 @@ run_dynamic_benchmark() {
     cat "$output_file"
 }
 
+run_wire_benchmark() {
+    log "=== WIRE PROTOCOL (INTERPRETER) BENCHMARK ==="
+    local output_file="$RESULTS_DIR/wire_$(date +%Y%m%d_%H%M%S).csv"
+    local post_script="$SCRIPT_DIR/wire/post_add.lua"
+    echo "server,url,requests_per_sec" > "$output_file"
+
+    if [ ! -f "$post_script" ]; then
+        warn "POST script not found: $post_script"
+        return
+    fi
+
+    kill_servers
+
+    if [ -x "$SCRIPT_DIR/../examples/interpreter-server/a.out" ]; then
+        log "Starting Orisha interpreter server on :$PORT_ORISHA..."
+        "$SCRIPT_DIR/../examples/interpreter-server/a.out" &
+        sleep 2
+        benchmark_endpoint_post "Orisha-interpreter" "http://localhost:$PORT_ORISHA/eval" "$output_file" "$post_script"
+        kill_servers
+    else
+        warn "Interpreter server not found"
+    fi
+
+    echo ""
+    success "Wire benchmark complete. Results: $output_file"
+    cat "$output_file"
+}
+
 print_summary() {
     echo ""
     echo "=========================================="
@@ -313,8 +409,14 @@ case "${1:-all}" in
         ;;
     dynamic)
         check_deps
-        build_all
+        build_dynamic
         run_dynamic_benchmark
+        print_summary
+        ;;
+    wire)
+        check_deps
+        build_wire
+        run_wire_benchmark
         print_summary
         ;;
     all)
@@ -322,10 +424,11 @@ case "${1:-all}" in
         build_all
         run_static_benchmark
         run_dynamic_benchmark
+        run_wire_benchmark
         print_summary
         ;;
     *)
-        echo "Usage: $0 [build|static|dynamic|all]"
+        echo "Usage: $0 [build|static|dynamic|wire|all]"
         exit 1
         ;;
 esac

@@ -14,6 +14,9 @@ Compares Orisha against nginx, Go, Bun, Rust actix-web, .NET, and mrhttp for bot
 # Run only dynamic endpoint benchmark
 ./run.sh dynamic
 
+# Run wire protocol (interpreter) benchmark
+./run.sh wire
+
 # Build all servers without benchmarking
 ./run.sh build
 ```
@@ -40,6 +43,11 @@ All servers implement the same API:
 | `GET /api/health` | Dynamic | `{"status":"ok"}` |
 | `GET /api/users/:id` | Dynamic | `{"id":"<id>","name":"User <id>"}` |
 
+## Wire Protocol (Interpreter)
+
+The `wire` benchmark runs the interpreter server and POSTs Koru source to `/eval`
+using `benchmarks/wire/post_add.lua`.
+
 ## Port Assignments
 
 | Server | Port |
@@ -51,6 +59,7 @@ All servers implement the same API:
 | actix-web | 3004 |
 | .NET | 3005 |
 | mrhttp | 3006 |
+| Orisha (interpreter) | 3000 |
 
 ## Configuration
 
