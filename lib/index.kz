@@ -488,123 +488,121 @@ fn workerLoop(ctx: *WorkerContext) void {
 // ============================================================================
 // Same architecture: N workers, non-blocking I/O, keep-alive.
 // Uses epoll instead of kqueue for Linux targets.
+// Structs and worker loop at module level (like kqueue) so @This() resolves
+// to the module — giving access to handler_event.
 
-~proc serve|epoll {
+const EpollConn = struct {
+    fd: posix.fd_t,
+    state: enum { reading, writing },
+};
+
+const EpollWorkerCtx = struct {
+    id: usize,
+    epfd: i32,
+    connections: [CONNS_PER_WORKER]?EpollConn,
+    running: *std.atomic.Value(bool),
+};
+
+fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
     const linux = std.os.linux;
+    var events: [MAX_EVENTS]linux.epoll_event = undefined;
 
-    const EpollConn = struct {
-        fd: posix.fd_t,
-        state: enum { reading, writing },
-    };
+    while (ctx.running.load(.acquire)) {
+        const rc = linux.epoll_wait(ctx.epfd, &events, MAX_EVENTS, 100);
+        const n: isize = @bitCast(rc);
+        if (n <= 0) continue;
 
-    const EpollWorkerCtx = struct {
-        id: usize,
-        epfd: i32,
-        connections: [CONNS_PER_WORKER]?EpollConn,
-        running: *std.atomic.Value(bool),
-    };
+        for (events[0..@intCast(@as(usize, @bitCast(n)))]) |event| {
+            const fd: posix.fd_t = event.data.fd;
+            const slot: usize = @intCast(@mod(fd, CONNS_PER_WORKER));
+            if (ctx.connections[slot]) |*conn| {
+                if (conn.state == .reading) {
+                    var buffer: [4096]u8 = undefined;
+                    const bytes_read = posix.read(fd, &buffer) catch 0;
+                    if (bytes_read == 0) {
+                        posix.close(fd);
+                        ctx.connections[slot] = null;
+                        continue;
+                    }
 
-    const ServeModule = @This();
+                    const request = buffer[0..bytes_read];
+                    var method: []const u8 = "GET";
+                    var path: []const u8 = "/";
 
-    const EpollWorker = struct {
-        fn loop(ctx: *EpollWorkerCtx) void {
-            var events: [MAX_EVENTS]linux.epoll_event = undefined;
-
-            while (ctx.running.load(.acquire)) {
-                const rc = linux.epoll_wait(ctx.epfd, &events, MAX_EVENTS, 100);
-                const n: isize = @bitCast(rc);
-                if (n <= 0) continue;
-
-                for (events[0..@intCast(@as(usize, @bitCast(n)))]) |event| {
-                    const fd: posix.fd_t = event.data.fd;
-                    const slot: usize = @intCast(@mod(fd, CONNS_PER_WORKER));
-                    if (ctx.connections[slot]) |*conn| {
-                        if (conn.state == .reading) {
-                            var buffer: [4096]u8 = undefined;
-                            const bytes_read = posix.read(fd, &buffer) catch 0;
-                            if (bytes_read == 0) {
-                                posix.close(fd);
-                                ctx.connections[slot] = null;
-                                continue;
-                            }
-
-                            const request = buffer[0..bytes_read];
-                            var method: []const u8 = "GET";
-                            var path: []const u8 = "/";
-
-                            var i: usize = 0;
-                            while (i < request.len and request[i] != ' ') : (i += 1) {}
-                            if (i < request.len) {
-                                method = request[0..i];
-                                i += 1;
-                                var j: usize = i;
-                                while (j < request.len and request[j] != ' ') : (j += 1) {}
-                                if (j > i) {
-                                    path = request[i..j];
-                                }
-                            }
-
-                            var body: ?[]const u8 = null;
-                            if (std.mem.indexOf(u8, request, "\r\n\r\n")) |header_end| {
-                                const body_start = header_end + 4;
-                                if (body_start < request.len) {
-                                    body = request[body_start..];
-                                }
-                            }
-
-                            var req = Request{
-                                .method = method,
-                                .path = path,
-                                .body = body,
-                                .allocator = std.heap.page_allocator,
-                            };
-
-                            const result = ServeModule.handler_event.handler(.{ .req = &req });
-                            const res = switch (result) {
-                                .response => |r| r,
-                            };
-                            const res_ct = if (res.content_type) |ct_str| ct_str else "text/plain";
-
-                            conn.state = .writing;
-
-                            if (std.mem.startsWith(u8, res.body, "HTTP/1.")) {
-                                if (!writeAll(fd, res.body)) {
-                                    posix.close(fd);
-                                    ctx.connections[slot] = null;
-                                    continue;
-                                }
-                            } else {
-                                var header_buf: [256]u8 = undefined;
-                                const header = if (headerPrefixKeepAlive(res.status)) |prefix|
-                                    std.fmt.bufPrint(&header_buf, "{s}{d}\r\nContent-Type: {s}\r\nConnection: keep-alive\r\n\r\n", .{ prefix, res.body.len, res_ct }) catch
-                                        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                                else
-                                    std.fmt.bufPrint(
-                                        &header_buf,
-                                        "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n",
-                                        .{ res.status, statusText(res.status), res_ct, res.body.len },
-                                    ) catch "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-
-                                if (!writeAll(fd, header) or !writeAll(fd, res.body)) {
-                                    posix.close(fd);
-                                    ctx.connections[slot] = null;
-                                    continue;
-                                }
-                            }
-
-                            conn.state = .reading;
-                            // Re-arm for reading (EPOLLONESHOT requires re-arm)
-                            var re_event = linux.epoll_event{
-                                .events = linux.EPOLL.IN | linux.EPOLL.ONESHOT,
-                                .data = .{ .fd = fd },
-                            };
-                            _ = linux.epoll_ctl(ctx.epfd, linux.EPOLL.CTL_MOD, fd, &re_event);
+                    var i: usize = 0;
+                    while (i < request.len and request[i] != ' ') : (i += 1) {}
+                    if (i < request.len) {
+                        method = request[0..i];
+                        i += 1;
+                        var j: usize = i;
+                        while (j < request.len and request[j] != ' ') : (j += 1) {}
+                        if (j > i) {
+                            path = request[i..j];
                         }
                     }
+
+                    var body: ?[]const u8 = null;
+                    if (std.mem.indexOf(u8, request, "\r\n\r\n")) |header_end| {
+                        const body_start = header_end + 4;
+                        if (body_start < request.len) {
+                            body = request[body_start..];
+                        }
+                    }
+
+                    var req = Request{
+                        .method = method,
+                        .path = path,
+                        .body = body,
+                        .allocator = std.heap.page_allocator,
+                    };
+
+                    const result = @This().handler_event.handler(.{ .req = &req });
+                    const res = switch (result) {
+                        .response => |r| r,
+                    };
+                    const res_ct = if (res.content_type) |ct_str| ct_str else "text/plain";
+
+                    conn.state = .writing;
+
+                    if (std.mem.startsWith(u8, res.body, "HTTP/1.")) {
+                        if (!writeAll(fd, res.body)) {
+                            posix.close(fd);
+                            ctx.connections[slot] = null;
+                            continue;
+                        }
+                    } else {
+                        var header_buf: [256]u8 = undefined;
+                        const header = if (headerPrefixKeepAlive(res.status)) |prefix|
+                            std.fmt.bufPrint(&header_buf, "{s}{d}\r\nContent-Type: {s}\r\nConnection: keep-alive\r\n\r\n", .{ prefix, res.body.len, res_ct }) catch
+                                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        else
+                            std.fmt.bufPrint(
+                                &header_buf,
+                                "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n",
+                                .{ res.status, statusText(res.status), res_ct, res.body.len },
+                            ) catch "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+                        if (!writeAll(fd, header) or !writeAll(fd, res.body)) {
+                            posix.close(fd);
+                            ctx.connections[slot] = null;
+                            continue;
+                        }
+                    }
+
+                    conn.state = .reading;
+                    var re_event = linux.epoll_event{
+                        .events = linux.EPOLL.IN | linux.EPOLL.ONESHOT,
+                        .data = .{ .fd = fd },
+                    };
+                    _ = linux.epoll_ctl(ctx.epfd, linux.EPOLL.CTL_MOD, fd, &re_event);
                 }
             }
         }
-    };
+    }
+}
+
+~proc serve|epoll {
+    const linux = std.os.linux;
 
     const address = std.net.Address.parseIp("0.0.0.0", port) catch {
         return .{ .failed = .{ .msg = "Invalid address" } };
@@ -640,7 +638,7 @@ fn workerLoop(ctx: *WorkerContext) void {
             .running = &running,
         };
 
-        worker_threads[i] = std.Thread.spawn(.{}, EpollWorker.loop, .{&workers[i]}) catch {
+        worker_threads[i] = std.Thread.spawn(.{}, epollWorkerLoop, .{&workers[i]}) catch {
             return .{ .failed = .{ .msg = "Failed to spawn worker thread" } };
         };
     }

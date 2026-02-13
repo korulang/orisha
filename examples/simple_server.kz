@@ -3,6 +3,12 @@
 
 ~import "$orisha"
 ~import "$std/io"
+~import "$std/build"
+
+// Cross-compilation: koruc simple_server.kz --build=linux
+~[build(linux)]std.build:config {
+    "target": "x86_64-linux-musl"
+}
 
 // Implement the handler - just return Hello World for everything
 ~orisha:handler = response { status: 200, body: "Hello from Koru!", content_type: "text/plain" }
