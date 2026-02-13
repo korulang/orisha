@@ -21,6 +21,7 @@
 
 ~import "$std/compiler"
 ~import "$std/io"
+~import "$std/build"
 
 ~std.compiler:requires {
     exe.linkLibC();
@@ -481,6 +482,213 @@ fn workerLoop(ctx: *WorkerContext) void {
 
     return .{ .shutdown = .{ .reason = "Server stopped" } };
 }
+
+// ============================================================================
+// SERVE|EPOLL - Linux epoll variant
+// ============================================================================
+// Same architecture: N workers, non-blocking I/O, keep-alive.
+// Uses epoll instead of kqueue for Linux targets.
+
+~proc serve|epoll {
+    const linux = std.os.linux;
+
+    const EpollConn = struct {
+        fd: posix.fd_t,
+        state: enum { reading, writing },
+    };
+
+    const EpollWorkerCtx = struct {
+        id: usize,
+        epfd: i32,
+        connections: [CONNS_PER_WORKER]?EpollConn,
+        running: *std.atomic.Value(bool),
+    };
+
+    const ServeModule = @This();
+
+    const EpollWorker = struct {
+        fn loop(ctx: *EpollWorkerCtx) void {
+            var events: [MAX_EVENTS]linux.epoll_event = undefined;
+
+            while (ctx.running.load(.acquire)) {
+                const rc = linux.epoll_wait(ctx.epfd, &events, MAX_EVENTS, 100);
+                const n: isize = @bitCast(rc);
+                if (n <= 0) continue;
+
+                for (events[0..@intCast(@as(usize, @bitCast(n)))]) |event| {
+                    const fd: posix.fd_t = event.data.fd;
+                    const slot: usize = @intCast(@mod(fd, CONNS_PER_WORKER));
+                    if (ctx.connections[slot]) |*conn| {
+                        if (conn.state == .reading) {
+                            var buffer: [4096]u8 = undefined;
+                            const bytes_read = posix.read(fd, &buffer) catch 0;
+                            if (bytes_read == 0) {
+                                posix.close(fd);
+                                ctx.connections[slot] = null;
+                                continue;
+                            }
+
+                            const request = buffer[0..bytes_read];
+                            var method: []const u8 = "GET";
+                            var path: []const u8 = "/";
+
+                            var i: usize = 0;
+                            while (i < request.len and request[i] != ' ') : (i += 1) {}
+                            if (i < request.len) {
+                                method = request[0..i];
+                                i += 1;
+                                var j: usize = i;
+                                while (j < request.len and request[j] != ' ') : (j += 1) {}
+                                if (j > i) {
+                                    path = request[i..j];
+                                }
+                            }
+
+                            var body: ?[]const u8 = null;
+                            if (std.mem.indexOf(u8, request, "\r\n\r\n")) |header_end| {
+                                const body_start = header_end + 4;
+                                if (body_start < request.len) {
+                                    body = request[body_start..];
+                                }
+                            }
+
+                            var req = Request{
+                                .method = method,
+                                .path = path,
+                                .body = body,
+                                .allocator = std.heap.page_allocator,
+                            };
+
+                            const result = ServeModule.handler_event.handler(.{ .req = &req });
+                            const res = switch (result) {
+                                .response => |r| r,
+                            };
+                            const res_ct = if (res.content_type) |ct_str| ct_str else "text/plain";
+
+                            conn.state = .writing;
+
+                            if (std.mem.startsWith(u8, res.body, "HTTP/1.")) {
+                                if (!writeAll(fd, res.body)) {
+                                    posix.close(fd);
+                                    ctx.connections[slot] = null;
+                                    continue;
+                                }
+                            } else {
+                                var header_buf: [256]u8 = undefined;
+                                const header = if (headerPrefixKeepAlive(res.status)) |prefix|
+                                    std.fmt.bufPrint(&header_buf, "{s}{d}\r\nContent-Type: {s}\r\nConnection: keep-alive\r\n\r\n", .{ prefix, res.body.len, res_ct }) catch
+                                        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                                else
+                                    std.fmt.bufPrint(
+                                        &header_buf,
+                                        "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n",
+                                        .{ res.status, statusText(res.status), res_ct, res.body.len },
+                                    ) catch "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+                                if (!writeAll(fd, header) or !writeAll(fd, res.body)) {
+                                    posix.close(fd);
+                                    ctx.connections[slot] = null;
+                                    continue;
+                                }
+                            }
+
+                            conn.state = .reading;
+                            // Re-arm for reading (EPOLLONESHOT requires re-arm)
+                            var re_event = linux.epoll_event{
+                                .events = linux.EPOLL.IN | linux.EPOLL.ONESHOT,
+                                .data = .{ .fd = fd },
+                            };
+                            _ = linux.epoll_ctl(ctx.epfd, linux.EPOLL.CTL_MOD, fd, &re_event);
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    const address = std.net.Address.parseIp("0.0.0.0", port) catch {
+        return .{ .failed = .{ .msg = "Invalid address" } };
+    };
+
+    var server = address.listen(.{
+        .reuse_address = true,
+        .kernel_backlog = 512,
+    }) catch {
+        return .{ .failed = .{ .msg = "Failed to listen" } };
+    };
+
+    const O_NONBLOCK: u32 = 0x0800; // Linux O_NONBLOCK
+    const listen_fd = server.stream.handle;
+    const flags = posix.fcntl(listen_fd, posix.F.GETFL, 0) catch 0;
+    _ = posix.fcntl(listen_fd, posix.F.SETFL, flags | O_NONBLOCK) catch {};
+
+    var running = std.atomic.Value(bool).init(true);
+    var workers: [NUM_WORKERS]EpollWorkerCtx = undefined;
+    var worker_threads: [NUM_WORKERS]std.Thread = undefined;
+
+    for (0..NUM_WORKERS) |i| {
+        const epfd_rc = linux.epoll_create1(0);
+        const epfd: i32 = @bitCast(@as(u32, @truncate(epfd_rc)));
+        if (epfd < 0) {
+            return .{ .failed = .{ .msg = "Failed to create worker epoll" } };
+        }
+
+        workers[i] = EpollWorkerCtx{
+            .id = i,
+            .epfd = epfd,
+            .connections = .{null} ** CONNS_PER_WORKER,
+            .running = &running,
+        };
+
+        worker_threads[i] = std.Thread.spawn(.{}, EpollWorker.loop, .{&workers[i]}) catch {
+            return .{ .failed = .{ .msg = "Failed to spawn worker thread" } };
+        };
+    }
+
+    var next_worker: usize = 0;
+
+    std.debug.print("Orisha listening on http://0.0.0.0:{}\n", .{port});
+    std.debug.print("Running with {} workers + epoll + TCP_NODELAY + keep-alive\n", .{NUM_WORKERS});
+
+    while (true) {
+        const conn = server.accept() catch continue;
+        const client_fd = conn.stream.handle;
+
+        const enable: i32 = 1;
+        posix.setsockopt(client_fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, std.mem.asBytes(&enable)) catch {};
+
+        const client_flags = posix.fcntl(client_fd, posix.F.GETFL, 0) catch 0;
+        _ = posix.fcntl(client_fd, posix.F.SETFL, client_flags | O_NONBLOCK) catch continue;
+
+        const worker_id = next_worker;
+        next_worker = (next_worker + 1) % NUM_WORKERS;
+        const worker = &workers[worker_id];
+
+        const slot: usize = @intCast(@mod(client_fd, CONNS_PER_WORKER));
+        worker.connections[slot] = .{ .fd = client_fd, .state = .reading };
+
+        var add_event = linux.epoll_event{
+            .events = linux.EPOLL.IN | linux.EPOLL.ONESHOT,
+            .data = .{ .fd = client_fd },
+        };
+        _ = linux.epoll_ctl(worker.epfd, linux.EPOLL.CTL_ADD, client_fd, &add_event);
+    }
+
+    return .{ .shutdown = .{ .reason = "Server stopped" } };
+}
+
+// ============================================================================
+// VARIANT SELECTION - Platform-specific server implementation
+// ============================================================================
+// Default (no --build flag): uses bare ~proc serve (kqueue/macOS)
+// With --build=linux: selects epoll variant
+
+~[build(linux)]std.build:variants {
+    "orisha:serve": "epoll"
+}
+| configured _ |> _
+| skipped _ |> _
+| invalid_event _ |> _
 
 // ============================================================================
 // ROUTER - Pattern-branch router transform
