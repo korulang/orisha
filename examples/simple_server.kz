@@ -4,16 +4,25 @@
 ~import "$orisha"
 ~import "$std/io"
 ~import "$std/build"
+~import "$koru/docker"
 
-// Cross-compilation: koruc simple_server.kz --build=linux
-~[build(linux)]std.build:config {
-    "target": "x86_64-linux-musl"
-}
-
-// Implement the handler - just return Hello World for everything
+// Implement the handler
 ~orisha:handler = response { status: 200, body: "Hello from Koru!", content_type: "text/plain" }
 
 // Start the server
 ~orisha:serve(port: 3001)
 | shutdown s |> std.io:println(text: s.reason)
 | failed f |> std.io:println(text: f.msg)
+
+// Cross-compilation: koruc simple_server.kz --build=linux
+~[build(linux)]std.build:config {
+    "target": "x86_64-linux-musl"
+}
+
+// Container image: koruc simple_server.kz --build=linux docker build
+~[build(linux)]koru.docker:image(tag: "koru-server:latest") {
+    FROM scratch
+    COPY a.out /server
+    EXPOSE 3001
+    ENTRYPOINT ["/server"]
+}
