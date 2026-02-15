@@ -29,10 +29,10 @@
         Try:
         <button onclick="setSource('~greet(name: &quot;World&quot;)')">greet</button>
         <button onclick="setSource('~add(a: 40, b: 2)')">add</button>
-        <button onclick="setSource('~add(a: ~add(a: 1, b: 2), b: ~add(a: 3, b: 4))')">nested</button>
+        <button onclick="setSource('~add(a: 1, b: 2)\n| sum s |> add(a: s, b: 100)')">chained</button>
         <button onclick="setSource('~delete_everything()')">denied</button>
     </div>
-    <button onclick="evaluate()">Evaluate</button>
+    <button onclick="runEval()">Evaluate</button>
     <div id="output">Press Evaluate to run Koru source on the server.</div>
 
     <div class="info">
@@ -45,16 +45,19 @@
 
     <script>
         function setSource(s) { document.getElementById('source').value = s; }
-        async function evaluate() {
+        async function runEval() {
             const src = document.getElementById('source').value;
             const out = document.getElementById('output');
             out.textContent = 'Evaluating...';
+            const t0 = performance.now();
             try {
                 const res = await fetch('/api/eval', { method: 'POST', body: src });
                 const json = await res.json();
-                out.textContent = JSON.stringify(json, null, 2);
+                const ms = Math.round(performance.now() - t0);
+                out.textContent = JSON.stringify(json, null, 2) + '\n\n⏱ ' + ms + ' ms';
             } catch (e) {
-                out.textContent = 'Error: ' + e.message;
+                const ms = Math.round(performance.now() - t0);
+                out.textContent = 'Error: ' + e.message + '\n\n⏱ ' + ms + ' ms';
             }
         }
     </script>
