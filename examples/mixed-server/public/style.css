@@ -1,0 +1,10 @@
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; color: #1a1a2e; }
+h1 { margin-bottom: 0.5rem; }
+p { margin-bottom: 1rem; line-height: 1.5; }
+nav { display: flex; gap: 1rem; margin: 1rem 0; }
+a { color: #0066cc; }
+ul { margin: 0 0 1rem 1.5rem; }
+li { margin-bottom: 0.5rem; }
+code { background: #f0f0f0; padding: 0.1em 0.3em; border-radius: 3px; font-size: 0.9em; }
+#status { margin-top: 1rem; padding: 0.5rem; background: #e8f5e9; border-radius: 4px; }

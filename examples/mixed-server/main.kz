@@ -1,0 +1,33 @@
+// Mixed Server — Dynamic API + Static Files through unified handler
+//
+// Demonstrates tree-structured routing:
+//   - API routes handled by orisha:router pattern matching
+//   - Static files served by orisha:static_router as catch-all
+//   - Both compose through a single orisha:handler
+//
+// Build & Run:
+//   koruc main.kz && ./a.out
+//
+// Test:
+//   curl http://localhost:3000/              → static index.html
+//   curl http://localhost:3000/about.html    → static about page
+//   curl http://localhost:3000/api/health    → {"status":"ok"}
+//   curl http://localhost:3000/api/info      → {"server":"orisha","version":"0.1.0"}
+//   curl http://localhost:3000/unknown/path  → SPA fallback (index.html)
+
+~import "$orisha"
+~import "$std/io"
+~import "$std/package"
+
+~std.package:requires.npm { "@korulang/gzip": "^0.0.1" }
+
+~orisha:static(name: "site", root: "public", fallback: "index.html")
+
+~orisha:handler = orisha:router(req)
+| [GET /api/health] |> response { status: 200, body: "{\"status\":\"ok\"}", content_type: "application/json" }
+| [GET /api/info] |> response { status: 200, body: "{\"server\":\"orisha\",\"version\":\"0.1.0\"}", content_type: "application/json" }
+| [*] |> orisha:static_router(name: "site")
+
+~orisha:serve(port: 3000)
+| shutdown s |> std.io:println(text: s.reason)
+| failed f |> std.io:println(text: f.msg)

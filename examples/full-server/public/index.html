@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Koru Playground</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; color: #1a1a2e; }
+        h1 { margin-bottom: 0.25rem; }
+        .subtitle { color: #666; margin-bottom: 1.5rem; }
+        textarea { width: 100%; height: 80px; font-family: monospace; font-size: 14px; padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px; resize: vertical; }
+        button { margin-top: 0.5rem; padding: 0.5rem 1.5rem; background: #0066cc; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; }
+        button:hover { background: #0052a3; }
+        #output { margin-top: 1rem; padding: 0.75rem; background: #f5f5f5; border-radius: 4px; font-family: monospace; font-size: 13px; white-space: pre-wrap; min-height: 2rem; }
+        .examples { margin: 1rem 0; }
+        .examples button { background: #eee; color: #333; font-size: 12px; padding: 0.3rem 0.6rem; margin: 0.2rem; }
+        .examples button:hover { background: #ddd; }
+        .info { margin-top: 2rem; padding: 1rem; background: #e8f5e9; border-radius: 4px; font-size: 13px; line-height: 1.6; }
+        code { background: #e0e0e0; padding: 0.1em 0.3em; border-radius: 3px; }
+    </style>
+</head>
+<body>
+    <h1>Koru Playground</h1>
+    <p class="subtitle">Static + Dynamic + Interpreted &mdash; one handler, one binary.</p>
+
+    <textarea id="source" spellcheck="false">~greet(name: "World")</textarea>
+    <div class="examples">
+        Try:
+        <button onclick="setSource('~greet(name: &quot;World&quot;)')">greet</button>
+        <button onclick="setSource('~add(a: 40, b: 2)')">add</button>
+        <button onclick="setSource('~add(a: ~add(a: 1, b: 2), b: ~add(a: 3, b: 4))')">nested</button>
+        <button onclick="setSource('~delete_everything()')">denied</button>
+    </div>
+    <button onclick="evaluate()">Evaluate</button>
+    <div id="output">Press Evaluate to run Koru source on the server.</div>
+
+    <div class="info">
+        <strong>How this works:</strong> This page is a static file embedded in the binary at compile time.
+        The <code>POST /api/eval</code> endpoint runs a budgeted Koru interpreter against compiled event handlers.
+        The <code>GET /api/health</code> endpoint returns a static JSON response.
+        All three modes &mdash; static files, dynamic routes, and live interpretation &mdash;
+        compose through a single <code>orisha:handler</code> using <code>|&gt;</code> continuations.
+    </div>
+
+    <script>
+        function setSource(s) { document.getElementById('source').value = s; }
+        async function evaluate() {
+            const src = document.getElementById('source').value;
+            const out = document.getElementById('output');
+            out.textContent = 'Evaluating...';
+            try {
+                const res = await fetch('/api/eval', { method: 'POST', body: src });
+                const json = await res.json();
+                out.textContent = JSON.stringify(json, null, 2);
+            } catch (e) {
+                out.textContent = 'Error: ' + e.message;
+            }
+        }
+    </script>
+</body>
+</html>

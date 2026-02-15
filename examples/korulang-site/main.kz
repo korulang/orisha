@@ -4,7 +4,7 @@
 // All files are embedded INTO THE BINARY at compile time.
 //
 // Build:
-//   cd ~/src/korulang_org && pnpm build:local
+//   cd ~/src/korulang_org && pnpm build:static
 //   cd ~/src/orisha/examples/korulang-site && koruc main.kz && ./a.out
 //
 // Cross-compile for Linux:
@@ -17,39 +17,10 @@
 
 ~std.package:requires.npm { "@korulang/gzip": "^0.0.1" }
 
-const std = @import("std");
+~orisha:static(name: "site", root: "../../../korulang_org/build", fallback: "200.html")
 
-// ============================================================================
-// STATIC CONTENT - korulang.org build output, embedded at compile time
-// ============================================================================
+~orisha:handler = orisha:static_router(name: "site")
 
-~orisha:static(path: "/", directory: "../../../korulang_org/build")
-
-// ============================================================================
-// COMPILE-TIME ROUTE COLLECTION
-// ============================================================================
-
-~orisha:collect_routes()
-| done |> _
-
-const routes = @import("generated/routes.zig");
-
-// ============================================================================
-// SPA FALLBACK ROUTER
-// ============================================================================
-// SvelteKit adapter-static generates 200.html as the SPA fallback shell.
-// If the path matches a static file, serve it directly.
-// Otherwise, serve 200.html so client-side routing takes over.
-
-fn spaRouter(method: []const u8, path: []const u8, client_etag: ?[]const u8) ?[]const u8 {
-    return routes.lookupWithEtag(method, path, client_etag) orelse
-        routes.lookupWithEtag("GET", "/200.html", null);
-}
-
-// ============================================================================
-// SERVER
-// ============================================================================
-
-~orisha:serve(port: 3000, router: spaRouter)
+~orisha:serve(port: 3000)
 | shutdown s |> std.io:println(text: s.reason)
 | failed f |> std.io:println(text: f.msg)

@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>About — Orisha Mixed Server</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <main>
+        <h1>About</h1>
+        <p>This server demonstrates Orisha's tree-structured routing.</p>
+        <ul>
+            <li><strong>Dynamic routes</strong> — <code>/api/*</code> handled by <code>orisha:router</code></li>
+            <li><strong>Static files</strong> — everything else served by <code>orisha:static_router</code></li>
+            <li><strong>SPA fallback</strong> — unknown paths serve <code>index.html</code></li>
+        </ul>
+        <p>All routes compose through a single <code>orisha:handler</code>.</p>
+        <nav><a href="/">← Home</a></nav>
+    </main>
+</body>
+</html>

@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Orisha Mixed Server</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <main>
+        <h1>Orisha Mixed Server</h1>
+        <p>Static files + dynamic API, all through one handler.</p>
+        <nav>
+            <a href="/">Home</a>
+            <a href="/about.html">About</a>
+            <a href="/api/health">Health API</a>
+            <a href="/api/info">Info API</a>
+        </nav>
+        <section id="status"></section>
+    </main>
+    <script>
+        fetch('/api/health')
+            .then(r => r.json())
+            .then(d => {
+                document.getElementById('status').textContent = 'API status: ' + d.status;
+            });
+    </script>
+</body>
+</html>

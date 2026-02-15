@@ -38,23 +38,14 @@ const std = @import("std");
 // STATIC CONTENT - Embedded at compile time
 // ============================================================================
 
-// Serve entire public directory at root
-~orisha:static(path: "/", directory: "public")
+~orisha:static(name: "site", root: "public")
 
-// ============================================================================
-// COMPILE-TIME ROUTE COLLECTION
-// ============================================================================
-
-~orisha:collect_routes()
-| done |> _
-
-// Import the generated routes
-const routes = @import("generated/routes.zig");
+~orisha:handler = orisha:static_router(name: "site")
 
 // ============================================================================
 // SERVER
 // ============================================================================
 
-~orisha:serve(port: 3000, router: routes.lookupWithEtag)
-| listening |> _
+~orisha:serve(port: 3000)
+| shutdown |> _
 | failed |> _
