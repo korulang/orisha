@@ -1,0 +1,4 @@
+FROM scratch
+COPY a.out /server
+EXPOSE 3001
+ENTRYPOINT ["/server"]

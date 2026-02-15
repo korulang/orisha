@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "@korulang/gzip": "^0.0.1"
+  }
+}

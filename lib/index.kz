@@ -24,6 +24,7 @@
 ~import "$std/build"
 
 ~std.compiler:requires {
+    exe.linkSystemLibrary("z");
     exe.linkLibC();
 }
 
@@ -228,7 +229,9 @@ pub const ConnHandle = struct {
 // SERVE - Main server flow (calls handler for each request)
 // ============================================================================
 
-~pub event serve { port: u16 }
+const RouterFn = *const fn ([]const u8, []const u8, ?[]const u8) ?[]const u8;
+
+~pub event serve { port: u16, router: ?RouterFn }
 | shutdown { reason: []const u8 }
 | failed { msg: []const u8 }
 
@@ -251,6 +254,7 @@ const WorkerContext = struct {
     kq: posix.fd_t,
     connections: [CONNS_PER_WORKER]?AsyncConn,
     running: *std.atomic.Value(bool),
+    router: ?RouterFn,
 };
 
 fn statusText(status: u16) []const u8 {
@@ -343,51 +347,83 @@ fn workerLoop(ctx: *WorkerContext) void {
                         }
                     }
 
-                    var body: ?[]const u8 = null;
-                    if (std.mem.indexOf(u8, request, "\r\n\r\n")) |header_end| {
-                        const body_start = header_end + 4;
-                        if (body_start < request.len) {
-                            body = request[body_start..];
+                    // Extract ETag from If-None-Match header
+                    var client_etag: ?[]const u8 = null;
+                    if (std.mem.indexOf(u8, request, "If-None-Match: ")) |etag_start| {
+                        const etag_val_start = etag_start + 15;
+                        if (std.mem.indexOf(u8, request[etag_val_start..], "\r\n")) |etag_end| {
+                            var etag_raw = request[etag_val_start..etag_val_start + etag_end];
+                            if (etag_raw.len >= 2 and etag_raw[0] == '"' and etag_raw[etag_raw.len - 1] == '"') {
+                                etag_raw = etag_raw[1..etag_raw.len - 1];
+                            }
+                            client_etag = etag_raw;
                         }
                     }
 
-                    var req = Request{
-                        .method = method,
-                        .path = path,
-                        .body = body,
-                        .allocator = std.heap.page_allocator,
-                    };
-
-                    const result = @This().handler_event.handler(.{ .req = &req });
-                    const res = switch (result) {
-                        .response => |r| r,
-                    };
-                    const res_ct = if (res.content_type) |ct_str| ct_str else "text/plain";
-
                     conn.state = .writing;
 
-                    if (std.mem.startsWith(u8, res.body, "HTTP/1.")) {
-                        if (!writeAll(fd, res.body)) {
-                            posix.close(fd);
-                            ctx.connections[slot] = null;
-                            continue;
+                    // Try router first (for pre-built HTTP responses)
+                    if (ctx.router) |router_fn| {
+                        if (router_fn(method, path, client_etag)) |response| {
+                            if (!writeAll(fd, response)) {
+                                posix.close(fd);
+                                ctx.connections[slot] = null;
+                                continue;
+                            }
+                        } else {
+                            const not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: keep-alive\r\n\r\nNot Found";
+                            if (!writeAll(fd, not_found)) {
+                                posix.close(fd);
+                                ctx.connections[slot] = null;
+                                continue;
+                            }
                         }
                     } else {
-                        var header_buf: [256]u8 = undefined;
-                        const header = if (headerPrefixKeepAlive(res.status)) |prefix|
-                            std.fmt.bufPrint(&header_buf, "{s}{d}\r\nContent-Type: {s}\r\nConnection: keep-alive\r\n\r\n", .{ prefix, res.body.len, res_ct }) catch
-                                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        else
-                            std.fmt.bufPrint(
-                                &header_buf,
-                                "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n",
-                                .{ res.status, statusText(res.status), res_ct, res.body.len },
-                            ) catch "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        // No router — use handler
+                        var body: ?[]const u8 = null;
+                        if (std.mem.indexOf(u8, request, "\r\n\r\n")) |header_end| {
+                            const body_start = header_end + 4;
+                            if (body_start < request.len) {
+                                body = request[body_start..];
+                            }
+                        }
 
-                        if (!writeAll(fd, header) or !writeAll(fd, res.body)) {
-                            posix.close(fd);
-                            ctx.connections[slot] = null;
-                            continue;
+                        var req = Request{
+                            .method = method,
+                            .path = path,
+                            .body = body,
+                            .allocator = std.heap.page_allocator,
+                        };
+
+                        const result = @This().handler_event.handler(.{ .req = &req });
+                        const res = switch (result) {
+                            .response => |r| r,
+                        };
+                        const res_ct = if (res.content_type) |ct_str| ct_str else "text/plain";
+
+                        if (std.mem.startsWith(u8, res.body, "HTTP/1.")) {
+                            if (!writeAll(fd, res.body)) {
+                                posix.close(fd);
+                                ctx.connections[slot] = null;
+                                continue;
+                            }
+                        } else {
+                            var header_buf: [256]u8 = undefined;
+                            const header = if (headerPrefixKeepAlive(res.status)) |prefix|
+                                std.fmt.bufPrint(&header_buf, "{s}{d}\r\nContent-Type: {s}\r\nConnection: keep-alive\r\n\r\n", .{ prefix, res.body.len, res_ct }) catch
+                                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            else
+                                std.fmt.bufPrint(
+                                    &header_buf,
+                                    "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n",
+                                    .{ res.status, statusText(res.status), res_ct, res.body.len },
+                                ) catch "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+                            if (!writeAll(fd, header) or !writeAll(fd, res.body)) {
+                                posix.close(fd);
+                                ctx.connections[slot] = null;
+                                continue;
+                            }
                         }
                     }
 
@@ -439,6 +475,7 @@ fn workerLoop(ctx: *WorkerContext) void {
             .kq = worker_kq,
             .connections = .{null} ** CONNS_PER_WORKER,
             .running = &running,
+            .router = router,
         };
 
         worker_threads[i] = std.Thread.spawn(.{}, workerLoop, .{&workers[i]}) catch {
@@ -501,6 +538,7 @@ const EpollWorkerCtx = struct {
     epfd: i32,
     connections: [CONNS_PER_WORKER]?EpollConn,
     running: *std.atomic.Value(bool),
+    router: ?RouterFn,
 };
 
 fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
@@ -541,51 +579,83 @@ fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
                         }
                     }
 
-                    var body: ?[]const u8 = null;
-                    if (std.mem.indexOf(u8, request, "\r\n\r\n")) |header_end| {
-                        const body_start = header_end + 4;
-                        if (body_start < request.len) {
-                            body = request[body_start..];
+                    // Extract ETag from If-None-Match header
+                    var client_etag: ?[]const u8 = null;
+                    if (std.mem.indexOf(u8, request, "If-None-Match: ")) |etag_start| {
+                        const etag_val_start = etag_start + 15;
+                        if (std.mem.indexOf(u8, request[etag_val_start..], "\r\n")) |etag_end| {
+                            var etag_raw = request[etag_val_start..etag_val_start + etag_end];
+                            if (etag_raw.len >= 2 and etag_raw[0] == '"' and etag_raw[etag_raw.len - 1] == '"') {
+                                etag_raw = etag_raw[1..etag_raw.len - 1];
+                            }
+                            client_etag = etag_raw;
                         }
                     }
 
-                    var req = Request{
-                        .method = method,
-                        .path = path,
-                        .body = body,
-                        .allocator = std.heap.page_allocator,
-                    };
-
-                    const result = @This().handler_event.handler(.{ .req = &req });
-                    const res = switch (result) {
-                        .response => |r| r,
-                    };
-                    const res_ct = if (res.content_type) |ct_str| ct_str else "text/plain";
-
                     conn.state = .writing;
 
-                    if (std.mem.startsWith(u8, res.body, "HTTP/1.")) {
-                        if (!writeAll(fd, res.body)) {
-                            posix.close(fd);
-                            ctx.connections[slot] = null;
-                            continue;
+                    // Try router first (for pre-built HTTP responses)
+                    if (ctx.router) |router_fn| {
+                        if (router_fn(method, path, client_etag)) |response| {
+                            if (!writeAll(fd, response)) {
+                                posix.close(fd);
+                                ctx.connections[slot] = null;
+                                continue;
+                            }
+                        } else {
+                            const not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: keep-alive\r\n\r\nNot Found";
+                            if (!writeAll(fd, not_found)) {
+                                posix.close(fd);
+                                ctx.connections[slot] = null;
+                                continue;
+                            }
                         }
                     } else {
-                        var header_buf: [256]u8 = undefined;
-                        const header = if (headerPrefixKeepAlive(res.status)) |prefix|
-                            std.fmt.bufPrint(&header_buf, "{s}{d}\r\nContent-Type: {s}\r\nConnection: keep-alive\r\n\r\n", .{ prefix, res.body.len, res_ct }) catch
-                                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        else
-                            std.fmt.bufPrint(
-                                &header_buf,
-                                "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n",
-                                .{ res.status, statusText(res.status), res_ct, res.body.len },
-                            ) catch "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        // No router — use handler
+                        var body: ?[]const u8 = null;
+                        if (std.mem.indexOf(u8, request, "\r\n\r\n")) |header_end| {
+                            const body_start = header_end + 4;
+                            if (body_start < request.len) {
+                                body = request[body_start..];
+                            }
+                        }
 
-                        if (!writeAll(fd, header) or !writeAll(fd, res.body)) {
-                            posix.close(fd);
-                            ctx.connections[slot] = null;
-                            continue;
+                        var req = Request{
+                            .method = method,
+                            .path = path,
+                            .body = body,
+                            .allocator = std.heap.page_allocator,
+                        };
+
+                        const result = @This().handler_event.handler(.{ .req = &req });
+                        const res = switch (result) {
+                            .response => |r| r,
+                        };
+                        const res_ct = if (res.content_type) |ct_str| ct_str else "text/plain";
+
+                        if (std.mem.startsWith(u8, res.body, "HTTP/1.")) {
+                            if (!writeAll(fd, res.body)) {
+                                posix.close(fd);
+                                ctx.connections[slot] = null;
+                                continue;
+                            }
+                        } else {
+                            var header_buf: [256]u8 = undefined;
+                            const header = if (headerPrefixKeepAlive(res.status)) |prefix|
+                                std.fmt.bufPrint(&header_buf, "{s}{d}\r\nContent-Type: {s}\r\nConnection: keep-alive\r\n\r\n", .{ prefix, res.body.len, res_ct }) catch
+                                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            else
+                                std.fmt.bufPrint(
+                                    &header_buf,
+                                    "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n",
+                                    .{ res.status, statusText(res.status), res_ct, res.body.len },
+                                ) catch "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+                            if (!writeAll(fd, header) or !writeAll(fd, res.body)) {
+                                posix.close(fd);
+                                ctx.connections[slot] = null;
+                                continue;
+                            }
                         }
                     }
 
@@ -636,6 +706,7 @@ fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
             .epfd = epfd,
             .connections = .{null} ** CONNS_PER_WORKER,
             .running = &running,
+            .router = router,
         };
 
         worker_threads[i] = std.Thread.spawn(.{}, epollWorkerLoop, .{&workers[i]}) catch {
@@ -993,4 +1064,259 @@ fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
         std.debug.print("ERROR: Router transform failed - flow not found in program\n", .{});
         return .{ .transformed = .{ .program = program } };
     }
+}
+
+// ============================================================================
+// STATIC FILE SERVING
+// ============================================================================
+// Compile-time static file embedding with gzip compression, ETags, and
+// automatic MIME type detection.
+//
+// Usage:
+//   ~orisha:static(path: "/", directory: "public")
+//   ~orisha:static(path: "/favicon.ico", file: "public/favicon.ico")
+//   ~orisha:collect_routes()
+//   | done |> _
+//   const routes = @import("generated/routes.zig");
+//   ~orisha:serve(port: 3000, router: routes.lookupWithEtag)
+
+const Sha256 = std.crypto.hash.sha2.Sha256;
+const zlib = @cImport({
+    @cInclude("zlib.h");
+});
+
+const ProcessedRoute = struct {
+    method: []const u8,
+    path: []const u8,
+    response: []const u8,
+    etag: []const u8,
+};
+
+fn stripQuotes(s: []const u8) []const u8 {
+    if (s.len >= 2 and s[0] == '"' and s[s.len - 1] == '"') {
+        return s[1 .. s.len - 1];
+    }
+    return s;
+}
+
+fn processDirectory(allocator: std.mem.Allocator, routes: *std.ArrayList(ProcessedRoute), method: []const u8, base_path: []const u8, dir_path: []const u8) void {
+    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
+    defer dir.close();
+    var walker = dir.walk(allocator) catch return;
+    defer walker.deinit();
+    while (walker.next() catch null) |entry| {
+        if (entry.kind != .file) continue;
+        const file_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.path }) catch continue;
+        const route_path = if (std.mem.eql(u8, base_path, "/"))
+            std.fmt.allocPrint(allocator, "/{s}", .{entry.path}) catch continue
+        else
+            std.fmt.allocPrint(allocator, "{s}/{s}", .{ base_path, entry.path }) catch continue;
+        const content = std.fs.cwd().readFileAlloc(allocator, file_path, 10 * 1024 * 1024) catch continue;
+        const http_resp = buildHttpResponse(allocator, content, mimeTypeFromPath(file_path)) catch continue;
+        routes.append(allocator, .{ .method = method, .path = route_path, .response = http_resp.response, .etag = http_resp.etag }) catch continue;
+        if (std.mem.eql(u8, entry.path, "index.html") and std.mem.eql(u8, base_path, "/")) {
+            routes.append(allocator, .{ .method = method, .path = "/", .response = http_resp.response, .etag = http_resp.etag }) catch continue;
+        }
+    }
+}
+
+fn processFile(allocator: std.mem.Allocator, routes: *std.ArrayList(ProcessedRoute), method: []const u8, path: []const u8, file_path: []const u8, content_type_override: ?[]const u8) void {
+    const content = std.fs.cwd().readFileAlloc(allocator, file_path, 10 * 1024 * 1024) catch return;
+    const content_type = content_type_override orelse mimeTypeFromPath(file_path);
+    const http_resp = buildHttpResponse(allocator, content, content_type) catch return;
+    routes.append(allocator, .{ .method = method, .path = path, .response = http_resp.response, .etag = http_resp.etag }) catch return;
+}
+
+fn computeEtag(content: []const u8, out: *[64]u8) void {
+    var hash: [32]u8 = undefined;
+    Sha256.hash(content, &hash, .{});
+    const hex_chars = "0123456789abcdef";
+    for (hash, 0..) |byte, i| {
+        out[i * 2] = hex_chars[byte >> 4];
+        out[i * 2 + 1] = hex_chars[byte & 0x0f];
+    }
+}
+
+const HttpResponse = struct { response: []const u8, etag: []const u8 };
+
+fn isCompressible(content_type: []const u8) bool {
+    if (std.mem.startsWith(u8, content_type, "text/")) return true;
+    if (std.mem.startsWith(u8, content_type, "application/javascript")) return true;
+    if (std.mem.startsWith(u8, content_type, "application/json")) return true;
+    if (std.mem.startsWith(u8, content_type, "image/svg")) return true;
+    return false;
+}
+
+fn gzipCompress(allocator: std.mem.Allocator, content: []const u8) ?[]const u8 {
+    if (content.len < 100) return null;
+    const max_output = zlib.compressBound(@intCast(content.len));
+    const output = allocator.alloc(u8, max_output) catch return null;
+    var strm: zlib.z_stream = std.mem.zeroes(zlib.z_stream);
+    strm.next_in = @constCast(content.ptr);
+    strm.avail_in = @intCast(content.len);
+    strm.next_out = output.ptr;
+    strm.avail_out = @intCast(output.len);
+    if (zlib.deflateInit2(&strm, zlib.Z_DEFAULT_COMPRESSION, zlib.Z_DEFLATED, 15 + 16, 8, zlib.Z_DEFAULT_STRATEGY) != zlib.Z_OK) {
+        allocator.free(output);
+        return null;
+    }
+    const result = zlib.deflate(&strm, zlib.Z_FINISH);
+    const compressed_size = output.len - strm.avail_out;
+    _ = zlib.deflateEnd(&strm);
+    if (result != zlib.Z_STREAM_END or compressed_size >= content.len) {
+        allocator.free(output);
+        return null;
+    }
+    return allocator.realloc(output, compressed_size) catch output[0..compressed_size];
+}
+
+fn buildHttpResponse(allocator: std.mem.Allocator, content: []const u8, content_type: []const u8) !HttpResponse {
+    var etag_buf: [64]u8 = undefined;
+    computeEtag(content, &etag_buf);
+    const etag = try allocator.dupe(u8, etag_buf[0..16]);
+    const compressed = if (isCompressible(content_type)) gzipCompress(allocator, content) else null;
+    const body = compressed orelse content;
+    var response: std.ArrayList(u8) = .empty;
+    try response.appendSlice(allocator, "HTTP/1.1 200 OK\r\nContent-Type: ");
+    try response.appendSlice(allocator, content_type);
+    try response.appendSlice(allocator, "\r\n");
+    if (compressed != null) try response.appendSlice(allocator, "Content-Encoding: gzip\r\n");
+    try response.appendSlice(allocator, "Content-Length: ");
+    var len_buf: [20]u8 = undefined;
+    try response.appendSlice(allocator, std.fmt.bufPrint(&len_buf, "{}", .{body.len}) catch "0");
+    try response.appendSlice(allocator, "\r\nETag: \"");
+    try response.appendSlice(allocator, etag);
+    try response.appendSlice(allocator, "\"\r\nConnection: keep-alive\r\n\r\n");
+    try response.appendSlice(allocator, body);
+    return .{ .response = response.items, .etag = etag };
+}
+
+fn mimeTypeFromPath(path: []const u8) []const u8 {
+    if (std.mem.endsWith(u8, path, ".html")) return "text/html; charset=utf-8";
+    if (std.mem.endsWith(u8, path, ".css")) return "text/css; charset=utf-8";
+    if (std.mem.endsWith(u8, path, ".js")) return "application/javascript; charset=utf-8";
+    if (std.mem.endsWith(u8, path, ".json")) return "application/json";
+    if (std.mem.endsWith(u8, path, ".png")) return "image/png";
+    if (std.mem.endsWith(u8, path, ".jpg") or std.mem.endsWith(u8, path, ".jpeg")) return "image/jpeg";
+    if (std.mem.endsWith(u8, path, ".gif")) return "image/gif";
+    if (std.mem.endsWith(u8, path, ".svg")) return "image/svg+xml";
+    if (std.mem.endsWith(u8, path, ".ico")) return "image/x-icon";
+    if (std.mem.endsWith(u8, path, ".woff")) return "font/woff";
+    if (std.mem.endsWith(u8, path, ".woff2")) return "font/woff2";
+    if (std.mem.endsWith(u8, path, ".ttf")) return "font/ttf";
+    if (std.mem.endsWith(u8, path, ".webp")) return "image/webp";
+    return "application/octet-stream";
+}
+
+fn generateRoutesFile(allocator: std.mem.Allocator, routes: []const ProcessedRoute) !void {
+    std.fs.cwd().makeDir("generated") catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(allocator);
+    try output.appendSlice(allocator,
+        \\// AUTO-GENERATED by Orisha
+        \\const std = @import("std");
+        \\pub const Route = struct { method: []const u8, path: []const u8, response: []const u8, etag: []const u8 };
+        \\pub const response_304 = "HTTP/1.1 304 Not Modified\r\nConnection: keep-alive\r\n\r\n";
+        \\pub const routes = [_]Route{
+        \\
+    );
+    for (routes) |route| {
+        try appendFmt(allocator, &output, "    .{{ .method = \"{s}\", .path = \"{s}\", .etag = \"{s}\", .response = ", .{ route.method, route.path, route.etag });
+        try output.append(allocator, '"');
+        for (route.response) |byte| {
+            switch (byte) {
+                '\n' => try output.appendSlice(allocator, "\\n"),
+                '\r' => try output.appendSlice(allocator, "\\r"),
+                '\t' => try output.appendSlice(allocator, "\\t"),
+                '"' => try output.appendSlice(allocator, "\\\""),
+                '\\' => try output.appendSlice(allocator, "\\\\"),
+                0x20...0x21, 0x23...0x5b, 0x5d...0x7e => try output.append(allocator, byte),
+                else => {
+                    var hex_buf: [4]u8 = undefined;
+                    _ = std.fmt.bufPrint(&hex_buf, "\\x{x:0>2}", .{byte}) catch unreachable;
+                    try output.appendSlice(allocator, &hex_buf);
+                },
+            }
+        }
+        try output.appendSlice(allocator, "\" },\n");
+    }
+    try output.appendSlice(allocator,
+        \\};
+        \\pub fn lookup(method: []const u8, path: []const u8) ?[]const u8 {
+        \\    for (routes) |r| if (std.mem.eql(u8, r.method, method) and std.mem.eql(u8, r.path, path)) return r.response;
+        \\    return null;
+        \\}
+        \\pub fn lookupWithEtag(method: []const u8, path: []const u8, client_etag: ?[]const u8) ?[]const u8 {
+        \\    for (routes) |r| {
+        \\        if (std.mem.eql(u8, r.method, method) and std.mem.eql(u8, r.path, path)) {
+        \\            if (client_etag) |e| if (std.mem.eql(u8, e, r.etag)) return response_304;
+        \\            return r.response;
+        \\        }
+        \\    }
+        \\    return null;
+        \\}
+        \\
+    );
+    const file = try std.fs.cwd().createFile("generated/routes.zig", .{});
+    defer file.close();
+    try file.writeAll(output.items);
+}
+
+fn appendFmt(allocator: std.mem.Allocator, list: *std.ArrayList(u8), comptime fmt: []const u8, args: anytype) !void {
+    var buf: [4096]u8 = undefined;
+    try list.appendSlice(allocator, std.fmt.bufPrint(&buf, fmt, args) catch return error.OutOfMemory);
+}
+
+// Data-only event: marks a static path declaration for collect_routes
+~[comptime]pub event static { path: []const u8, directory: ?[]const u8, file: ?[]const u8 }
+
+// Comptime event: processes static declarations and generates routes.zig
+~[comptime]pub event collect_routes { program: *const Program, allocator: std.mem.Allocator }
+| done { route_count: usize }
+
+~proc collect_routes {
+    std.debug.print("\n=== ORISHA STATIC COLLECTOR ===\n", .{});
+
+    var routes: std.ArrayList(ProcessedRoute) = .empty;
+    defer routes.deinit(allocator);
+
+    for (program.items) |item| {
+        if (item != .flow) continue;
+        const inv = item.flow.invocation;
+        if (inv.path.segments.len == 0) continue;
+        const last_segment = inv.path.segments[inv.path.segments.len - 1];
+        if (!std.mem.eql(u8, last_segment, "static")) continue;
+
+        // Parse args: path, directory, file
+        var static_path: []const u8 = "/";
+        var directory: ?[]const u8 = null;
+        var static_file: ?[]const u8 = null;
+
+        for (inv.args) |arg| {
+            if (std.mem.eql(u8, arg.name, "path")) static_path = stripQuotes(arg.value);
+            if (std.mem.eql(u8, arg.name, "directory")) directory = stripQuotes(arg.value);
+            if (std.mem.eql(u8, arg.name, "file")) static_file = stripQuotes(arg.value);
+        }
+
+        std.debug.print("Static: {s}\n", .{static_path});
+
+        if (directory) |dir_path| {
+            processDirectory(allocator, &routes, "GET", static_path, dir_path);
+        } else if (static_file) |file_path| {
+            processFile(allocator, &routes, "GET", static_path, file_path, null);
+        }
+    }
+
+    std.debug.print("\n=== Generating routes.zig ({} routes) ===\n", .{routes.items.len});
+
+    generateRoutesFile(allocator, routes.items) catch |err| {
+        std.debug.print("ERROR generating routes.zig: {}\n", .{err});
+        return .{ .done = .{ .route_count = 0 } };
+    };
+
+    std.debug.print("=== Routes generated successfully ===\n", .{});
+    return .{ .done = .{ .route_count = routes.items.len } };
 }
