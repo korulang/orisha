@@ -1372,6 +1372,102 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const Process
     const inline_body_str = ib.toOwnedSlice(allocator) catch unreachable;
     std.debug.print("[STATIC_ROUTER TRANSFORM] Generated inline dispatch:\n{s}\n", .{inline_body_str});
 
+    // Check if this invocation is the flow's top-level invocation or nested in a continuation.
+    // If the flow's invocation IS static_router, we're standalone (top-level handler).
+    // If it's something else (e.g., router), we're nested in a catch-all continuation.
+    const flow_inv_name = if (flow.invocation.path.segments.len > 0)
+        flow.invocation.path.segments[flow.invocation.path.segments.len - 1]
+    else
+        "";
+    const is_top_level = std.mem.eql(u8, flow_inv_name, "static_router");
+
+    if (!is_top_level) {
+        // Nested case: only replace the continuation's node, preserving the parent flow
+        // so the outer transform (e.g., router) can still process it.
+        std.debug.print("[STATIC_ROUTER TRANSFORM] Nested in '{s}' flow — replacing continuation only\n", .{flow_inv_name});
+
+        // Strip //@koru:inline_stmt prefix — not needed for continuation inline_code nodes
+        const prefix = "//@koru:inline_stmt\n";
+        var nested_code = inline_body_str;
+        if (std.mem.startsWith(u8, nested_code, prefix)) {
+            nested_code = nested_code[prefix.len..];
+        }
+
+        // Find the continuation whose node is the static_router invocation and replace its node
+        var new_conts = allocator.alloc(ast_mod.Continuation, flow.continuations.len) catch unreachable;
+        var replaced = false;
+        for (flow.continuations, 0..) |cont, ci| {
+            if (!replaced) {
+                if (cont.node) |node| {
+                    if (node == .invocation) {
+                        const segs = node.invocation.path.segments;
+                        if (segs.len > 0 and std.mem.eql(u8, segs[segs.len - 1], "static_router")) {
+                            // Verify name arg matches
+                            var name_match = false;
+                            for (node.invocation.args) |arg| {
+                                if (std.mem.eql(u8, arg.name, "name") and
+                                    std.mem.eql(u8, stripQuotes(arg.value), static_name)) {
+                                    name_match = true;
+                                    break;
+                                }
+                            }
+                            if (name_match) {
+                                new_conts[ci] = ast_mod.Continuation{
+                                    .branch = cont.branch,
+                                    .binding = cont.binding,
+                                    .binding_annotations = cont.binding_annotations,
+                                    .binding_type = cont.binding_type,
+                                    .is_catchall = cont.is_catchall,
+                                    .catchall_metatype = cont.catchall_metatype,
+                                    .condition = cont.condition,
+                                    .condition_expr = cont.condition_expr,
+                                    .node = ast_mod.Node{ .inline_code = nested_code },
+                                    .indent = cont.indent,
+                                    .continuations = cont.continuations,
+                                    .location = cont.location,
+                                };
+                                replaced = true;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            new_conts[ci] = cont;
+        }
+
+        if (replaced) {
+            const modified_flow = ast_mod.Flow{
+                .invocation = flow.invocation, // Keep original — no @pass_ran!
+                .continuations = new_conts,
+                .annotations = flow.annotations,
+                .pre_label = flow.pre_label,
+                .post_label = flow.post_label,
+                .super_shape = flow.super_shape,
+                .inline_body = flow.inline_body,
+                .preamble_code = flow.preamble_code,
+                .is_pure = flow.is_pure,
+                .is_transitively_pure = flow.is_transitively_pure,
+                .impl_of = flow.impl_of,
+                .is_impl = flow.is_impl,
+                .module = flow.module,
+                .location = flow.location,
+            };
+
+            const new_item = ast_mod.Item{ .flow = modified_flow };
+            const maybe_new_program = ast_functional.replaceFlowRecursive(allocator, program, flow, new_item) catch unreachable;
+            if (maybe_new_program) |new_program_val| {
+                const result = allocator.create(ast_mod.Program) catch unreachable;
+                result.* = new_program_val;
+                std.debug.print("[STATIC_ROUTER TRANSFORM] Replaced nested continuation (preserving parent flow for '{s}')\n", .{flow_inv_name});
+                return .{ .transformed = .{ .program = result } };
+            }
+        }
+        // Fall through to top-level behavior if replacement didn't work
+        std.debug.print("[STATIC_ROUTER TRANSFORM] WARNING: Could not find matching continuation, falling back to top-level replacement\n", .{});
+    }
+
+    // Top-level case: replace the entire flow (standalone handler)
     // Mark as transformed
     const new_inv_annotations = allocator.alloc([]const u8, flow.invocation.annotations.len + 1) catch unreachable;
     for (flow.invocation.annotations, 0..) |ann, j| {

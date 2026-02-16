@@ -47,5 +47,5 @@ const std = @import("std");
 // ============================================================================
 
 ~orisha:serve(port: 3000)
-| shutdown |> _
-| failed |> _
+| shutdown _ |> _
+| failed _ |> _

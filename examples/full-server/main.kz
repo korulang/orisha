@@ -21,9 +21,6 @@
 ~import "$std/runtime"
 ~import "$std/io"
 ~import "$std/fmt"
-~import "$std/package"
-
-~std.package:requires.npm { "@korulang/gzip": "^0.0.1" }
 
 // ============================================================================
 // COMPILED EVENTS — native Zig speed, called by the interpreter
