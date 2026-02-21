@@ -765,6 +765,11 @@ fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
         }
     }
 
+    // Detect whether this is the flow's own invocation or a nested one.
+    // findContainingItem returns the parent flow, so for nested routers
+    // we must search the continuation tree for the actual invocation.
+    const is_pointer_top = (invocation == &flow.invocation);
+
     // Get the request expression from invocation args (the call-site value to splice)
     var req_expr: []const u8 = "req";
     for (invocation.args) |arg| {
@@ -774,20 +779,50 @@ fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
         }
     }
 
-    // Collect pattern branches from continuations
+    // Collect pattern branches from the correct continuations.
+    // For top-level: flow.continuations (the flow IS the router).
+    // For nested: find the continuation whose node IS our invocation,
+    // then use its sub-continuations as pattern branches.
     const PatternCont = struct {
         pattern: []const u8,
         cont: *const ast_mod.Continuation,
     };
 
+    // Helper to find the continuation containing a specific invocation by pointer
+    const findContWithInvocation = struct {
+        fn search(continuations: []const ast_mod.Continuation, target_inv: *const ast_mod.Invocation) ?*const ast_mod.Continuation {
+            for (continuations) |*cont| {
+                if (cont.node) |*node| {
+                    if (node.* == .invocation and &node.invocation == target_inv) {
+                        return cont;
+                    }
+                }
+                if (search(cont.continuations, target_inv)) |found| {
+                    return found;
+                }
+            }
+            return null;
+        }
+    }.search;
+
+    const source_continuations = if (is_pointer_top)
+        flow.continuations
+    else blk: {
+        const parent_cont = findContWithInvocation(flow.continuations, invocation) orelse {
+            std.debug.print("[ROUTER TRANSFORM] WARNING: Could not find nested invocation\n", .{});
+            return .{ .transformed = .{ .program = program } };
+        };
+        break :blk parent_cont.continuations;
+    };
+
     var patterns: std.ArrayList([]const u8) = .empty;
     var pattern_conts: std.ArrayList(PatternCont) = .empty;
-    for (flow.continuations, 0..) |*cont, i| {
+    for (source_continuations, 0..) |*cont, i| {
         if (cont.branch.len > 0 and cont.branch[0] == '[') {
             patterns.append(allocator, cont.branch) catch unreachable;
             pattern_conts.append(allocator, .{
                 .pattern = cont.branch,
-                .cont = &flow.continuations[i],
+                .cont = &source_continuations[i],
             }) catch unreachable;
         }
     }
@@ -989,6 +1024,33 @@ fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
     const inline_body_str = ib.toOwnedSlice(allocator) catch unreachable;
     std.debug.print("[ROUTER TRANSFORM] Generated inline dispatch:\n{s}\n", .{inline_body_str});
 
+    if (!is_pointer_top) {
+        // NESTED CASE: replace the invocation node with inline_code, not the whole flow.
+        // Strip the //@koru:inline_stmt prefix — inline_code nodes emit raw code.
+        const prefix = "//@koru:inline_stmt\n";
+        const code_str = if (std.mem.startsWith(u8, inline_body_str, prefix))
+            inline_body_str[prefix.len..]
+        else
+            inline_body_str;
+
+        const new_node = ast_mod.Node{ .inline_code = code_str };
+        const empty_conts = allocator.alloc(ast_mod.Continuation, 0) catch unreachable;
+        const maybe_new = ast_functional.replaceInvocationNodeAndContinuationsRecursive(
+            allocator,
+            program,
+            invocation,
+            new_node,
+            empty_conts,
+        ) catch unreachable;
+        if (maybe_new) |new_program_val| {
+            const result = allocator.create(ast_mod.Program) catch unreachable;
+            result.* = new_program_val;
+            return .{ .transformed = .{ .program = result } };
+        }
+        return .{ .transformed = .{ .program = program } };
+    }
+
+    // TOP-LEVEL CASE: replace the entire flow
     // Mark as transformed (keep original invocation path)
     const new_inv_annotations = allocator.alloc([]const u8, flow.invocation.annotations.len + 1) catch unreachable;
     for (flow.invocation.annotations, 0..) |ann, j| {
