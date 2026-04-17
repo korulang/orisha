@@ -452,14 +452,14 @@ fn workerLoop(ctx: *WorkerContext) void {
 
 ~proc serve {
     const address = std.net.Address.parseIp("0.0.0.0", port) catch {
-        return .{ .failed = .{ .msg = "Invalid address" } };
+        return .{ .failed = "Invalid address" };
     };
 
     var server = address.listen(.{
         .reuse_address = true,
         .kernel_backlog = 512,
     }) catch {
-        return .{ .failed = .{ .msg = "Failed to listen" } };
+        return .{ .failed = "Failed to listen" };
     };
 
     const O_NONBLOCK: u32 = 0x0004;
@@ -473,7 +473,7 @@ fn workerLoop(ctx: *WorkerContext) void {
 
     for (0..NUM_WORKERS) |i| {
         const worker_kq = posix.kqueue() catch {
-            return .{ .failed = .{ .msg = "Failed to create worker kqueue" } };
+            return .{ .failed = "Failed to create worker kqueue" };
         };
 
         workers[i] = WorkerContext{
@@ -484,7 +484,7 @@ fn workerLoop(ctx: *WorkerContext) void {
         };
 
         worker_threads[i] = std.Thread.spawn(.{}, workerLoop, .{&workers[i]}) catch {
-            return .{ .failed = .{ .msg = "Failed to spawn worker thread" } };
+            return .{ .failed = "Failed to spawn worker thread" };
         };
     }
 
@@ -522,7 +522,7 @@ fn workerLoop(ctx: *WorkerContext) void {
         _ = c.kevent(worker.kq, &add_event, 1, &no_events, 0, null);
     }
 
-    return .{ .shutdown = .{ .reason = "Server stopped" } };
+    return .{ .shutdown = "Server stopped" };
 }
 
 // ============================================================================
@@ -665,14 +665,14 @@ fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
     const linux = std.os.linux;
 
     const address = std.net.Address.parseIp("0.0.0.0", port) catch {
-        return .{ .failed = .{ .msg = "Invalid address" } };
+        return .{ .failed = "Invalid address" };
     };
 
     var server = address.listen(.{
         .reuse_address = true,
         .kernel_backlog = 512,
     }) catch {
-        return .{ .failed = .{ .msg = "Failed to listen" } };
+        return .{ .failed = "Failed to listen" };
     };
 
     const O_NONBLOCK: u32 = 0x0800; // Linux O_NONBLOCK
@@ -688,7 +688,7 @@ fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
         const epfd_rc = linux.epoll_create1(0);
         const epfd: i32 = @bitCast(@as(u32, @truncate(epfd_rc)));
         if (epfd < 0) {
-            return .{ .failed = .{ .msg = "Failed to create worker epoll" } };
+            return .{ .failed = "Failed to create worker epoll" };
         }
 
         workers[i] = EpollWorkerCtx{
@@ -699,7 +699,7 @@ fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
         };
 
         worker_threads[i] = std.Thread.spawn(.{}, epollWorkerLoop, .{&workers[i]}) catch {
-            return .{ .failed = .{ .msg = "Failed to spawn worker thread" } };
+            return .{ .failed = "Failed to spawn worker thread" };
         };
     }
 
@@ -732,7 +732,7 @@ fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
         _ = linux.epoll_ctl(worker.epfd, linux.EPOLL.CTL_ADD, client_fd, &add_event);
     }
 
-    return .{ .shutdown = .{ .reason = "Server stopped" } };
+    return .{ .shutdown = "Server stopped" };
 }
 
 // ============================================================================
