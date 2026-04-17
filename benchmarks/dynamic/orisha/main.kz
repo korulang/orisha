@@ -27,6 +27,6 @@ fn userJsonBody(id: []const u8) []const u8 {
 | [*] |> response { status: 404, body: "Not Found", content_type: "text/plain" }
 
 // Start the server
-~orisha:serve(port: 3000)
+~orisha:serve(port: 3100)
 | shutdown _ |> _
 | failed _ |> _

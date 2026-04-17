@@ -87,6 +87,6 @@ fn buildUserResponse(id: []const u8) []const u8 {
 // SERVER
 // ============================================================================
 
-~orisha:serve(port: 3000, router: combinedRouter)
+~orisha:serve(port: 3100, router: combinedRouter)
 | listening |> _
 | failed |> _

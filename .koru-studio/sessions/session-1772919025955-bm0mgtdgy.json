@@ -1,0 +1,30 @@
+{
+  "id": "session-1772919025955-bm0mgtdgy",
+  "title": "Greeting the user",
+  "createdAt": "2026-03-07T21:30:25.955Z",
+  "updatedAt": "2026-03-07T21:32:57.796Z",
+  "fragment": {
+    "focus": "Greeting the user"
+  },
+  "todo": {},
+  "insights": {},
+  "messages": [
+    {
+      "role": "user",
+      "content": "Hey, are you awake?"
+    },
+    {
+      "role": "assistant",
+      "content": ""
+    },
+    {
+      "role": "user",
+      "content": "Hello!"
+    },
+    {
+      "role": "assistant",
+      "content": ""
+    }
+  ],
+  "messageCount": 3
+}

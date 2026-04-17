@@ -1,0 +1,4 @@
+FROM scratch
+COPY orisha_tiny_new /server
+EXPOSE 3001
+ENTRYPOINT ["/server"]

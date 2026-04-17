@@ -55,8 +55,8 @@ pub const Route = struct {
 // Match a path against a pattern like "/users/:id/posts/:post_id"
 // Returns match result with extracted parameters
 ~pub event match { path: []const u8, pattern: []const u8 }
-| ok { result: RouteMatch }
-| no_match {}
+| ok RouteMatch
+| no_match
 
 ~[pure] proc match {
     var result = RouteMatch{
@@ -76,12 +76,12 @@ pub const Route = struct {
         // Both exhausted = match
         if (pattern_seg == null and path_seg == null) {
             result.matched = true;
-            return .{ .ok = .{ .result = result } };
+            return .{ .ok = result };
         }
 
         // One exhausted but not other = no match
         if (pattern_seg == null or path_seg == null) {
-            return .{ .no_match = .{} };
+            return .{ .no_match = {} };
         }
 
         const p = pattern_seg.?;
@@ -94,7 +94,7 @@ pub const Route = struct {
         if (p.len == 1 and p[0] == '*') {
             // Wildcard consumes rest of path
             result.matched = true;
-            return .{ .ok = .{ .result = result } };
+            return .{ .ok = result };
         }
 
         // Parameter segment
@@ -112,7 +112,7 @@ pub const Route = struct {
 
         // Literal segment - must match exactly
         if (!router_std.mem.eql(u8, p, s)) {
-            return .{ .no_match = .{} };
+            return .{ .no_match = {} };
         }
     }
 }

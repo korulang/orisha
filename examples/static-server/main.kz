@@ -9,9 +9,6 @@
 
 ~import "$orisha"
 ~import "$std/build"
-~import "$std/package"
-
-~std.package:requires.npm { "@korulang/gzip": "^0.0.1" }
 
 const std = @import("std");
 

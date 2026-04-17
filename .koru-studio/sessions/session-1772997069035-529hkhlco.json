@@ -1,0 +1,680 @@
+{
+  "id": "session-1772997069035-529hkhlco",
+  "title": "Cleaning up the test suite",
+  "createdAt": "2026-03-08T19:11:09.035Z",
+  "updatedAt": "2026-03-08T19:11:45.760Z",
+  "fragment": {
+    "focus": "Cleaning up the test suite"
+  },
+  "todo": {
+    "tasks": [
+      {
+        "description": "Clean up the test suite.",
+        "priority": "medium",
+        "status": "todo"
+      }
+    ]
+  },
+  "insights": {},
+  "messages": [
+    {
+      "role": "user",
+      "content": "We need to clean up the test suite."
+    },
+    {
+      "role": "assistant",
+      "content": "",
+      "toolInvocations": [
+        {
+          "type": "tool-call",
+          "toolCallId": "tool_get_architecture_C4ekLEWEvGyHIcfEx1TI",
+          "toolName": "get_architecture",
+          "args": {},
+          "result": {
+            "modules": [
+              {
+                "name": "orisha.lib.index",
+                "filePath": "/Users/larsde/src/orisha/lib/index.kz",
+                "events": [
+                  {
+                    "name": "listen",
+                    "input": {
+                      "fields": [
+                        {
+                          "name": "port",
+                          "type": "u16",
+                          "is_source": false,
+                          "is_file": false,
+                          "is_embed_file": false,
+                          "is_expression": false,
+                          "is_invocation_meta": false,
+                          "phantom": null
+                        }
+                      ]
+                    },
+                    "branches": [
+                      {
+                        "name": "listening",
+                        "fields": {
+                          "fields": [
+                            {
+                              "name": "server",
+                              "type": "*ServerHandle",
+                              "is_source": false,
+                              "is_file": false,
+                              "is_embed_file": false,
+                              "is_expression": false,
+                              "is_invocation_meta": false,
+                              "phantom": null
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "name": "failed",
+                        "fields": {
+                          "fields": [
+                            {
+                              "name": "msg",
+                              "type": "[]const u8",
+                              "is_source": false,
+                              "is_file": false,
+                              "is_embed_file": false,
+                              "is_expression": false,
+                              "is_invocation_meta": false,
+                              "phantom": null
+                            }
+                          ]
+                        }
+                      }
+                    ],
+                    "hasImplementation": true,
+                    "location": {
+                      "line": 71,
+                      "col": 0
+                    }
+                  },
+                  {
+                    "name": "accept",
+                    "input": {
+                      "fields": [
+                        {
+                          "name": "server",
+                          "type": "*ServerHandle",
+                          "is_source": false,
+                          "is_file": false,
+                          "is_embed_file": false,
+                          "is_expression": false,
+                          "is_invocation_meta": false,
+                          "phantom": null
+                        }
+                      ]
+                    },
+                    "branches": [
+                      {
+                        "name": "request",
+                        "fields": {
+                          "fields": [
+                            {
+                              "name": "req",
+                              "type": "*Request",
+                              "is_source": false,
+                              "is_file": false,
+                              "is_embed_file": false,
+                              "is_expression": false,
+                              "is_invocation_meta": false,
+                              "phantom": null
+                            },
+                            {
+                              "name": "conn",
+                              "type": "*ConnHandle",
+                              "is_source": false,
+                              "is_file": false,
+                              "is_embed_file": false,
+                              "is_expression": false,
+                              "is_invocation_meta": false,
+                              "phantom": null
+                            },
+                            {
+                              "name": "server",
+                              "type": "*ServerHandle",
+                              "is_source": false,
+                              "is_file": false,
+                              "is_embed_file": false,
+                              "is_expression": false,
+                              "is_invocation_meta": false,
+                              "phantom": null
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "name": "failed",
+                        "fields": {
+                          "fields": [
+                            {
+                              "name": "msg",
+                              "type": "[]const u8",
+                              "is_source": false,
+                              "is_file": false,
+                              "is_embed_file": false,
+                              "is_expression": false,
+                              "is_invocation_meta": false,
+                              "phantom": null
+                            },
+                            {
+                              "name": "server",
+                              "type": "*ServerHandle",
+                              "is_source": false,
+                              "is_file": false,
+                              "is_embed_file": false,
+                              "is_expression": false,
+                              "is_invocation_meta": false,
+                              "phantom": null
+                            }
+                          ]
+                        }
+                      }
+                    ],
+                    "hasImplementation": true,
+                    "location": {
+                      "line": 102,
+                      "col": 0
+                    }
+                  },
+                  {
+                    "name": "send",
+                    "input": {
+                      "fields": [
+                        {
+                          "name": "conn",
+                          "type": "*ConnHandle",
+                          "is_source": false,
+                          "is_file": false,
+                          "is_embed_file": false,
+                          "is_expression": false,
+                          "is_invocation_meta": false,
+                          "phantom": null
+                        },
+                        {
+                          "name": "status",
+                          "type": "u16",
+                          "is_source": false,
+                          "is_file": false,
+                          "is_embed_file": false,
+                          "is_expression": false,
+                          "is_invocation_meta": false,
+                          "phantom": null
+                        },
+                        {
+                          "name": "body",
+                          "type": "[]const u8",
+                          "is_source": false,
+                          "is_file": false,
+                          "is_embed_file": false,
+                          "is_expression": false,
+                          "is_invocation_meta": false,
+                          "phantom": null
+                        },
+                        {
+                          "name": "content_type",
+                          "type": "?[]const u8",
+                          "is_source": false,
+                          "is_file": false,
+                          "is_embed_file": false,
+                          "is_expression": false,
+                          "is_invocation_meta": false,
+                          "phantom": null
+                        }
+                      ]
+                    },
+                    "branches": [
+                      {
+                        "name": "sent",
+                        "fields": {
+                          "fields": []
+                        }
+                      },
+                      {
+                        "name": "failed",
+                        "fields": {
+                          "fields": [
+                            {
+                              "name": "msg",
+                              "type": "[]const u8",
+                              "is_source": false,
+                              "is_file": false,
+                              "is_embed_file": false,
+                              "is_expression": false,
+                              "is_invocation_meta": false,
+                              "phantom": null
+                            }
+                          ]
+                        }
+                      }
+                    ],
+                    "hasImplementation": true,
+                    "location": {
+                      "line": 176,
+                      "col": 0
+                    }
+                  },
+                  {
+                    "name": "handler",
+                    "input": {
+                      "fields": [
+                        {
+                          "name": "req",
+                          "type": "*Request",
+                          "is_source": false,
+                          "is_file": false,
+                          "is_embed_file": false,
+                          "is_expression": false,
+                          "is_invocation_meta": false,
+                          "phantom": null
+                        }
+                      ]
+                    },
+                    "branches": [
+                      {
+                        "name": "response",
+                        "fields": {
+                          "fields": [
+                            {
+                              "name": "status",
+                              "type": "u16",
+                              "is_source": false,
+                              "is_file": false,
+                              "is_embed_file": false,
+                              "is_expression": false,
+                              "is_invocation_meta": false,
+                              "phantom": null
+                            },
+                            {
+                              "name": "body",
+                              "type": "[]const u8",
+                              "is_source": false,
+                              "is_file": false,
+                              "is_embed_file": false,
+                              "is_expression": false,
+                              "is_invocation_meta": false,
+                              "phantom": null
+                            },
+                            {
+                              "name": "content_type",
+                              "type": "?[]const u8",
+                              "is_source": false,
+                              "is_file": false,
+                              "is_embed_file": false,
+                              "is_expression": false,
+                              "is_invocation_meta": false,
+                              "phantom": null
+                            }
+                          ]
+                        }
+                      }
+                    ],
+                    "hasImplementation": false,
+                    "location": {
+                      "line": 231,
+                      "col": 0
+                    }
+                  },
+                  {
+                    "name": "serve",
+                    "input": {
+                      "fields": [
+                        {
+                          "name": "port",
+                          "type": "u16",
+                          "is_source": false,
+                          "is_file": false,
+                          "is_embed_file": false,
+                          "is_expression": false,
+                          "is_invocation_meta": false,
+                          "phantom": null
+                        }
+                      ]
+                    },
+                    "branches": [
+                      {
+                        "name": "shutdown",
+                        "fields": {
+                          "fields": [
+                            {
+                              "name": "reason",
+                              "type": "[]const u8",
+                              "is_source": false,
+                              "is_file": false,
+                              "is_embed_file": false,
+                              "is_expression": false,
+                              "is_invocation_meta": false,
+                              "phantom": null
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "name": "failed",
+                        "fields": {
+                          "fields": [
+                            {
+                              "name": "msg",
+                              "type": "[]const u8",
+                              "is_source": false,
+                              "is_file": false,
+                              "is_embed_file": false,
+                              "is_expression": false,
+                              "is_invocation_meta": false,
+                              "phantom": null
+                            }
+                          ]
+                        }
+                      }
+                    ],
+                    "hasImplementation": true,
+                    "location": {
+                      "line": 242,
+                      "col": 0
+                    }
+                  },
+                  {
+                    "name": "router",
+                    "input": {
+                      "fields": [
+                        {
+                          "name": "invocation",
+                          "type": "*const Invocation",
+                          "is_source": false,
+                          "is_file": false,
+                          "is_embed_file": false,
+                          "is_expression": false,
+                          "is_invocation_meta": false,
+                          "phantom": null
+                        },
+                        {
+                          "name": "item",
+                          "type": "*const Item",
+                          "is_source": false,
+                          "is_file": false,
+                          "is_embed_file": false,
+                          "is_expression": false,
+                          "is_invocation_meta": false,
+                          "phantom": null
+                        },
+                        {
+                          "name": "program",
+                          "type": "*const Program",
+                          "is_source": false,
+                          "is_file": false,
+                          "is_embed_file": false,
+                          "is_expression": false,
+                          "is_invocation_meta": false,
+                          "phantom": null
+                        },
+                        {
+                          "name": "allocator",
+                          "type": "std.mem.Allocator",
+                          "is_source": false,
+                          "is_file": false,
+                          "is_embed_file": false,
+                          "is_expression": false,
+                          "is_invocation_meta": false,
+                          "phantom": null
+                        }
+                      ]
+                    },
+                    "branches": [
+                      {
+                        "name": "transformed",
+                        "fields": {
+                          "fields": [
+                            {
+                              "name": "program",
+                              "type": "*const Program",
+                              "is_source": false,
+                              "is_file": false,
+                              "is_embed_file": false,
+                              "is_expression": false,
+                              "is_invocation_meta": false,
+                              "phantom": null
+                            }
+                          ]
+                        }
+                      }
+                    ],
+                    "hasImplementation": true,
+                    "location": {
+                      "line": 749,
+                      "col": 0
+                    }
+                  },
+                  {
+                    "name": "static",
+                    "input": {
+                      "fields": [
+                        {
+                          "name": "name",
+                          "type": "[]const u8",
+                          "is_source": false,
+                          "is_file": false,
+                          "is_embed_file": false,
+                          "is_expression": false,
+                          "is_invocation_meta": false,
+                          "phantom": null
+                        },
+                        {
+                          "name": "root",
+                          "type": "[]const u8",
+                          "is_source": false,
+                          "is_file": false,
+                          "is_embed_file": false,
+                          "is_expression": false,
+                          "is_invocation_meta": false,
+                          "phantom": null
+                        },
+                        {
+                          "name": "fallback",
+                          "type": "?[]const u8",
+                          "is_source": false,
+                          "is_file": false,
+                          "is_embed_file": false,
+                          "is_expression": false,
+                          "is_invocation_meta": false,
+                          "phantom": null
+                        }
+                      ]
+                    },
+                    "branches": [],
+                    "hasImplementation": false,
+                    "location": {
+                      "line": 1307,
+                      "col": 0
+                    }
+                  },
+                  {
+                    "name": "static_router",
+                    "input": {
+                      "fields": [
+                        {
+                          "name": "invocation",
+                          "type": "*const Invocation",
+                          "is_source": false,
+                          "is_file": false,
+                          "is_embed_file": false,
+                          "is_expression": false,
+                          "is_invocation_meta": false,
+                          "phantom": null
+                        },
+                        {
+                          "name": "item",
+                          "type": "*const Item",
+                          "is_source": false,
+                          "is_file": false,
+                          "is_embed_file": false,
+                          "is_expression": false,
+                          "is_invocation_meta": false,
+                          "phantom": null
+                        },
+                        {
+                          "name": "program",
+                          "type": "*const Program",
+                          "is_source": false,
+                          "is_file": false,
+                          "is_embed_file": false,
+                          "is_expression": false,
+                          "is_invocation_meta": false,
+                          "phantom": null
+                        },
+                        {
+                          "name": "allocator",
+                          "type": "std.mem.Allocator",
+                          "is_source": false,
+                          "is_file": false,
+                          "is_embed_file": false,
+                          "is_expression": false,
+                          "is_invocation_meta": false,
+                          "phantom": null
+                        }
+                      ]
+                    },
+                    "branches": [
+                      {
+                        "name": "transformed",
+                        "fields": {
+                          "fields": [
+                            {
+                              "name": "program",
+                              "type": "*const Program",
+                              "is_source": false,
+                              "is_file": false,
+                              "is_embed_file": false,
+                              "is_expression": false,
+                              "is_invocation_meta": false,
+                              "phantom": null
+                            }
+                          ]
+                        }
+                      }
+                    ],
+                    "hasImplementation": true,
+                    "location": {
+                      "line": 1327,
+                      "col": 0
+                    }
+                  }
+                ],
+                "implementedEvents": [
+                  "listen",
+                  "accept",
+                  "send",
+                  "serve",
+                  "router",
+                  "static_router"
+                ],
+                "imports": [
+                  "$std/compiler",
+                  "$std/io",
+                  "$std/build"
+                ]
+              },
+              {
+                "name": "orisha.lib.routing",
+                "filePath": "/Users/larsde/src/orisha/lib/routing.kz",
+                "events": [
+                  {
+                    "name": "match",
+                    "input": {
+                      "fields": [
+                        {
+                          "name": "path",
+                          "type": "[]const u8",
+                          "is_source": false,
+                          "is_file": false,
+                          "is_embed_file": false,
+                          "is_expression": false,
+                          "is_invocation_meta": false,
+                          "phantom": null
+                        },
+                        {
+                          "name": "pattern",
+                          "type": "[]const u8",
+                          "is_source": false,
+                          "is_file": false,
+                          "is_embed_file": false,
+                          "is_expression": false,
+                          "is_invocation_meta": false,
+                          "phantom": null
+                        }
+                      ]
+                    },
+                    "branches": [
+                      {
+                        "name": "ok",
+                        "fields": {
+                          "fields": [
+                            {
+                              "name": "result",
+                              "type": "RouteMatch",
+                              "is_source": false,
+                              "is_file": false,
+                              "is_embed_file": false,
+                              "is_expression": false,
+                              "is_invocation_meta": false,
+                              "phantom": null
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "name": "no_match",
+                        "fields": {
+                          "fields": []
+                        }
+                      }
+                    ],
+                    "hasImplementation": true,
+                    "location": {
+                      "line": 61,
+                      "col": 0
+                    }
+                  }
+                ],
+                "implementedEvents": [
+                  "match"
+                ],
+                "imports": [
+                  "$std/compiler",
+                  "$std/testing"
+                ]
+              }
+            ],
+            "stats": {
+              "totalModules": 2,
+              "totalEvents": 9,
+              "totalImplementations": 7,
+              "implementationRate": 0.7777777777777778
+            }
+          }
+        },
+        {
+          "type": "tool-call",
+          "toolCallId": "tool_read_module_PFySq9Vua7qf3WGrFqDN",
+          "toolName": "read_module",
+          "args": {
+            "module": "orisha.lib.routing"
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": "Are you here?"
+    },
+    {
+      "role": "assistant",
+      "content": ""
+    }
+  ],
+  "messageCount": 3
+}

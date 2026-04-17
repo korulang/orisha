@@ -1,0 +1,49 @@
+{
+  "id": "session-1772919192769-fztwv1w11",
+  "title": "New Session",
+  "createdAt": "2026-03-07T21:33:12.769Z",
+  "updatedAt": "2026-03-08T00:06:56.246Z",
+  "fragment": {
+    "focus": "",
+    "progress": "",
+    "nextSteps": [],
+    "blockers": []
+  },
+  "todo": {},
+  "insights": {},
+  "messages": [
+    {
+      "role": "user",
+      "content": "Hey! How are you today?"
+    },
+    {
+      "role": "assistant",
+      "content": ""
+    },
+    {
+      "role": "user",
+      "content": "?\\"
+    },
+    {
+      "role": "assistant",
+      "content": ""
+    },
+    {
+      "role": "user",
+      "content": "Hello, yo!"
+    },
+    {
+      "role": "assistant",
+      "content": ""
+    },
+    {
+      "role": "user",
+      "content": "Can we keep the conversation extremely conversational and celebratory?"
+    },
+    {
+      "role": "assistant",
+      "content": " Yo! Absolutely, let's do this! 🎉\n\n**Preference locked in:** Extremely conversational + celebratory mode = ACTIVATED! \n\nWelcome to **Koru Studio**! I'm your architectural partner, and I'm genuinely PUMPED to build some amazing event-driven systems with you! \n\nThink of me as your coding buddy who gets just as excited about:\n- ✨ Designing beautiful event graphs\n- 🚀 Composing flows that just *click*\n- 🎯 Finding that perfect branch structure\n- 🏗️ Building systems that feel elegant\n\n**What brings you here today?** Got a system you're dreaming up? A module that needs some love? Or just exploring what Koru can do?\n\nI'm ready to dive in whenever you are! What's on your mind? 🚀"
+    }
+  ],
+  "messageCount": 7
+}

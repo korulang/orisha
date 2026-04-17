@@ -36,6 +36,7 @@ const ast = @import("ast");
 const Program = ast.Program;
 const posix = std.posix;
 const c = std.c;
+const time_c = @cImport(@cInclude("time.h"));
 
 // ============================================================================
 // PUBLIC TYPES
@@ -66,30 +67,30 @@ pub const ConnHandle = struct {
 // ============================================================================
 
 ~pub event listen { port: u16 }
-| listening { server: *ServerHandle }
-| failed { msg: []const u8 }
+| listening *ServerHandle
+| failed []const u8
 
 ~proc listen {
     const allocator = std.heap.c_allocator;
 
     const address = std.net.Address.parseIp("0.0.0.0", port) catch {
-        return .{ .failed = .{ .msg = "Invalid address" } };
+        return .{ .failed = "Invalid address" };
     };
 
     const server = address.listen(.{
         .reuse_address = true,
         .kernel_backlog = 128,
     }) catch {
-        return .{ .failed = .{ .msg = "Failed to listen" } };
+        return .{ .failed = "Failed to listen" };
     };
 
     const handle = allocator.create(ServerHandle) catch {
-        return .{ .failed = .{ .msg = "Failed to allocate server handle" } };
+        return .{ .failed = "Failed to allocate server handle" };
     };
     handle.* = .{ .inner = server, .allocator = allocator };
 
     std.debug.print("Orisha listening on http://0.0.0.0:{}\n", .{port});
-    return .{ .listening = .{ .server = handle } };
+    return .{ .listening = handle };
 }
 
 // ============================================================================
@@ -171,8 +172,8 @@ pub const ConnHandle = struct {
 // ============================================================================
 
 ~pub event send { conn: *ConnHandle, status: u16, body: []const u8, content_type: ?[]const u8 }
-| sent {}
-| failed { msg: []const u8 }
+| sent
+| failed []const u8
 
 ~proc send {
     const allocator = conn.allocator;
@@ -184,11 +185,15 @@ pub const ConnHandle = struct {
 
     var len_buf: [20]u8 = undefined;
     const len_str = std.fmt.bufPrint(&len_buf, "{}", .{body.len}) catch "0";
+    var date_buf: [29]u8 = undefined;
+    formatHttpDate(&date_buf);
     if (headerPrefixClose(status)) |prefix| {
         response_buf.appendSlice(allocator, prefix) catch {};
         response_buf.appendSlice(allocator, len_str) catch {};
         response_buf.appendSlice(allocator, "\r\nContent-Type: ") catch {};
         response_buf.appendSlice(allocator, ct) catch {};
+        response_buf.appendSlice(allocator, "\r\nDate: ") catch {};
+        response_buf.appendSlice(allocator, &date_buf) catch {};
         response_buf.appendSlice(allocator, "\r\nConnection: close\r\n\r\n") catch {};
     } else {
         response_buf.appendSlice(allocator, "HTTP/1.1 ") catch {};
@@ -203,6 +208,8 @@ pub const ConnHandle = struct {
         response_buf.appendSlice(allocator, "\r\n") catch {};
         response_buf.appendSlice(allocator, "Content-Length: ") catch {};
         response_buf.appendSlice(allocator, len_str) catch {};
+        response_buf.appendSlice(allocator, "\r\nDate: ") catch {};
+        response_buf.appendSlice(allocator, &date_buf) catch {};
         response_buf.appendSlice(allocator, "\r\nConnection: close\r\n\r\n") catch {};
     }
 
@@ -212,11 +219,11 @@ pub const ConnHandle = struct {
     // Send
     _ = conn.stream.writeAll(response_buf.items) catch {
         conn.stream.close();
-        return .{ .failed = .{ .msg = "Write failed" } };
+        return .{ .failed = "Write failed" };
     };
 
     conn.stream.close();
-    return .{ .sent = .{} };
+    return .{ .sent = {} };
 }
 
 // ============================================================================
@@ -237,8 +244,8 @@ pub const ConnHandle = struct {
 // ============================================================================
 
 ~pub event serve { port: u16 }
-| shutdown { reason: []const u8 }
-| failed { msg: []const u8 }
+| shutdown []const u8
+| failed []const u8
 
 // Brutal async server loop (kqueue + keep-alive) with direct handler dispatch.
 // Keeps the DX: users implement ~orisha:handler.
@@ -273,6 +280,15 @@ fn statusText(status: u16) []const u8 {
         500 => "Internal Server Error",
         else => "Unknown",
     };
+}
+
+fn formatHttpDate(buf: *[29]u8) void {
+    const epoch = time_c.time(null);
+    var tm: time_c.struct_tm = undefined;
+    _ = time_c.gmtime_r(&epoch, &tm);
+    var tmp: [30]u8 = undefined;
+    _ = time_c.strftime(&tmp, 30, "%a, %d %b %Y %H:%M:%S GMT", &tm);
+    @memcpy(buf, tmp[0..29]);
 }
 
 fn headerPrefixClose(status: u16) ?[]const u8 {
@@ -397,15 +413,17 @@ fn workerLoop(ctx: *WorkerContext) void {
                         }
                     } else {
                         const res_ct = if (res.content_type) |ct_str| ct_str else "text/plain";
-                        var header_buf: [256]u8 = undefined;
+                        var date_buf: [29]u8 = undefined;
+                        formatHttpDate(&date_buf);
+                        var header_buf: [512]u8 = undefined;
                         const header = if (headerPrefixKeepAlive(res.status)) |prefix|
-                            std.fmt.bufPrint(&header_buf, "{s}{d}\r\nContent-Type: {s}\r\nConnection: keep-alive\r\n\r\n", .{ prefix, res.body.len, res_ct }) catch
+                            std.fmt.bufPrint(&header_buf, "{s}{d}\r\nContent-Type: {s}\r\nDate: {s}\r\nConnection: keep-alive\r\n\r\n", .{ prefix, res.body.len, res_ct, &date_buf }) catch
                                 "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                         else
                             std.fmt.bufPrint(
                                 &header_buf,
-                                "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n",
-                                .{ res.status, statusText(res.status), res_ct, res.body.len },
+                                "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nDate: {s}\r\nConnection: keep-alive\r\n\r\n",
+                                .{ res.status, statusText(res.status), res_ct, res.body.len, &date_buf },
                             ) catch "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
                         if (!writeAll(fd, header) or !writeAll(fd, res.body)) {
@@ -611,15 +629,17 @@ fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
                         }
                     } else {
                         const res_ct = if (res.content_type) |ct_str| ct_str else "text/plain";
-                        var header_buf: [256]u8 = undefined;
+                        var date_buf: [29]u8 = undefined;
+                        formatHttpDate(&date_buf);
+                        var header_buf: [512]u8 = undefined;
                         const header = if (headerPrefixKeepAlive(res.status)) |prefix|
-                            std.fmt.bufPrint(&header_buf, "{s}{d}\r\nContent-Type: {s}\r\nConnection: keep-alive\r\n\r\n", .{ prefix, res.body.len, res_ct }) catch
+                            std.fmt.bufPrint(&header_buf, "{s}{d}\r\nContent-Type: {s}\r\nDate: {s}\r\nConnection: keep-alive\r\n\r\n", .{ prefix, res.body.len, res_ct, &date_buf }) catch
                                 "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                         else
                             std.fmt.bufPrint(
                                 &header_buf,
-                                "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n",
-                                .{ res.status, statusText(res.status), res_ct, res.body.len },
+                                "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nDate: {s}\r\nConnection: keep-alive\r\n\r\n",
+                                .{ res.status, statusText(res.status), res_ct, res.body.len, &date_buf },
                             ) catch "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
                         if (!writeAll(fd, header) or !writeAll(fd, res.body)) {
@@ -745,7 +765,7 @@ fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
     program: *const Program,
     allocator: std.mem.Allocator
 }
-| transformed { program: *const Program }
+| transformed *const Program
 
 ~proc router {
     const ast_mod = @import("ast");
@@ -756,12 +776,12 @@ fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
     const flow = if (item.* == .flow)
         &item.flow
     else
-        return .{ .transformed = .{ .program = program } };
+        return .{ .transformed = program };
 
     // Check if already transformed
     for (flow.invocation.annotations) |ann| {
         if (std.mem.startsWith(u8, ann, "@pass_ran")) {
-            return .{ .transformed = .{ .program = program } };
+            return .{ .transformed = program };
         }
     }
 
@@ -810,7 +830,7 @@ fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
     else blk: {
         const parent_cont = findContWithInvocation(flow.continuations, invocation) orelse {
             std.debug.print("[ROUTER TRANSFORM] WARNING: Could not find nested invocation\n", .{});
-            return .{ .transformed = .{ .program = program } };
+            return .{ .transformed = program };
         };
         break :blk parent_cont.continuations;
     };
@@ -828,7 +848,7 @@ fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
     }
 
     if (patterns.items.len == 0) {
-        return .{ .transformed = .{ .program = program } };
+        return .{ .transformed = program };
     }
 
     std.debug.print("[ROUTER TRANSFORM] Found {} pattern branches\n", .{patterns.items.len});
@@ -1045,9 +1065,9 @@ fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
         if (maybe_new) |new_program_val| {
             const result = allocator.create(ast_mod.Program) catch unreachable;
             result.* = new_program_val;
-            return .{ .transformed = .{ .program = result } };
+            return .{ .transformed = result };
         }
-        return .{ .transformed = .{ .program = program } };
+        return .{ .transformed = program };
     }
 
     // TOP-LEVEL CASE: replace the entire flow
@@ -1090,10 +1110,10 @@ fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
     if (maybe_new_program) |new_program_val| {
         const result = allocator.create(ast_mod.Program) catch unreachable;
         result.* = new_program_val;
-        return .{ .transformed = .{ .program = result } };
+        return .{ .transformed = result };
     } else {
         std.debug.print("ERROR: Router transform failed - flow not found in program\n", .{});
-        return .{ .transformed = .{ .program = program } };
+        return .{ .transformed = program };
     }
 }
 
@@ -1323,7 +1343,7 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const Process
     program: *const Program,
     allocator: std.mem.Allocator
 }
-| transformed { program: *const Program }
+| transformed *const Program
 
 ~proc static_router {
     const ast_mod = @import("ast");
@@ -1333,12 +1353,12 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const Process
     const flow = if (item.* == .flow)
         &item.flow
     else
-        return .{ .transformed = .{ .program = program } };
+        return .{ .transformed = program };
 
     // Check if already transformed
     for (flow.invocation.annotations) |ann| {
         if (std.mem.startsWith(u8, ann, "@pass_ran")) {
-            return .{ .transformed = .{ .program = program } };
+            return .{ .transformed = program };
         }
     }
 
@@ -1380,7 +1400,7 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const Process
 
     if (static_root == null) {
         std.debug.print("ERROR: No ~orisha:static(name: \"{s}\") declaration found\n", .{static_name});
-        return .{ .transformed = .{ .program = program } };
+        return .{ .transformed = program };
     }
 
     std.debug.print("[STATIC_ROUTER] root={s}, fallback={s}\n", .{
@@ -1397,7 +1417,7 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const Process
 
     generateNamedRoutesFile(allocator, routes.items, static_name) catch |err| {
         std.debug.print("ERROR generating {s}: {}\n", .{ routes_filename, err });
-        return .{ .transformed = .{ .program = program } };
+        return .{ .transformed = program };
     };
 
     // Build inline_body: import routes, lookup, return response
@@ -1522,7 +1542,7 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const Process
                 const result = allocator.create(ast_mod.Program) catch unreachable;
                 result.* = new_program_val;
                 std.debug.print("[STATIC_ROUTER TRANSFORM] Replaced nested continuation (preserving parent flow for '{s}')\n", .{flow_inv_name});
-                return .{ .transformed = .{ .program = result } };
+                return .{ .transformed = result };
             }
         }
         // Fall through to top-level behavior if replacement didn't work
@@ -1568,9 +1588,9 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const Process
     if (maybe_new_program) |new_program_val| {
         const result = allocator.create(ast_mod.Program) catch unreachable;
         result.* = new_program_val;
-        return .{ .transformed = .{ .program = result } };
+        return .{ .transformed = result };
     } else {
         std.debug.print("ERROR: Static router transform failed - flow not found in program\n", .{});
-        return .{ .transformed = .{ .program = program } };
+        return .{ .transformed = program };
     }
 }
