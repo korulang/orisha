@@ -70,7 +70,7 @@ pub const ConnHandle = struct {
 | listening *ServerHandle
 | failed []const u8
 
-~proc listen {
+~proc listen|zig {
     const allocator = std.heap.c_allocator;
 
     const address = std.net.Address.parseIp("0.0.0.0", port) catch {
@@ -101,7 +101,7 @@ pub const ConnHandle = struct {
 | request { req: *Request, conn: *ConnHandle, server: *ServerHandle }
 | failed { msg: []const u8, server: *ServerHandle }
 
-~proc accept {
+~proc accept|zig {
     const allocator = server.allocator;
 
     // Accept connection
@@ -175,7 +175,7 @@ pub const ConnHandle = struct {
 | sent
 | failed []const u8
 
-~proc send {
+~proc send|zig {
     const allocator = conn.allocator;
     const ct = if (content_type) |ct_str| ct_str else "text/plain";
 
@@ -450,7 +450,7 @@ fn workerLoop(ctx: *WorkerContext) void {
     }
 }
 
-~proc serve {
+~proc serve|zig {
     const address = std.net.Address.parseIp("0.0.0.0", port) catch {
         return .{ .failed = "Invalid address" };
     };
@@ -767,7 +767,7 @@ fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
 }
 | transformed *const Program
 
-~proc router {
+~proc router|zig {
     const ast_mod = @import("ast");
     const ast_functional = @import("ast_functional");
     const continuation_codegen = @import("continuation_codegen");
@@ -1345,7 +1345,7 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const Process
 }
 | transformed *const Program
 
-~proc static_router {
+~proc static_router|zig {
     const ast_mod = @import("ast");
     const ast_functional = @import("ast_functional");
 

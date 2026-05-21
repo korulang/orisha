@@ -58,7 +58,7 @@ pub const Route = struct {
 | ok RouteMatch
 | no_match
 
-~[pure] proc match {
+~[pure] proc match|zig {
     var result = RouteMatch{
         .matched = false,
         .params = undefined,

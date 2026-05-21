@@ -34,7 +34,7 @@ const std = @import("std");
 ~event handle_request { method: []const u8, path: []const u8, conn: *std.net.Server.Connection }
 | responded { conn: *std.net.Server.Connection }
 
-~proc handle_request {
+~proc handle_request|zig {
     // Simple route matching
     if (std.mem.eql(u8, path, "/")) {
         const response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 18\r\n\r\nWelcome to Orisha!";
@@ -58,7 +58,7 @@ const std = @import("std");
 ~event send_400 { conn: *std.net.Server.Connection, msg: []const u8 }
 | sent { conn: *std.net.Server.Connection }
 
-~proc send_400 {
+~proc send_400|zig {
     const response = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 11\r\n\r\nBad Request";
     _ = conn.stream.writeAll(response) catch {};
     std.debug.print("❌ Bad request: {s}\n", .{msg});
