@@ -837,8 +837,14 @@ fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
 
     var patterns: std.ArrayList([]const u8) = .empty;
     var pattern_conts: std.ArrayList(PatternCont) = .empty;
+    // Kind awareness: the router DISPATCHES into the matched route, which is
+    // effect semantics — so its pattern branches must be effect branches (`!`),
+    // not terminal (`|`). Orisha predates BranchKind and was kind-blind; this
+    // makes it reject the terminal form loudly (see the @compileError below).
+    var has_terminal_pattern = false;
     for (source_continuations, 0..) |*cont, i| {
         if (cont.branch.len > 0 and cont.branch[0] == '[') {
+            if (cont.kind != .effect) has_terminal_pattern = true;
             patterns.append(allocator, cont.branch) catch unreachable;
             pattern_conts.append(allocator, .{
                 .pattern = cont.branch,
@@ -1041,7 +1047,13 @@ fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
         ib.appendSlice(allocator, "\n") catch unreachable;
     }
 
-    const inline_body_str = ib.toOwnedSlice(allocator) catch unreachable;
+    const _generated_dispatch = ib.toOwnedSlice(allocator) catch unreachable;
+    // If any pattern branch was terminal (`|`) rather than effect (`!`), replace
+    // the whole dispatch with a hard compile error. The router is kind-aware now.
+    const inline_body_str: []const u8 = if (has_terminal_pattern)
+        "//@koru:inline_stmt\ncomptime { @compileError(\"orisha:router pattern branches must use effect `!`, not terminal `|`. Write `! [GET /path]` instead.\"); }\n"
+    else
+        _generated_dispatch;
     std.debug.print("[ROUTER TRANSFORM] Generated inline dispatch:\n{s}\n", .{inline_body_str});
 
     if (!is_pointer_top) {
@@ -1496,6 +1508,7 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const Process
                             if (name_match) {
                                 new_conts[ci] = ast_mod.Continuation{
                                     .branch = cont.branch,
+                                    .kind = cont.kind, // preserve `!`/`|` — the router re-runs after this and is kind-aware
                                     .binding = cont.binding,
                                     .binding_annotations = cont.binding_annotations,
                                     .binding_type = cont.binding_type,
