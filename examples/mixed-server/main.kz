@@ -15,8 +15,8 @@
 //   curl http://localhost:3000/api/info      → {"server":"orisha","version":"0.1.0"}
 //   curl http://localhost:3000/unknown/path  → SPA fallback (index.html)
 
-~import "$orisha"
-~import "$std/io"
+~import "orisha"
+~import "std/io"
 
 ~orisha:static(name: "site", root: "public", fallback: "index.html")
 

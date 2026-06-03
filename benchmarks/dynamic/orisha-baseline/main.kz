@@ -6,8 +6,8 @@
 //
 // Run: koruc main.kz && ./a.out
 
-~import "$orisha"
-~import "$std/build"
+~import "orisha"
+~import "std/build"
 
 const std = @import("std");
 

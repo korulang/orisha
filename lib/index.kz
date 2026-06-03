@@ -8,7 +8,7 @@
 //   ~orisha:static_router(name)      - Transform: inline static file lookup + fallback
 //
 // Example (pure static site):
-//   ~import "$orisha"
+//   ~import "orisha"
 //   ~orisha:static(name: "site", root: "build", fallback: "200.html")
 //   ~orisha:handler = orisha:static_router(name: "site")
 //   ~orisha:serve(port: 3000)
@@ -22,9 +22,9 @@
 //   ~orisha:handler = response { status: 200, body: "Hello!", content_type: "text/plain" }
 //   ~orisha:serve(port: 3001)
 
-~import "$std/compiler"
-~import "$std/io"
-~import "$std/build"
+~import "std/compiler"
+~import "std/io"
+~import "std/build"
 
 ~std.compiler:requires {
     exe.linkSystemLibrary("z");
@@ -237,7 +237,7 @@ pub const ConnHandle = struct {
 | response { status: u16, body: []const u8, content_type: ?[]const u8 }
 
 // Default implementation - 404 for everything
-~handler = response { status: 404, body: "Not Found", content_type: null }
+~handler => response { status: 404, body: "Not Found", content_type: null }
 
 // ============================================================================
 // SERVE - Main server flow (calls handler for each request)

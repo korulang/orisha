@@ -10,10 +10,10 @@
 // Cross-compile for Linux:
 //   koruc main.kz --build=linux
 
-~import "$orisha"
-~import "$std/io"
-~import "$std/build"
-~import "$std/package"
+~import "orisha"
+~import "std/io"
+~import "std/build"
+~import "std/package"
 
 ~std.package:requires.npm { "@korulang/gzip": "^0.0.1" }
 

@@ -1,7 +1,7 @@
 // Hello World HTTP server using Orisha
-~import "$orisha/eshu"
-~import "$std/build"
-~import "$std/http"
+~import "orisha/eshu"
+~import "std/build"
+~import "std/http"
 
 const std = @import("std");
 

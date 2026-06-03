@@ -17,10 +17,10 @@
 //                                                            → {"result":...}
 //   curl http://localhost:3000/any/path                      → SPA fallback
 
-~import "$orisha"
-~import "$std/runtime"
-~import "$std/io"
-~import "$std/fmt"
+~import "orisha"
+~import "std/runtime"
+~import "std/io"
+~import "std/fmt"
 
 // ============================================================================
 // COMPILED EVENTS — native Zig speed, called by the interpreter
