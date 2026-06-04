@@ -33,20 +33,20 @@ import std/io
 
 // One handler, three modes + a nested router.
 ~orisha:handler = orisha:router(req)
-! [GET /api/health] |> response { status: 200, body: "{\"status\":\"ok\"}", content-type: "application/json" }
+! [GET /api/health] |> response { status: 200, body: "{\"status\":\"ok\"}", content_type: "application/json" }
 ! [POST /api/eval] _ |> std/runtime:run(source: req.body orelse "", scope: "api", budget: 1000)
     | result r |> std/fmt:ln("{\"result\":{{ r.value.toJsonBuf():s }}}")
-        | line l |> response { status: 200, body: l.text, content-type: "application/json" }
-    | exhausted _ |> response { status: 429, body: "{\"error\":\"budget_exhausted\"}", content-type: "application/json" }
-    | parse-error _ |> response { status: 400, body: "{\"error\":\"parse_error\"}", content-type: "application/json" }
-    | validation-error _ |> response { status: 400, body: "{\"error\":\"validation_error\"}", content-type: "application/json" }
-    | shape-error _ |> response { status: 400, body: "{\"error\":\"shape_error\"}", content-type: "application/json" }
-    | event-denied _ |> response { status: 403, body: "{\"error\":\"event_denied\"}", content-type: "application/json" }
-    | dispatch-error _ |> response { status: 500, body: "{\"error\":\"dispatch_error\"}", content-type: "application/json" }
-    | scope-not-found _ |> response { status: 500, body: "{\"error\":\"scope_not_found\"}", content-type: "application/json" }
+        | line l |> response { status: 200, body: l.text, content_type: "application/json" }
+    | exhausted _ |> response { status: 429, body: "{\"error\":\"budget_exhausted\"}", content_type: "application/json" }
+    | parse-error _ |> response { status: 400, body: "{\"error\":\"parse_error\"}", content_type: "application/json" }
+    | validation-error _ |> response { status: 400, body: "{\"error\":\"validation_error\"}", content_type: "application/json" }
+    | shape-error _ |> response { status: 400, body: "{\"error\":\"shape_error\"}", content_type: "application/json" }
+    | event-denied _ |> response { status: 403, body: "{\"error\":\"event_denied\"}", content_type: "application/json" }
+    | dispatch-error _ |> response { status: 500, body: "{\"error\":\"dispatch_error\"}", content_type: "application/json" }
+    | scope-not-found _ |> response { status: 500, body: "{\"error\":\"scope_not_found\"}", content_type: "application/json" }
 ! [GET /admin] |> orisha:router(req)
-    ! [GET /admin] |> response { status: 200, body: "{\"admin\":\"home\"}", content-type: "application/json" }
-    ! [*] |> response { status: 404, body: "{\"error\":\"admin_not_found\"}", content-type: "application/json" }
+    ! [GET /admin] |> response { status: 200, body: "{\"admin\":\"home\"}", content_type: "application/json" }
+    ! [*] |> response { status: 404, body: "{\"error\":\"admin_not_found\"}", content_type: "application/json" }
 ! [*] |> orisha:static_router(name: "site")
 
 ~orisha:serve(port: 3000)
