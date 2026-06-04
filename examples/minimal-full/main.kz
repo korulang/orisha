@@ -2,7 +2,7 @@
 //
 // A pruned `full-server` rewritten on EFFECT branches. The router *fires* the
 // matched route, so its pattern branches are `!` (effect dispatch). The events
-// the routes call into — `std.runtime:run`, `orisha:serve` — yield real
+// the routes call into — `std/runtime:run`, `orisha:serve` — yield real
 // outcomes, so those stay `|` continuation branches.
 //
 //   ! [GET /api/health]  → dynamic   (inline JSON)
@@ -21,10 +21,10 @@ import std/io
 ~pub event greet { name: []const u8 }
 | greeted []const u8
 
-~greet = std.fmt:ln("Hello, {{name:s}}!")
+~greet = std/fmt:ln("Hello, {{name:s}}!")
 | line l |> greeted l.text
 
-~std.runtime:register(scope: "api") {
+~std/runtime:register(scope: "api") {
     greet(5)
 }
 
@@ -34,8 +34,8 @@ import std/io
 // One handler, three modes + a nested router.
 ~orisha:handler = orisha:router(req)
 ! [GET /api/health] |> response { status: 200, body: "{\"status\":\"ok\"}", content-type: "application/json" }
-! [POST /api/eval] _ |> std.runtime:run(source: req.body orelse "", scope: "api", budget: 1000)
-    | result r |> std.fmt:ln("{\"result\":{{ r.value.toJsonBuf():s }}}")
+! [POST /api/eval] _ |> std/runtime:run(source: req.body orelse "", scope: "api", budget: 1000)
+    | result r |> std/fmt:ln("{\"result\":{{ r.value.toJsonBuf():s }}}")
         | line l |> response { status: 200, body: l.text, content-type: "application/json" }
     | exhausted _ |> response { status: 429, body: "{\"error\":\"budget_exhausted\"}", content-type: "application/json" }
     | parse-error _ |> response { status: 400, body: "{\"error\":\"parse_error\"}", content-type: "application/json" }
@@ -50,5 +50,5 @@ import std/io
 ! [*] |> orisha:static_router(name: "site")
 
 ~orisha:serve(port: 3000)
-| shutdown s |> std.io:println(text: s)
-| failed f |> std.io:println(text: f)
+| shutdown s |> std/io:println(text: s)
+| failed f |> std/io:println(text: f)

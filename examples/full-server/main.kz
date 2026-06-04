@@ -29,7 +29,7 @@ import std/fmt
 ~pub event greet { name: []const u8 }
 | greeted []const u8
 
-~greet = std.fmt:ln("Hello, {{name:s}}!")
+~greet = std/fmt:ln("Hello, {{name:s}}!")
 | line l |> greeted l.text
 
 ~pub event add { a: i64, b: i64 }
@@ -41,7 +41,7 @@ import std/fmt
 // INTERPRETER SCOPE — sandbox: only greet + add, budgeted
 // ============================================================================
 
-~std.runtime:register(scope: "api") {
+~std/runtime:register(scope: "api") {
     greet(5)
     add(2)
 }
@@ -58,25 +58,25 @@ import std/fmt
 
 ~orisha:handler = orisha:router(req)
 | [GET /api/health] |> response { status: 200, body: "{\"status\":\"ok\"}", content-type: "application/json" }
-| [POST /api/eval] _ |> std.runtime:run(source: req.body orelse "", scope: "api", budget: 1000)
-    | result r |> std.fmt:ln("{\"result\":{{r.value.toJsonBuf():s}},\"budget_used\":{{r.used}}}")
+| [POST /api/eval] _ |> std/runtime:run(source: req.body orelse "", scope: "api", budget: 1000)
+    | result r |> std/fmt:ln("{\"result\":{{r.value.toJsonBuf():s}},\"budget_used\":{{r.used}}}")
         | line l |> response { status: 200, body: l.text, content-type: "application/json" }
-    | exhausted e |> std.fmt:ln("{\"error\":\"budget_exhausted\",\"used\":{{e.used}},\"last_event\":\"{{e.last_event:s}}\"}")
+    | exhausted e |> std/fmt:ln("{\"error\":\"budget_exhausted\",\"used\":{{e.used}},\"last_event\":\"{{e.last_event:s}}\"}")
         | line l |> response { status: 429, body: l.text, content-type: "application/json" }
-    | parse-error e |> std.fmt:ln("{\"error\":\"parse_error\",\"message\":\"{{e.message:s}}\"}")
+    | parse-error e |> std/fmt:ln("{\"error\":\"parse_error\",\"message\":\"{{e.message:s}}\"}")
         | line l |> response { status: 400, body: l.text, content-type: "application/json" }
-    | validation-error e |> std.fmt:ln("{\"error\":\"validation_error\",\"message\":\"{{e.message:s}}\"}")
+    | validation-error e |> std/fmt:ln("{\"error\":\"validation_error\",\"message\":\"{{e.message:s}}\"}")
         | line l |> response { status: 400, body: l.text, content-type: "application/json" }
-    | shape-error e |> std.fmt:ln("{\"error\":\"shape_error\",\"branch\":\"{{e.branch:s}}\"}")
+    | shape-error e |> std/fmt:ln("{\"error\":\"shape_error\",\"branch\":\"{{e.branch:s}}\"}")
         | line l |> response { status: 400, body: l.text, content-type: "application/json" }
-    | event-denied e |> std.fmt:ln("{\"error\":\"event_denied\",\"name\":\"{{e.name:s}}\"}")
+    | event-denied e |> std/fmt:ln("{\"error\":\"event_denied\",\"name\":\"{{e.name:s}}\"}")
         | line l |> response { status: 403, body: l.text, content-type: "application/json" }
-    | dispatch-error e |> std.fmt:ln("{\"error\":\"dispatch_error\",\"event\":\"{{e.event_name:s}}\"}")
+    | dispatch-error e |> std/fmt:ln("{\"error\":\"dispatch_error\",\"event\":\"{{e.event_name:s}}\"}")
         | line l |> response { status: 500, body: l.text, content-type: "application/json" }
-    | scope-not-found e |> std.fmt:ln("{\"error\":\"scope_not_found\",\"scope\":\"{{e.scope_name:s}}\"}")
+    | scope-not-found e |> std/fmt:ln("{\"error\":\"scope_not_found\",\"scope\":\"{{e.scope_name:s}}\"}")
         | line l |> response { status: 500, body: l.text, content-type: "application/json" }
 | [*] |> orisha:static_router(name: "site")
 
 ~orisha:serve(port: 3000)
-| shutdown s |> std.io:println(text: s.reason)
-| failed f |> std.io:println(text: f.msg)
+| shutdown s |> std/io:println(text: s.reason)
+| failed f |> std/io:println(text: f.msg)

@@ -16,12 +16,12 @@ const std = @import("std");
 // BENCHMARK COMMANDS
 // ============================================================================
 
-~std.build:command.sh(name: "bench", description: "Benchmark Orisha (50 connections, 10s)") {
+~std/build:command.sh(name: "bench", description: "Benchmark Orisha (50 connections, 10s)") {
   echo "=== Orisha Benchmark (50 connections, 10s) ==="
   wrk -t2 -c50 -d10s http://localhost:3000/
 }
 
-~std.build:command.sh(name: "compare", description: "Compare Orisha vs nginx performance") {
+~std/build:command.sh(name: "compare", description: "Compare Orisha vs nginx performance") {
   echo "=== ORISHA vs NGINX Comparison ==="
   echo ""
   echo "--- Orisha ---"

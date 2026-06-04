@@ -6,25 +6,25 @@ import std/http
 const std = @import("std");
 
 // Define a GET route at /hello
-~orisha.eshu:route(method: "GET", path: "/hello")
+~orisha/eshu:route(method: "GET", path: "/hello")
   | http-context ctx |>
-    orisha.eshu:send_text(ctx: ctx, content: "Hello, World!")
+    orisha/eshu:send_text(ctx: ctx, content: "Hello, World!")
 
 // Define a GET route at /
-~orisha.eshu:route(method: "GET", path: "/")
+~orisha/eshu:route(method: "GET", path: "/")
   | http-context ctx |>
-    orisha.eshu:send_text(ctx: ctx, content: "Welcome to Orisha!")
+    orisha/eshu:send_text(ctx: ctx, content: "Welcome to Orisha!")
 
 // Server loop - listen, accept, handle request, respond, repeat
-~orisha.eshu:listen(port: 3000)
-| listening l |> #accept_loop orisha.eshu:accept(server: l.server)
-    | connection c |> orisha.eshu:read(conn: c.conn)
-        | data d |> std.http:parse_request(data: d.bytes)
+~orisha/eshu:listen(port: 3000)
+| listening l |> #accept_loop orisha/eshu:accept(server: l.server)
+    | connection c |> orisha/eshu:read(conn: c.conn)
+        | data d |> std/http:parse_request(data: d.bytes)
             | request req |> handle-request(method: req.method, path: req.path, conn: c.conn)
-                | responded |> orisha.eshu:close(conn: responded.conn)
+                | responded |> orisha/eshu:close(conn: responded.conn)
                     | done |> @accept_loop(server: c.server)
             | invalid err |> send-400(conn: c.conn, msg: err.msg)
-                | sent s |> orisha.eshu:close(conn: s.conn)
+                | sent s |> orisha/eshu:close(conn: s.conn)
                     | done |> @accept_loop(server: c.server)
         | closed |> @accept_loop(server: c.server)
     | failed f |> @accept_loop(server: f.server)
@@ -70,12 +70,12 @@ const std = @import("std");
 // ============================================================================
 
 // Step 1: Compile the backend
-~std.build:step(name: "compile") {
+~std/build:step(name: "compile") {
     zig build-exe backend_output_emitted.zig -femit-bin=backend_tmp
 }
 
 // Step 2: Run the server (depends on compile)
 ~[depends_on("compile")]
-std.build:step(name: "run") {
+std/build:step(name: "run") {
     ./backend_tmp
 }

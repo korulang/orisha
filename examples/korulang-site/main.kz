@@ -15,12 +15,12 @@ import std/io
 import std/build
 import std/package
 
-~std.package:requires.npm { "@korulang/gzip": "^0.0.1" }
+~std/package:requires.npm { "@korulang/gzip": "^0.0.1" }
 
 ~orisha:static(name: "site", root: "../../../korulang_org/build", fallback: "200.html")
 
 ~orisha:handler = orisha:static_router(name: "site")
 
 ~orisha:serve(port: 3000)
-| shutdown s |> std.io:println(text: s.reason)
-| failed f |> std.io:println(text: f.msg)
+| shutdown s |> std/io:println(text: s.reason)
+| failed f |> std/io:println(text: f.msg)

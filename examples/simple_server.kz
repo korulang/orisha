@@ -11,16 +11,16 @@ import koru/docker
 
 // Start the server
 ~orisha:serve(port: 3001)
-| shutdown s |> std.io:println(text: s.reason)
-| failed f |> std.io:println(text: f.msg)
+| shutdown s |> std/io:println(text: s.reason)
+| failed f |> std/io:println(text: f.msg)
 
 // Cross-compilation: koruc simple_server.kz --build=linux
-~[build(linux)]std.build:config {
+~[build(linux)]std/build:config {
     "target": "x86_64-linux-musl"
 }
 
 // Container image: koruc simple_server.kz --build=linux docker build
-~[build(linux)]koru.docker:image(tag: "koru-server:latest") {
+~[build(linux)]koru/docker:image(tag: "koru-server:latest") {
     FROM scratch
     COPY a.out /server
     EXPOSE 3001

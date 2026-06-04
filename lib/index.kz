@@ -26,7 +26,7 @@ import std/compiler
 import std/io
 import std/build
 
-~std.compiler:requires {
+~std/compiler:requires {
     exe.linkSystemLibrary("z");
     exe.linkLibC();
 }
@@ -741,7 +741,7 @@ fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
 // Default (no --build flag): uses bare ~proc serve (kqueue/macOS)
 // With --build=linux: selects epoll variant
 
-~[build(linux)]std.build:variants {
+~[build(linux)]std/build:variants {
     "orisha:serve": "epoll"
 }
 | configured _ |> _
