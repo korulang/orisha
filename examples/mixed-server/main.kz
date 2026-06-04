@@ -24,11 +24,11 @@ import std/io
 | [GET /api/health] |> response {
     status: 200,
     body: "{\"status\":\"ok\"}",
-    content_type: "application/json"
+    content-type: "application/json"
 }
 | [GET /api/info] |> response {
     status: 200, body: "{\"server\":\"orisha\",\"version\":\"0.1.0\"}",
-    content_type: "application/json" }
+    content-type: "application/json" }
 | [*] |> orisha:static_router(name: "site")
 
 ~orisha:serve(port: 3000)

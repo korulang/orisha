@@ -7,7 +7,7 @@ import std/build
 import koru/docker
 
 // Implement the handler
-~orisha:handler = response { status: 200, body: "Hello from Koru!", content_type: "text/plain" }
+~orisha:handler = response { status: 200, body: "Hello from Koru!", content-type: "text/plain" }
 
 // Start the server
 ~orisha:serve(port: 3001)

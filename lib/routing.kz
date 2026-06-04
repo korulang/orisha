@@ -56,7 +56,7 @@ pub const Route = struct {
 // Returns match result with extracted parameters
 ~pub event match { path: []const u8, pattern: []const u8 }
 | ok RouteMatch
-| no_match
+| no-match
 
 ~[pure] proc match|zig {
     var result = RouteMatch{
@@ -119,8 +119,8 @@ pub const Route = struct {
 
 // TODO: match_route needs cross-event call support
 // The @This().match_event pattern doesn't work inside nested event structs
-// ~pub event match_route { method: []const u8, path: []const u8, route_method: []const u8, pattern: []const u8 }
+// ~pub event match_route { method: []const u8, path: []const u8, route-method: []const u8, pattern: []const u8 }
 // | ok { result: RouteMatch }
-// | no_match {}
+// | no-match {}
 
 // Tests removed — ~test infrastructure needs to move to testing.kz
