@@ -5,10 +5,10 @@
 //
 // Run: koruc main.kz && ./a.out
 
-~import "orisha"
-~import "std/runtime"
-~import "std/io"
-~import "std/fmt"
+import orisha
+import std/runtime
+import std/io
+import std/fmt
 
 // ============================================================================
 // API EVENTS - These are compiled Zig procs, NOT interpreted

@@ -12,10 +12,10 @@
 //
 // Build & run:  koruc main.kz && ./a.out
 
-~import "orisha"
-~import "std/runtime"
-~import "std/fmt"
-~import "std/io"
+import orisha
+import std/runtime
+import std/fmt
+import std/io
 
 // One compiled event the interpreter is allowed to call, budgeted.
 ~pub event greet { name: []const u8 }

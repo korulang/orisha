@@ -22,9 +22,9 @@
 //   ~orisha:handler = response { status: 200, body: "Hello!", content_type: "text/plain" }
 //   ~orisha:serve(port: 3001)
 
-~import "std/compiler"
-~import "std/io"
-~import "std/build"
+import std/compiler
+import std/io
+import std/build
 
 ~std.compiler:requires {
     exe.linkSystemLibrary("z");
