@@ -61,4 +61,4 @@ import std/fmt
 
 ~orisha:serve(port: 3000)
 | shutdown _ |> _
-| failed f |> std.io:println(text: f.msg)
+| failed f |> std.io:print.ln(f.msg)
