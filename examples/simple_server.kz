@@ -1,10 +1,10 @@
 // Simple Orisha server test
 // Tests the new Koru-flow-based server architecture
 
-import orisha
-import std/io
-import std/build
-import koru/docker
+~import orisha
+~import std/io
+~import std/build
+~import koru/docker
 
 // Implement the handler
 ~orisha:handler = response { status: 200, body: "Hello from Koru!", content_type: "text/plain" }

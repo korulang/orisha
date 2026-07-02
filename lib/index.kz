@@ -8,7 +8,7 @@
 //   ~orisha:static_router(name)      - Transform: inline static file lookup + fallback
 //
 // Example (pure static site):
-//   ~import "orisha"
+//   ~import orisha
 //   ~orisha:static(name: "site", root: "build", fallback: "200.html")
 //   ~orisha:handler = orisha:static_router(name: "site")
 //   ~orisha:serve(port: 3000)
@@ -22,9 +22,9 @@
 //   ~orisha:handler = response { status: 200, body: "Hello!", content-type: "text/plain" }
 //   ~orisha:serve(port: 3001)
 
-import std/compiler
-import std/io
-import std/build
+~import std/compiler
+~import std/io
+~import std/build
 
 ~std/compiler:requires {
     exe.linkSystemLibrary("z");

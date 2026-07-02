@@ -10,7 +10,7 @@
 //       | ok m |> assert.ok()
 //   }
 
-import std/testing
+~import std/testing
 
 const router_std = @import("std");
 

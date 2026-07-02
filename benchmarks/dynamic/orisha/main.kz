@@ -5,7 +5,7 @@
 //
 // Run: koruc main.kz && ./a.out
 
-import orisha
+~import orisha
 const std = @import("std");
 
 // Build JSON body for /api/users/:id (upstream formatting)

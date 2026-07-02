@@ -7,8 +7,8 @@
 // Run: koruc main.kz && ./a.out
 // Bench: koruc main.kz bench
 
-import orisha
-import std/build
+~import orisha
+~import std/build
 
 const std = @import("std");
 

@@ -1,7 +1,7 @@
 // Test: Router transform with pattern branches - SIMPLIFIED
 
-import orisha
-import std/io
+~import orisha
+~import std/io
 
 const std = @import("std");
 
