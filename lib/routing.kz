@@ -54,7 +54,7 @@ pub const Route = struct {
 
 // Match a path against a pattern like "/users/:id/posts/:post_id"
 // Returns match result with extracted parameters
-~pub event match { path: []const u8, pattern: []const u8 }
+~pub tor match { path: string, pattern: string }
 | ok RouteMatch
 | no-match
 

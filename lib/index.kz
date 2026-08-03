@@ -66,9 +66,9 @@ pub const ConnHandle = struct {
 // LISTEN - Start listening on a port
 // ============================================================================
 
-~pub event listen { port: u16 }
+~pub tor listen { port: u16 }
 | listening *ServerHandle
-| failed []const u8
+| failed string
 
 ~proc listen|zig {
     const allocator = std.heap.c_allocator;
@@ -97,9 +97,9 @@ pub const ConnHandle = struct {
 // ACCEPT - Accept connection and parse HTTP request
 // ============================================================================
 
-~pub event accept { server: *ServerHandle }
+~pub tor accept { server: *ServerHandle }
 | request { req: *Request, conn: *ConnHandle, server: *ServerHandle }
-| failed { msg: []const u8, server: *ServerHandle }
+| failed { msg: string, server: *ServerHandle }
 
 ~proc accept|zig {
     const allocator = server.allocator;
@@ -171,9 +171,9 @@ pub const ConnHandle = struct {
 // SEND - Send HTTP response and close connection
 // ============================================================================
 
-~pub event send { conn: *ConnHandle, status: u16, body: []const u8, content_type: ?[]const u8 }
+~pub tor send { conn: *ConnHandle, status: u16, body: string, content_type: ?string }
 | sent
-| failed []const u8
+| failed string
 
 ~proc send|zig {
     const allocator = conn.allocator;
@@ -233,19 +233,18 @@ pub const ConnHandle = struct {
 
 // @retain: handler_event is referenced from serve proc's raw Zig code
 // via @This().handler_event.handler(...) — invisible to the dead-stripper.
-~[abstract|retain]pub event handler { req: *Request }
-| response { status: u16, body: []const u8, content_type: ?[]const u8 }
+~[abstract|retain]pub tor handler { req: *Request } -> { status: u16, body: string, content_type: ?string }
 
 // Default implementation - 404 for everything
-~handler => response { status: 404, body: "Not Found", content_type: null }
+~handler -> { status: 404, body: "Not Found", content_type: null }
 
 // ============================================================================
 // SERVE - Main server flow (calls handler for each request)
 // ============================================================================
 
-~pub event serve { port: u16 }
-| shutdown []const u8
-| failed []const u8
+~pub tor serve { port: u16 }
+| shutdown string
+| failed string
 
 // Brutal async server loop (kqueue + keep-alive) with direct handler dispatch.
 // Keeps the DX: users implement ~orisha:handler.
@@ -399,10 +398,7 @@ fn workerLoop(ctx: *WorkerContext) void {
                         .allocator = std.heap.page_allocator,
                     };
 
-                    const result = @This().handler_event.handler(.{ .req = &req });
-                    const res = switch (result) {
-                        .response => |r| r,
-                    };
+                    const res = @This().handler_event.handler(.{ .req = &req });
 
                     // Pre-built HTTP response (starts with "HTTP/1.") — write directly
                     if (std.mem.startsWith(u8, res.body, "HTTP/1.")) {
@@ -615,10 +611,7 @@ fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
                         .allocator = std.heap.page_allocator,
                     };
 
-                    const result = @This().handler_event.handler(.{ .req = &req });
-                    const res = switch (result) {
-                        .response => |r| r,
-                    };
+                    const res = @This().handler_event.handler(.{ .req = &req });
 
                     // Pre-built HTTP response (starts with "HTTP/1.") — write directly
                     if (std.mem.startsWith(u8, res.body, "HTTP/1.")) {
@@ -759,13 +752,12 @@ fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
 //   | [GET /users/:id] p |> response { status: 200, body: p.id, content-type: "text/plain" }
 //   | [*] _ |> response { status: 404, body: "Not Found", content-type: "text/plain" }
 
-~[comptime|transform]pub event router {
+~[comptime|transform]pub tor router {
     invocation: *const Invocation,
     item: *const Item,
     program: *const Program,
     allocator: std.mem.Allocator
-}
-| transformed *const Program
+} -> *const Program
 
 ~proc router|zig {
     const ast_mod = @import("ast");
@@ -776,12 +768,12 @@ fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
     const flow = if (item.* == .flow)
         &item.flow
     else
-        return .{ .transformed = program };
+        return program;
 
     // Check if already transformed
     for (flow.invocation.annotations) |ann| {
         if (std.mem.startsWith(u8, ann, "@pass_ran")) {
-            return .{ .transformed = program };
+            return program;
         }
     }
 
@@ -830,7 +822,7 @@ fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
     else blk: {
         const parent_cont = findContWithInvocation(flow.continuations, invocation) orelse {
             std.debug.print("[ROUTER TRANSFORM] WARNING: Could not find nested invocation\n", .{});
-            return .{ .transformed = program };
+            return program;
         };
         break :blk parent_cont.continuations;
     };
@@ -854,7 +846,7 @@ fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
     }
 
     if (patterns.items.len == 0) {
-        return .{ .transformed = program };
+        return program;
     }
 
     std.debug.print("[ROUTER TRANSFORM] Found {} pattern branches\n", .{patterns.items.len});
@@ -1077,9 +1069,9 @@ fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
         if (maybe_new) |new_program_val| {
             const result = allocator.create(ast_mod.Program) catch unreachable;
             result.* = new_program_val;
-            return .{ .transformed = result };
+            return result;
         }
-        return .{ .transformed = program };
+        return program;
     }
 
     // TOP-LEVEL CASE: replace the entire flow
@@ -1122,10 +1114,10 @@ fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
     if (maybe_new_program) |new_program_val| {
         const result = allocator.create(ast_mod.Program) catch unreachable;
         result.* = new_program_val;
-        return .{ .transformed = result };
+        return result;
     } else {
         std.debug.print("ERROR: Router transform failed - flow not found in program\n", .{});
-        return .{ .transformed = program };
+        return program;
     }
 }
 
@@ -1335,7 +1327,7 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const Process
 // - name: identifier for referencing via static_router
 // - root: directory to embed (relative to .kz file)
 // - fallback: optional file for SPA fallback (relative to root, e.g. "200.html")
-~[comptime]pub event static { name: []const u8, root: []const u8, fallback: ?[]const u8 }
+~[comptime]pub tor static { name: string, root: string, fallback: ?string }
 
 // ============================================================================
 // STATIC ROUTER - Compile-time transform for static file dispatch
@@ -1349,13 +1341,12 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const Process
 //   ~orisha:handler = orisha:static_router(name: "site")
 //   | [*] |> orisha:static_router(name: "site")
 
-~[comptime|transform]pub event static-router {
+~[comptime|transform]pub tor static-router {
     invocation: *const Invocation,
     item: *const Item,
     program: *const Program,
     allocator: std.mem.Allocator
-}
-| transformed *const Program
+} -> *const Program
 
 ~proc static-router|zig {
     const ast_mod = @import("ast");
@@ -1365,12 +1356,12 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const Process
     const flow = if (item.* == .flow)
         &item.flow
     else
-        return .{ .transformed = program };
+        return program;
 
     // Check if already transformed
     for (flow.invocation.annotations) |ann| {
         if (std.mem.startsWith(u8, ann, "@pass_ran")) {
-            return .{ .transformed = program };
+            return program;
         }
     }
 
@@ -1412,7 +1403,7 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const Process
 
     if (static_root == null) {
         std.debug.print("ERROR: No ~orisha:static(name: \"{s}\") declaration found\n", .{static_name});
-        return .{ .transformed = program };
+        return program;
     }
 
     std.debug.print("[STATIC_ROUTER] root={s}, fallback={s}\n", .{
@@ -1429,7 +1420,7 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const Process
 
     generateNamedRoutesFile(allocator, routes.items, static_name) catch |err| {
         std.debug.print("ERROR generating {s}: {}\n", .{ routes_filename, err });
-        return .{ .transformed = program };
+        return program;
     };
 
     // Build inline_body: import routes, lookup, return response
@@ -1443,7 +1434,7 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const Process
 
     // Lookup with ETag: use req from the handler's scope
     ib.appendSlice(allocator, "    if (_static_routes.lookupWithEtag(req.method, req.path, req.if_none_match)) |_static_resp| {\n") catch unreachable;
-    ib.appendSlice(allocator, "        return .{ .response = .{ .status = 200, .body = _static_resp, .content_type = null } };\n") catch unreachable;
+    ib.appendSlice(allocator, "        return .{ .status = 200, .body = _static_resp, .content_type = null };\n") catch unreachable;
     ib.appendSlice(allocator, "    }") catch unreachable;
 
     // Fallback handling
@@ -1452,14 +1443,14 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const Process
         ib.appendSlice(allocator, " else if (_static_routes.lookupWithEtag(\"GET\", \"/") catch unreachable;
         ib.appendSlice(allocator, fallback) catch unreachable;
         ib.appendSlice(allocator, "\", null)) |_fallback_resp| {\n") catch unreachable;
-        ib.appendSlice(allocator, "        return .{ .response = .{ .status = 200, .body = _fallback_resp, .content_type = null } };\n") catch unreachable;
+        ib.appendSlice(allocator, "        return .{ .status = 200, .body = _fallback_resp, .content_type = null };\n") catch unreachable;
         ib.appendSlice(allocator, "    } else {\n") catch unreachable;
-        ib.appendSlice(allocator, "        return .{ .response = .{ .status = 404, .body = \"Not Found\", .content_type = null } };\n") catch unreachable;
+        ib.appendSlice(allocator, "        return .{ .status = 404, .body = \"Not Found\", .content_type = null };\n") catch unreachable;
         ib.appendSlice(allocator, "    }\n") catch unreachable;
     } else {
         // No fallback: 404
         ib.appendSlice(allocator, " else {\n") catch unreachable;
-        ib.appendSlice(allocator, "        return .{ .response = .{ .status = 404, .body = \"Not Found\", .content_type = null } };\n") catch unreachable;
+        ib.appendSlice(allocator, "        return .{ .status = 404, .body = \"Not Found\", .content_type = null };\n") catch unreachable;
         ib.appendSlice(allocator, "    }\n") catch unreachable;
     }
 
@@ -1555,7 +1546,7 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const Process
                 const result = allocator.create(ast_mod.Program) catch unreachable;
                 result.* = new_program_val;
                 std.debug.print("[STATIC_ROUTER TRANSFORM] Replaced nested continuation (preserving parent flow for '{s}')\n", .{flow_inv_name});
-                return .{ .transformed = result };
+                return result;
             }
         }
         // Fall through to top-level behavior if replacement didn't work
@@ -1601,9 +1592,9 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const Process
     if (maybe_new_program) |new_program_val| {
         const result = allocator.create(ast_mod.Program) catch unreachable;
         result.* = new_program_val;
-        return .{ .transformed = result };
+        return result;
     } else {
         std.debug.print("ERROR: Static router transform failed - flow not found in program\n", .{});
-        return .{ .transformed = program };
+        return program;
     }
 }
