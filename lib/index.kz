@@ -231,9 +231,16 @@ pub const ConnHandle = struct {
 // ============================================================================
 // Users implement this to handle requests. Default returns 404.
 
+// The response's content type. `?string` in a RETURN RECORD does not lower to
+// Zig yet (params lower via emitter_helpers.zig:907 / regression 400_181; the
+// bare-return record path writeBareReturnType only lowers exact `string`), so
+// the optional field names this module-local alias instead — the same
+// mechanism `*Request` uses.
+pub const ContentType = []const u8;
+
 // @retain: handler_event is referenced from serve proc's raw Zig code
 // via @This().handler_event.handler(...) — invisible to the dead-stripper.
-~[abstract|retain]pub tor handler { req: *Request } -> { status: u16, body: string, content_type: ?string }
+~[abstract|retain]pub tor handler { req: *Request } -> { status: u16, body: string, content_type: ?ContentType }
 
 // Default implementation - 404 for everything
 ~handler -> { status: 404, body: "Not Found", content_type: null }
@@ -757,7 +764,7 @@ fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
     item: *const Item,
     program: *const Program,
     allocator: std.mem.Allocator
-} -> *const Program
+} -> SiteResult
 
 ~proc router|zig {
     const ast_mod = @import("ast");
@@ -768,19 +775,19 @@ fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
     const flow = if (item.* == .flow)
         &item.flow
     else
-        return program;
+        return .{};
 
     // Check if already transformed
-    for (flow.invocation.annotations) |ann| {
+    for (flow.inv().annotations) |ann| {
         if (std.mem.startsWith(u8, ann, "@pass_ran")) {
-            return program;
+            return .{};
         }
     }
 
     // Detect whether this is the flow's own invocation or a nested one.
     // findContainingItem returns the parent flow, so for nested routers
     // we must search the continuation tree for the actual invocation.
-    const is_pointer_top = (invocation == &flow.invocation);
+    const is_pointer_top = (invocation == flow.inv());
 
     // Get the request expression from invocation args (the call-site value to splice)
     var req_expr: []const u8 = "req";
@@ -818,11 +825,11 @@ fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
     }.search;
 
     const source_continuations = if (is_pointer_top)
-        flow.continuations
+        flow.body.continuations
     else blk: {
-        const parent_cont = findContWithInvocation(flow.continuations, invocation) orelse {
+        const parent_cont = findContWithInvocation(flow.body.continuations, invocation) orelse {
             std.debug.print("[ROUTER TRANSFORM] WARNING: Could not find nested invocation\n", .{});
-            return program;
+            return .{};
         };
         break :blk parent_cont.continuations;
     };
@@ -834,8 +841,19 @@ fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
     // not terminal (`|`). Orisha predates BranchKind and was kind-blind; this
     // makes it reject the terminal form loudly (see the @compileError below).
     var has_terminal_pattern = false;
+    // The `[...]` glyphs are a source ENCODING of a quoted branch name — the
+    // parser strips them (flow_parser.zig parseBranchInfo), so the AST carries
+    // `GET /users/:id` or `*`, never `[GET /users/:id]`. A router pattern is
+    // therefore a branch that is the catch-all `*` or carries a `METHOD path`
+    // pair (contains a space).
+    const isPatternBranch = struct {
+        fn check(branch: []const u8) bool {
+            if (std.mem.eql(u8, branch, "*")) return true;
+            return std.mem.indexOfScalar(u8, branch, ' ') != null;
+        }
+    }.check;
     for (source_continuations, 0..) |*cont, i| {
-        if (cont.branch.len > 0 and cont.branch[0] == '[') {
+        if (isPatternBranch(cont.branch)) {
             if (cont.kind != .effect) has_terminal_pattern = true;
             patterns.append(allocator, cont.branch) catch unreachable;
             pattern_conts.append(allocator, .{
@@ -846,7 +864,7 @@ fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
     }
 
     if (patterns.items.len == 0) {
-        return program;
+        return .{};
     }
 
     std.debug.print("[ROUTER TRANSFORM] Found {} pattern branches\n", .{patterns.items.len});
@@ -863,7 +881,7 @@ fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
     // Parse all patterns
     var parsed_patterns: std.ArrayList(ParsedPattern) = .empty;
     for (patterns.items) |pattern| {
-        if (std.mem.eql(u8, pattern, "[*]")) {
+        if (std.mem.eql(u8, pattern, "*")) {
             parsed_patterns.append(allocator, .{
                 .raw = pattern,
                 .method = "*",
@@ -874,7 +892,7 @@ fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
             continue;
         }
 
-        const inner = pattern[1 .. pattern.len - 1];
+        const inner = pattern; // brackets already stripped by the parser
         const space_idx = std.mem.indexOf(u8, inner, " ") orelse continue;
         const method = inner[0..space_idx];
         const path = inner[space_idx + 1 ..];
@@ -1065,47 +1083,35 @@ fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
             invocation,
             new_node,
             empty_conts,
+            true, // synthesized graft — exempt from structural branch rules
         ) catch unreachable;
         if (maybe_new) |new_program_val| {
             const result = allocator.create(ast_mod.Program) catch unreachable;
             result.* = new_program_val;
-            return result;
+            return .{ .whole_program = result };
         }
-        return program;
+        return .{};
     }
 
     // TOP-LEVEL CASE: replace the entire flow
     // Mark as transformed (keep original invocation path)
-    const new_inv_annotations = allocator.alloc([]const u8, flow.invocation.annotations.len + 1) catch unreachable;
-    for (flow.invocation.annotations, 0..) |ann, j| {
+    const new_inv_annotations = allocator.alloc([]const u8, flow.inv().annotations.len + 1) catch unreachable;
+    for (flow.inv().annotations, 0..) |ann, j| {
         new_inv_annotations[j] = ann;
     }
-    new_inv_annotations[flow.invocation.annotations.len] = allocator.dupe(u8, "@pass_ran(\"transform\")") catch unreachable;
+    new_inv_annotations[flow.inv().annotations.len] = allocator.dupe(u8, "@pass_ran(\"transform\")") catch unreachable;
 
     const new_invocation = ast_mod.Invocation{
-        .path = flow.invocation.path,
-        .args = flow.invocation.args,
+        .path = flow.inv().path,
+        .args = flow.inv().args,
         .annotations = new_inv_annotations,
     };
 
     const empty_conts = allocator.alloc(ast_mod.Continuation, 0) catch unreachable;
 
-    const transformed_flow = ast_mod.Flow{
-        .invocation = new_invocation,
-        .continuations = empty_conts,
-        .annotations = flow.annotations,
-        .pre_label = flow.pre_label,
-        .post_label = flow.post_label,
-        .super_shape = flow.super_shape,
-        .inline_body = inline_body_str,
-        .preamble_code = flow.preamble_code,
-        .is_pure = flow.is_pure,
-        .is_transitively_pure = flow.is_transitively_pure,
-        .impl_of = flow.impl_of,
-        .is_impl = flow.is_impl,
-        .module = flow.module,
-        .location = flow.location,
-    };
+    var transformed_flow = flow.*;
+    transformed_flow.body = ast_mod.rootSite(new_invocation, empty_conts, flow.location);
+    transformed_flow.inline_body = inline_body_str;
 
     const new_item = ast_mod.Item{ .flow = transformed_flow };
 
@@ -1114,10 +1120,10 @@ fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
     if (maybe_new_program) |new_program_val| {
         const result = allocator.create(ast_mod.Program) catch unreachable;
         result.* = new_program_val;
-        return result;
+        return .{ .whole_program = result };
     } else {
         std.debug.print("ERROR: Router transform failed - flow not found in program\n", .{});
-        return program;
+        return .{};
     }
 }
 
@@ -1346,7 +1352,7 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const Process
     item: *const Item,
     program: *const Program,
     allocator: std.mem.Allocator
-} -> *const Program
+} -> SiteResult
 
 ~proc static-router|zig {
     const ast_mod = @import("ast");
@@ -1356,12 +1362,12 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const Process
     const flow = if (item.* == .flow)
         &item.flow
     else
-        return program;
+        return .{};
 
     // Check if already transformed
-    for (flow.invocation.annotations) |ann| {
+    for (flow.inv().annotations) |ann| {
         if (std.mem.startsWith(u8, ann, "@pass_ran")) {
-            return program;
+            return .{};
         }
     }
 
@@ -1382,7 +1388,7 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const Process
 
     for (program.items) |prog_item| {
         if (prog_item != .flow) continue;
-        const inv = prog_item.flow.invocation;
+        const inv = prog_item.flow.inv().*;
         if (inv.path.segments.len == 0) continue;
         const last_segment = inv.path.segments[inv.path.segments.len - 1];
         if (!std.mem.eql(u8, last_segment, "static")) continue;
@@ -1403,7 +1409,7 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const Process
 
     if (static_root == null) {
         std.debug.print("ERROR: No ~orisha:static(name: \"{s}\") declaration found\n", .{static_name});
-        return program;
+        return .{};
     }
 
     std.debug.print("[STATIC_ROUTER] root={s}, fallback={s}\n", .{
@@ -1420,7 +1426,7 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const Process
 
     generateNamedRoutesFile(allocator, routes.items, static_name) catch |err| {
         std.debug.print("ERROR generating {s}: {}\n", .{ routes_filename, err });
-        return program;
+        return .{};
     };
 
     // Build inline_body: import routes, lookup, return response
@@ -1460,8 +1466,8 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const Process
     // Check if this invocation is the flow's top-level invocation or nested in a continuation.
     // If the flow's invocation IS static_router, we're standalone (top-level handler).
     // If it's something else (e.g., router), we're nested in a catch-all continuation.
-    const flow_inv_name = if (flow.invocation.path.segments.len > 0)
-        flow.invocation.path.segments[flow.invocation.path.segments.len - 1]
+    const flow_inv_name = if (flow.inv().path.segments.len > 0)
+        flow.inv().path.segments[flow.inv().path.segments.len - 1]
     else
         "";
     const is_top_level = std.mem.eql(u8, flow_inv_name, "static_router");
@@ -1479,9 +1485,9 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const Process
         }
 
         // Find the continuation whose node is the static_router invocation and replace its node
-        var new_conts = allocator.alloc(ast_mod.Continuation, flow.continuations.len) catch unreachable;
+        var new_conts = allocator.alloc(ast_mod.Continuation, flow.body.continuations.len) catch unreachable;
         var replaced = false;
-        for (flow.continuations, 0..) |cont, ci| {
+        for (flow.body.continuations, 0..) |cont, ci| {
             if (!replaced) {
                 if (cont.node) |node| {
                     if (node == .invocation) {
@@ -1497,21 +1503,12 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const Process
                                 }
                             }
                             if (name_match) {
-                                new_conts[ci] = ast_mod.Continuation{
-                                    .branch = cont.branch,
-                                    .kind = cont.kind, // preserve `!`/`|` — the router re-runs after this and is kind-aware
-                                    .binding = cont.binding,
-                                    .binding_annotations = cont.binding_annotations,
-                                    .binding_type = cont.binding_type,
-                                    .is_catchall = cont.is_catchall,
-                                    .catchall_metatype = cont.catchall_metatype,
-                                    .condition = cont.condition,
-                                    .condition_expr = cont.condition_expr,
-                                    .node = ast_mod.Node{ .inline_code = nested_code },
-                                    .indent = cont.indent,
-                                    .continuations = cont.continuations,
-                                    .location = cont.location,
-                                };
+                                // Copy-then-mutate: preserve every continuation field
+                                // (incl. kind — the router re-runs after this and is
+                                // kind-aware), swap only the node for the inline code.
+                                var new_cont = cont;
+                                new_cont.node = ast_mod.Node{ .inline_code = nested_code };
+                                new_conts[ci] = new_cont;
                                 replaced = true;
                                 continue;
                             }
@@ -1523,22 +1520,12 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const Process
         }
 
         if (replaced) {
-            const modified_flow = ast_mod.Flow{
-                .invocation = flow.invocation, // Keep original — no @pass_ran!
-                .continuations = new_conts,
-                .annotations = flow.annotations,
-                .pre_label = flow.pre_label,
-                .post_label = flow.post_label,
-                .super_shape = flow.super_shape,
-                .inline_body = flow.inline_body,
-                .preamble_code = flow.preamble_code,
-                .is_pure = flow.is_pure,
-                .is_transitively_pure = flow.is_transitively_pure,
-                .impl_of = flow.impl_of,
-                .is_impl = flow.is_impl,
-                .module = flow.module,
-                .location = flow.location,
-            };
+            // Keep the original invocation (no @pass_ran!) — only swap the
+            // branch continuations under it.
+            var modified_flow = flow.*;
+            var new_body = flow.body;
+            new_body.continuations = new_conts;
+            modified_flow.body = new_body;
 
             const new_item = ast_mod.Item{ .flow = modified_flow };
             const maybe_new_program = ast_functional.replaceFlowRecursive(allocator, program, flow, new_item) catch unreachable;
@@ -1546,7 +1533,7 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const Process
                 const result = allocator.create(ast_mod.Program) catch unreachable;
                 result.* = new_program_val;
                 std.debug.print("[STATIC_ROUTER TRANSFORM] Replaced nested continuation (preserving parent flow for '{s}')\n", .{flow_inv_name});
-                return result;
+                return .{ .whole_program = result };
             }
         }
         // Fall through to top-level behavior if replacement didn't work
@@ -1555,36 +1542,23 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const Process
 
     // Top-level case: replace the entire flow (standalone handler)
     // Mark as transformed
-    const new_inv_annotations = allocator.alloc([]const u8, flow.invocation.annotations.len + 1) catch unreachable;
-    for (flow.invocation.annotations, 0..) |ann, j| {
+    const new_inv_annotations = allocator.alloc([]const u8, flow.inv().annotations.len + 1) catch unreachable;
+    for (flow.inv().annotations, 0..) |ann, j| {
         new_inv_annotations[j] = ann;
     }
-    new_inv_annotations[flow.invocation.annotations.len] = allocator.dupe(u8, "@pass_ran(\"transform\")") catch unreachable;
+    new_inv_annotations[flow.inv().annotations.len] = allocator.dupe(u8, "@pass_ran(\"transform\")") catch unreachable;
 
     const new_invocation = ast_mod.Invocation{
-        .path = flow.invocation.path,
-        .args = flow.invocation.args,
+        .path = flow.inv().path,
+        .args = flow.inv().args,
         .annotations = new_inv_annotations,
     };
 
     const empty_conts = allocator.alloc(ast_mod.Continuation, 0) catch unreachable;
 
-    const transformed_flow = ast_mod.Flow{
-        .invocation = new_invocation,
-        .continuations = empty_conts,
-        .annotations = flow.annotations,
-        .pre_label = flow.pre_label,
-        .post_label = flow.post_label,
-        .super_shape = flow.super_shape,
-        .inline_body = inline_body_str,
-        .preamble_code = flow.preamble_code,
-        .is_pure = flow.is_pure,
-        .is_transitively_pure = flow.is_transitively_pure,
-        .impl_of = flow.impl_of,
-        .is_impl = flow.is_impl,
-        .module = flow.module,
-        .location = flow.location,
-    };
+    var transformed_flow = flow.*;
+    transformed_flow.body = ast_mod.rootSite(new_invocation, empty_conts, flow.location);
+    transformed_flow.inline_body = inline_body_str;
 
     const new_item = ast_mod.Item{ .flow = transformed_flow };
 
@@ -1592,9 +1566,9 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const Process
     if (maybe_new_program) |new_program_val| {
         const result = allocator.create(ast_mod.Program) catch unreachable;
         result.* = new_program_val;
-        return result;
+        return .{ .whole_program = result };
     } else {
         std.debug.print("ERROR: Static router transform failed - flow not found in program\n", .{});
-        return program;
+        return .{};
     }
 }

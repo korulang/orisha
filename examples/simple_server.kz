@@ -6,13 +6,15 @@
 ~import std/build
 ~import koru/docker
 
-// Implement the handler
-~orisha:handler = response { status: 200, body: "Hello from Koru!", content_type: "text/plain" }
+// Implement the handler — bare-return produce (`-> { record }`), the same
+// spelling as the lib's own default impl. The old `= response { ... }` form
+// named a branch the handler no longer declares (it moved to `-> record`).
+~orisha:handler -> { status: 200, body: "Hello from Koru!", content_type: "text/plain" }
 
 // Start the server
 ~orisha:serve(port: 3001)
-| shutdown s |> std/io:print.ln(s.reason)
-| failed f |> std/io:print.ln(f.msg)
+| shutdown s |> std/io:print.ln(s)
+| failed f |> std/io:print.ln(f)
 
 // Cross-compilation: koruc simple_server.kz --build=linux
 ~[build(linux)]std/build:config {

@@ -18,11 +18,10 @@
 ~import std/io
 
 // One compiled event the interpreter is allowed to call, budgeted.
-~pub event greet { name: []const u8 }
-| greeted []const u8
+~pub tor greet { name: string } -> string
 
 ~greet = std/fmt:ln("Hello, {{name:s}}!")
-| line l |> greeted l.text
+| line l -> l.text
 
 ~std/runtime:register(scope: "api") {
     greet(5)

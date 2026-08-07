@@ -26,16 +26,14 @@
 // COMPILED EVENTS — native Zig speed, called by the interpreter
 // ============================================================================
 
-~pub event greet { name: []const u8 }
-| greeted []const u8
+~pub tor greet { name: string } -> string
 
 ~greet = std/fmt:ln("Hello, {{name:s}}!")
-| line l |> greeted l.text
+| line l -> l.text
 
-~pub event add { a: i64, b: i64 }
-| sum i64
+~pub tor add { a: i64, b: i64 } -> i64
 
-~add = sum a + b
+~add -> { a + b }
 
 // ============================================================================
 // INTERPRETER SCOPE — sandbox: only greet + add, budgeted
