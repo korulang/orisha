@@ -13,7 +13,7 @@
 // Test:
 //   curl http://localhost:3000/                              → static landing page
 //   curl http://localhost:3000/api/health                    → {"status":"ok"}
-//   curl -X POST http://localhost:3000/api/eval -d '~greet(name: "Koru")'
+//   curl -X POST http://localhost:3000/api/eval -d 'greet(name: "Koru")'
 //                                                            → {"result":...}
 //   curl http://localhost:3000/any/path                      → SPA fallback
 

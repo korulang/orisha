@@ -24,13 +24,13 @@
     <h1>Koru Playground</h1>
     <p class="subtitle">Static + Dynamic + Interpreted &mdash; one handler, one binary.</p>
 
-    <textarea id="source" spellcheck="false">~greet(name: "World")</textarea>
+    <textarea id="source" spellcheck="false">greet(name: "World")</textarea>
     <div class="examples">
         Try:
-        <button onclick="setSource('~greet(name: &quot;World&quot;)')">greet</button>
-        <button onclick="setSource('~add(a: 40, b: 2)')">add</button>
-        <button onclick="setSource('~add(a: 1, b: 2)\n| sum s |> add(a: s, b: 100)')">chained</button>
-        <button onclick="setSource('~delete_everything()')">denied</button>
+        <button onclick="setSource('greet(name: &quot;World&quot;)')">greet</button>
+        <button onclick="setSource('add(a: 40, b: 2)')">add</button>
+        <button onclick="setSource('add(a: 1, b: 2)\n| sum s |> add(a: s, b: 100)')">chained</button>
+        <button onclick="setSource('delete_everything()')">denied</button>
     </div>
     <button onclick="runEval()">Evaluate</button>
     <div id="output">Press Evaluate to run Koru source on the server.</div>
