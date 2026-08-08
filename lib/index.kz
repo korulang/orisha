@@ -240,7 +240,7 @@ pub const ConnHandle = struct {
 pub const ContentType = []const u8;
 
 // @retain: handler_event is referenced from serve proc's raw Zig code
-// via @This().handler_event.handler(...) — invisible to the dead-stripper.
+// via $mod.handler_event.handler(...) — invisible to the dead-stripper.
 ~[abstract|retain]pub tor handler { req: *Request } -> { status: u16, body: string, content_type: ?ContentType }
 
 // Default implementation - 404 for everything
@@ -326,7 +326,7 @@ var header_buf: [512]u8 = undefined;
         .allocator = std.heap.page_allocator,
     };
 
-    const res = @This().handler_event.handler(.{ .req = &req });
+    const res = $mod.handler_event.handler(.{ .req = &req });
 
     // A handler that already rendered a whole response (a static route) hands
     // it back verbatim; it goes out as the head with no separate body.
