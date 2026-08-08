@@ -1,0 +1,9 @@
+{
+    "name": "orisha-unikernel",
+    "version": "0.1.0",
+    "paths": {
+        "std": "../../../koru/koru_std",
+        "orisha": "../../lib",
+        "koru": "../../../koru-libs"
+    }
+}

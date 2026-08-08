@@ -25,14 +25,53 @@ const c = std.c;
 
 // One request, read and waiting for its answer. `raw` borrows the pump's read
 // buffer and is valid for the duration of the `arrived` arm only.
+//
+// `fd` is `c_int`, not `posix.fd_t`. Exchange is reachable from every pump
+// including the unikernel one, and on `x86_64-freestanding` `std.posix` has no
+// syscall layer to name a descriptor type with. `c_int` is what `accept`
+// returns on every target we build, and it is what `posix.fd_t` already is on
+// Linux and macOS, so the hosted pumps are unaffected.
 pub const Exchange = struct {
-    fd: posix.fd_t,
+    fd: c_int,
     raw: []const u8,
     keep_alive: bool = true,
 };
 
 const READ_BUFFER = 4096;
 const MAX_EVENTS = 64;
+
+// ---------------------------------------------------------------------------
+// The unikernel's sockets, as plain C.
+// ---------------------------------------------------------------------------
+// Unikraft's posix-socket + lwip put these in the image as ordinary symbols in
+// the same address space — the same way std/io reaches nolibc's fputs. They are
+// declared here rather than reached through `std.net` because STD.NET CANNOT
+// EXIST on this target: `std.posix` has no `sockaddr` there, and it is a hard
+// compile error rather than a missing feature. That is the whole reason this
+// file is split by platform. Measured in koru/examples/unikraft-net.
+extern fn socket(domain: c_int, stype: c_int, protocol: c_int) c_int;
+extern fn bind(fd: c_int, addr: *const anyopaque, len: u32) c_int;
+extern fn listen(fd: c_int, backlog: c_int) c_int;
+extern fn accept(fd: c_int, addr: ?*anyopaque, len: ?*u32) c_int;
+extern fn recv(fd: c_int, buf: [*]u8, len: usize, flags: c_int) isize;
+extern fn send(fd: c_int, buf: [*]const u8, len: usize, flags: c_int) isize;
+extern fn close(fd: c_int) c_int;
+
+// Unikraft's nolibc imports musl's `netinet/in.h`, where there is NO `sin_len`
+// byte: the family is a u16 at offset 0. Writing the BSD layout instead puts
+// 0x0210 where the family belongs, and then `socket` and `listen` both succeed
+// while `bind` fails — so the error points at the wrong call.
+const SockaddrIn = extern struct {
+    family: u16 = 2,
+    port: u16,
+    addr: u32,
+    zero: [8]u8 = [_]u8{0} ** 8,
+};
+
+// The unikernel pump reads into a module-level buffer rather than a stack frame:
+// same reasoning as `answer`'s header buffer in index.kz, and sound for the same
+// reason — one exchange is in flight at a time.
+var uk_read_buf: [READ_BUFFER]u8 = undefined;
 
 // ============================================================================
 // RUN — the loop. One variant per platform.
@@ -242,6 +281,44 @@ fn writeAll(fd: posix.fd_t, data: []const u8) bool {
     return .{ .stopped = "Server stopped" };
 }
 
+// ---------------------------------------------------------------------------
+// unikraft — a unikernel. Selected by `--build=unikraft`.
+// ---------------------------------------------------------------------------
+// No kqueue, no epoll, and nothing to multiplex onto: one vCPU, one loop, one
+// exchange in flight. A readiness mechanism would buy nothing here, which is
+// why this variant is SHORTER than the two above rather than a port of them.
+//
+// Blocking accept is deliberate. lwip runs its own stack thread, so blocking in
+// the application does not stall the network.
+
+~proc run|unikraft {
+    const fd = $mod.socket(2, 1, 0);
+    if (fd < 0) return .{ .failed = "socket" };
+
+    var addr = $mod.SockaddrIn{ .port = @byteSwap(port), .addr = 0 };
+    if ($mod.bind(fd, &addr, @sizeOf($mod.SockaddrIn)) < 0) return .{ .failed = "bind" };
+    if ($mod.listen(fd, 512) < 0) return .{ .failed = "listen" };
+
+    while (true) {
+        const conn = $mod.accept(fd, null, null);
+        if (conn < 0) continue;
+
+        // Keep-alive: serve requests off the same connection until the peer
+        // stops sending or an arm sets keep_alive false through `hang-up`.
+        while (true) {
+            const n = $mod.recv(conn, &$mod.uk_read_buf, $mod.uk_read_buf.len, 0);
+            if (n <= 0) break;
+            var x = $mod.Exchange{ .fd = conn, .raw = $mod.uk_read_buf[0..@intCast(n)] };
+            arrived(&x);
+            if (!x.keep_alive) break;
+        }
+
+        _ = $mod.close(conn);
+    }
+
+    return .{ .stopped = "Server stopped" };
+}
+
 // ============================================================================
 // REPLY / HANG-UP — how the flow answers an exchange
 // ============================================================================
@@ -262,6 +339,33 @@ fn writeAll(fd: posix.fd_t, data: []const u8) bool {
         x.keep_alive = false;
         return .{ .broken = "write failed" };
     }
+    return .sent;
+}
+
+// The unikernel's writer. `writeAll` above is built on `posix.write`, which has
+// no implementation on a freestanding target; `send` is the same loop over the
+// socket symbol the pump already uses.
+~proc reply|unikraft {
+    var offset: usize = 0;
+    while (offset < head.len) {
+        const n = $mod.send(x.fd, head.ptr + offset, head.len - offset, 0);
+        if (n <= 0) {
+            x.keep_alive = false;
+            return .{ .broken = "write failed" };
+        }
+        offset += @intCast(n);
+    }
+
+    offset = 0;
+    while (offset < body.len) {
+        const n = $mod.send(x.fd, body.ptr + offset, body.len - offset, 0);
+        if (n <= 0) {
+            x.keep_alive = false;
+            return .{ .broken = "write failed" };
+        }
+        offset += @intCast(n);
+    }
+
     return .sent;
 }
 

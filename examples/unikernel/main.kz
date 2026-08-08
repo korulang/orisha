@@ -1,0 +1,31 @@
+// Orisha in a unikernel — the whole server, no operating system.
+//
+// Nothing here is unikernel-specific. The handler and `serve` are the same two
+// lines a hosted Orisha program writes; what changes is one build flag, which
+// selects a different `~proc run|…` inside orisha/pump and nothing else. That
+// is the entire point of the pump seam.
+//
+//   koruc main.kz --build=unikraft        -> output_emitted.zig
+//   zig build-lib wrapper.zig -target x86_64-freestanding \
+//       -O ReleaseSmall -fno-stack-protector -femit-bin=libkoruapp.a
+//   UK_CFLAGS="-std=gnu17" kraft build --arch x86_64 --plat qemu --no-prompt
+//
+// See BUILD.md for the QEMU line and the measurements.
+
+~import orisha
+
+// The handler is implemented with a proc rather than the `response { … }`
+// constructor the library's doc comment shows: that spelling resolves to an
+// event invocation and garbles the record (see BUILD.md, known-not-done).
+~proc orisha:handler|zig {
+    _ = &req;
+    return .{
+        .status = 200,
+        .body = "Hello from Orisha, inside a unikernel.\n",
+        .content_type = "text/plain",
+    };
+}
+
+~orisha:serve(port: 8080)
+| shutdown _ |> _
+| failed _ |> _

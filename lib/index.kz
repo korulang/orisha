@@ -25,7 +25,7 @@
 ~import std/compiler
 ~import std/io
 ~import std/build
-// ~import orisha/pump
+~import orisha/pump
 
 ~std/compiler:requires {
     exe.linkSystemLibrary("z");
@@ -395,6 +395,18 @@ fn headerPrefixKeepAlive(status: u16) ?[]const u8 {
 
 ~[build(linux)]std/build:variants {
     "orisha/pump:run": "epoll"
+}
+| configured _ |> _
+| skipped _ |> _
+| invalid-event _ |> _
+
+// A unikernel selects BOTH: the loop, and the writer. `reply`'s default body
+// goes through `posix.write`, which has no implementation on a freestanding
+// target, and it is reached from the `arrived` arm on every request — so it is
+// not one of the bodies the target can simply leave unanalyzed.
+~[build(unikraft)]std/build:variants {
+    "orisha/pump:run": "unikraft",
+    "orisha/pump:reply": "unikraft"
 }
 | configured _ |> _
 | skipped _ |> _
