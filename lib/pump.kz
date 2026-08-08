@@ -1,0 +1,277 @@
+// Orisha — the pump.
+//
+// A pump owns the accept-and-readiness loop for exactly one platform. It reads
+// a request off the wire and fires `arrived` once per request; everything a
+// pump does NOT do — parsing, routing, response shaping — belongs to the Koru
+// flow that consumes the stream, and is written once for every platform.
+//
+// The point of the split: a new platform is a `~proc run|<name>` body, not a
+// copy of the server. Selection is a build-time variant, so the unselected
+// pumps are not merely unused — they are not emitted at all.
+//
+//   ~[build(linux)]std/build:variants { "orisha/pump:run": "epoll" }
+//
+// The `unikraft` variant is the reason this file exists: a unikernel has no
+// second thread to spawn and no kqueue, so it needs its own loop — and now
+// that loop is the only thing it needs.
+//
+// Note the `$mod.` qualification through both loop bodies: a proc body that
+// carries effect branches splices into its CALLER, where this module's scope
+// does not exist. The compiler refuses the bare names and says so.
+
+const std = @import("std");
+const posix = std.posix;
+const c = std.c;
+
+// One request, read and waiting for its answer. `raw` borrows the pump's read
+// buffer and is valid for the duration of the `arrived` arm only.
+pub const Exchange = struct {
+    fd: posix.fd_t,
+    raw: []const u8,
+    keep_alive: bool = true,
+};
+
+const READ_BUFFER = 4096;
+const MAX_EVENTS = 64;
+
+// ============================================================================
+// RUN — the loop. One variant per platform.
+// ============================================================================
+
+~pub tor run { port: u16 }
+! arrived *Exchange
+| stopped string
+| failed string
+
+// ---------------------------------------------------------------------------
+// Shared helpers — identical on every POSIX platform, written once.
+// ---------------------------------------------------------------------------
+
+const O_NONBLOCK: u32 = 0x0004;
+
+fn openListener(port: u16) ?std.net.Server {
+    const address = std.net.Address.parseIp("0.0.0.0", port) catch return null;
+    return address.listen(.{
+        .reuse_address = true,
+        .kernel_backlog = 512,
+    }) catch null;
+}
+
+fn markNonBlocking(fd: posix.fd_t) void {
+    const flags = posix.fcntl(fd, posix.F.GETFL, 0) catch 0;
+    _ = posix.fcntl(fd, posix.F.SETFL, flags | O_NONBLOCK) catch {};
+}
+
+fn disableNagle(fd: posix.fd_t) void {
+    const enable: i32 = 1;
+    posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, std.mem.asBytes(&enable)) catch {};
+}
+
+fn writeAll(fd: posix.fd_t, data: []const u8) bool {
+    var offset: usize = 0;
+    while (offset < data.len) {
+        const n = posix.write(fd, data[offset..]) catch return false;
+        if (n == 0) return false;
+        offset += @intCast(n);
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// kqueue — macOS and the BSDs. The default variant.
+// ---------------------------------------------------------------------------
+
+~proc run|zig {
+    var server = $mod.openListener(port) orelse return .{ .failed = "Failed to listen" };
+    const listen_fd = server.stream.handle;
+    $mod.markNonBlocking(listen_fd);
+
+    const kq = $mod.posix.kqueue() catch return .{ .failed = "Failed to create kqueue" };
+
+    var changes: [1]$mod.c.Kevent = undefined;
+    var no_changes: [0]$mod.c.Kevent = undefined;
+    var events: [$mod.MAX_EVENTS]$mod.c.Kevent = undefined;
+    var buffer: [$mod.READ_BUFFER]u8 = undefined;
+
+    // Arm the listener itself, so accept and read wait in one place.
+    changes[0] = .{
+        .ident = @intCast(listen_fd),
+        .filter = $mod.c.EVFILT.READ,
+        .flags = $mod.c.EV.ADD,
+        .fflags = 0,
+        .data = 0,
+        .udata = undefined,
+    };
+    _ = $mod.c.kevent(kq, &changes, 1, &no_changes, 0, null);
+
+    std.debug.print("Orisha listening on http://0.0.0.0:{}\n", .{port});
+    std.debug.print("Pump: kqueue, keep-alive, TCP_NODELAY\n", .{});
+
+    while (true) {
+        const n = $mod.c.kevent(kq, &no_changes, 0, &events, $mod.MAX_EVENTS, null);
+        if (n <= 0) continue;
+
+        for (events[0..@intCast(n)]) |event| {
+            const fd: $mod.posix.fd_t = @intCast(event.ident);
+
+            if (fd == listen_fd) {
+                // One readiness notification can cover several pending
+                // connections; drain until the backlog is empty.
+                while (true) {
+                    const conn = server.accept() catch break;
+                    const client_fd = conn.stream.handle;
+                    $mod.disableNagle(client_fd);
+                    $mod.markNonBlocking(client_fd);
+
+                    changes[0] = .{
+                        .ident = @intCast(client_fd),
+                        .filter = $mod.c.EVFILT.READ,
+                        .flags = $mod.c.EV.ADD | $mod.c.EV.ONESHOT,
+                        .fflags = 0,
+                        .data = 0,
+                        .udata = undefined,
+                    };
+                    _ = $mod.c.kevent(kq, &changes, 1, &no_changes, 0, null);
+                }
+                continue;
+            }
+
+            const bytes_read = $mod.posix.read(fd, &buffer) catch 0;
+            if (bytes_read == 0) {
+                $mod.posix.close(fd);
+                continue;
+            }
+
+            var exchange = $mod.Exchange{ .fd = fd, .raw = buffer[0..bytes_read] };
+            arrived(&exchange);
+
+            if (!exchange.keep_alive) {
+                $mod.posix.close(fd);
+                continue;
+            }
+
+            // ONESHOT disarms on delivery — re-arm for the next request.
+            changes[0] = .{
+                .ident = @intCast(fd),
+                .filter = $mod.c.EVFILT.READ,
+                .flags = $mod.c.EV.ADD | $mod.c.EV.ONESHOT,
+                .fflags = 0,
+                .data = 0,
+                .udata = undefined,
+            };
+            _ = $mod.c.kevent(kq, &changes, 1, &no_changes, 0, null);
+        }
+    }
+
+    return .{ .stopped = "Server stopped" };
+}
+
+// ---------------------------------------------------------------------------
+// epoll — Linux. Selected by `--build=linux`.
+// ---------------------------------------------------------------------------
+
+~proc run|epoll {
+    const linux = std.os.linux;
+
+    var server = $mod.openListener(port) orelse return .{ .failed = "Failed to listen" };
+    const listen_fd = server.stream.handle;
+    $mod.markNonBlocking(listen_fd);
+
+    const epfd_rc = linux.epoll_create1(0);
+    const epfd: i32 = @bitCast(@as(u32, @truncate(epfd_rc)));
+    if (epfd < 0) return .{ .failed = "Failed to create epoll" };
+
+    var listen_event = linux.epoll_event{
+        .events = linux.EPOLL.IN,
+        .data = .{ .fd = listen_fd },
+    };
+    _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_ADD, listen_fd, &listen_event);
+
+    var events: [$mod.MAX_EVENTS]linux.epoll_event = undefined;
+    var buffer: [$mod.READ_BUFFER]u8 = undefined;
+
+    std.debug.print("Orisha listening on http://0.0.0.0:{}\n", .{port});
+    std.debug.print("Pump: epoll, keep-alive, TCP_NODELAY\n", .{});
+
+    while (true) {
+        const n_rc = linux.epoll_wait(epfd, &events, $mod.MAX_EVENTS, -1);
+        const n: i32 = @bitCast(@as(u32, @truncate(n_rc)));
+        if (n <= 0) continue;
+
+        for (events[0..@intCast(n)]) |event| {
+            const fd: $mod.posix.fd_t = event.data.fd;
+
+            if (fd == listen_fd) {
+                while (true) {
+                    const conn = server.accept() catch break;
+                    const client_fd = conn.stream.handle;
+                    $mod.disableNagle(client_fd);
+                    $mod.markNonBlocking(client_fd);
+
+                    var client_event = linux.epoll_event{
+                        .events = linux.EPOLL.IN | linux.EPOLL.ONESHOT,
+                        .data = .{ .fd = client_fd },
+                    };
+                    _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_ADD, client_fd, &client_event);
+                }
+                continue;
+            }
+
+            const bytes_read = $mod.posix.read(fd, &buffer) catch 0;
+            if (bytes_read == 0) {
+                $mod.posix.close(fd);
+                continue;
+            }
+
+            var exchange = $mod.Exchange{ .fd = fd, .raw = buffer[0..bytes_read] };
+            arrived(&exchange);
+
+            if (!exchange.keep_alive) {
+                $mod.posix.close(fd);
+                continue;
+            }
+
+            var rearm = linux.epoll_event{
+                .events = linux.EPOLL.IN | linux.EPOLL.ONESHOT,
+                .data = .{ .fd = fd },
+            };
+            _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &rearm);
+        }
+    }
+
+    return .{ .stopped = "Server stopped" };
+}
+
+// ============================================================================
+// REPLY / HANG-UP — how the flow answers an exchange
+// ============================================================================
+
+// Write an answer back. `head` and `body` go out in that order; a caller that
+// already holds a whole rendered response passes it as `head` with an empty
+// `body`, which is what a pre-rendered static route does.
+~pub tor reply { x: *Exchange, head: string, body: string }
+| sent
+| broken string
+
+~proc reply|zig {
+    if (!writeAll(x.fd, head)) {
+        x.keep_alive = false;
+        return .{ .broken = "write failed" };
+    }
+    if (body.len > 0 and !writeAll(x.fd, body)) {
+        x.keep_alive = false;
+        return .{ .broken = "write failed" };
+    }
+    return .sent;
+}
+
+// Refuse to keep the connection. The pump closes it when the arm returns.
+~pub tor hang-up { x: *Exchange }
+
+~proc hang-up|zig {
+    x.keep_alive = false;
+}
+
+// The raw request bytes, for the parsing layer.
+~pub tor raw { x: *Exchange } -> string
+~raw -> x.raw

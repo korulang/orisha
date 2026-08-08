@@ -25,6 +25,7 @@
 ~import std/compiler
 ~import std/io
 ~import std/build
+// ~import orisha/pump
 
 ~std/compiler:requires {
     exe.linkSystemLibrary("z");
@@ -246,33 +247,109 @@ pub const ContentType = []const u8;
 ~handler -> { status: 404, body: "Not Found", content_type: null }
 
 // ============================================================================
-// SERVE - Main server flow (calls handler for each request)
+// SERVE — a Koru flow over a platform pump
 // ============================================================================
+// `serve` used to be two ~200-line Zig bodies, one per readiness mechanism,
+// that differed in about twenty lines and duplicated everything else. The loop
+// now lives in orisha/pump, one variant per platform; what remains here is the
+// part that is the same everywhere, and it is a flow.
+//
+// Adding a platform is a `~proc run|<name>` in orisha/pump plus a line in the
+// variants block. Nothing in this file changes.
 
 ~pub tor serve { port: u16 }
 | shutdown string
 | failed string
 
-// Brutal async server loop (kqueue + keep-alive) with direct handler dispatch.
-// Keeps the DX: users implement ~orisha:handler.
-const MAX_EVENTS = 64;
-const MAX_CONNECTIONS = 1024;
-const NUM_WORKERS = 4;
-const CONNS_PER_WORKER = MAX_CONNECTIONS / NUM_WORKERS;
+~serve =
+    orisha/pump:run(port)
+    ! arrived x |> orisha/pump:raw(x): raw |> orisha:answer(raw): a |> orisha/pump:reply(x, a.head, a.body)
+        | sent |> _
+        | broken _ |> _
+    | stopped s -> shutdown s
+    | failed e -> failed e
 
-const Kevent = c.Kevent;
+// ============================================================================
+// ANSWER — parse one request, run the handler, shape the response
+// ============================================================================
+// Platform-free by construction: it takes bytes and returns bytes, and never
+// names a file descriptor. Every pump shares it.
 
-const AsyncConn = struct {
-    fd: posix.fd_t,
-    state: enum { reading, writing },
-};
+~pub tor answer { raw: string } -> { head: string, body: string }
 
-const WorkerContext = struct {
-    id: usize,
-    kq: posix.fd_t,
-    connections: [CONNS_PER_WORKER]?AsyncConn,
-    running: *std.atomic.Value(bool),
-};
+// The header is built into a module-level buffer rather than a stack frame,
+// because a slice of a dead frame is the bug this file has shipped before. It
+// is sound because a pump delivers one exchange at a time — see orisha/pump.
+var header_buf: [512]u8 = undefined;
+
+~proc answer|zig {
+    var method: []const u8 = "GET";
+    var path: []const u8 = "/";
+
+    var i: usize = 0;
+    while (i < raw.len and raw[i] != ' ') : (i += 1) {}
+    if (i < raw.len) {
+        method = raw[0..i];
+        i += 1;
+        var j: usize = i;
+        while (j < raw.len and raw[j] != ' ') : (j += 1) {}
+        if (j > i) {
+            path = raw[i..j];
+        }
+    }
+
+    var client_etag: ?[]const u8 = null;
+    if (std.mem.indexOf(u8, raw, "If-None-Match: ")) |etag_start| {
+        const etag_val_start = etag_start + 15;
+        if (std.mem.indexOf(u8, raw[etag_val_start..], "\r\n")) |etag_end| {
+            var etag_raw = raw[etag_val_start .. etag_val_start + etag_end];
+            if (etag_raw.len >= 2 and etag_raw[0] == '"' and etag_raw[etag_raw.len - 1] == '"') {
+                etag_raw = etag_raw[1 .. etag_raw.len - 1];
+            }
+            client_etag = etag_raw;
+        }
+    }
+
+    var body: ?[]const u8 = null;
+    if (std.mem.indexOf(u8, raw, "\r\n\r\n")) |header_end| {
+        const body_start = header_end + 4;
+        if (body_start < raw.len) {
+            body = raw[body_start..];
+        }
+    }
+
+    var req = Request{
+        .method = method,
+        .path = path,
+        .body = body,
+        .if_none_match = client_etag,
+        .allocator = std.heap.page_allocator,
+    };
+
+    const res = @This().handler_event.handler(.{ .req = &req });
+
+    // A handler that already rendered a whole response (a static route) hands
+    // it back verbatim; it goes out as the head with no separate body.
+    if (std.mem.startsWith(u8, res.body, "HTTP/1.")) {
+        return .{ .head = res.body, .body = "" };
+    }
+
+    const res_ct = if (res.content_type) |ct_str| ct_str else "text/plain";
+    var date_buf: [29]u8 = undefined;
+    formatHttpDate(&date_buf);
+
+    const head = if (headerPrefixKeepAlive(res.status)) |prefix|
+        std.fmt.bufPrint(&header_buf, "{s}{d}\r\nContent-Type: {s}\r\nDate: {s}\r\nConnection: keep-alive\r\n\r\n", .{ prefix, res.body.len, res_ct, &date_buf }) catch
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    else
+        std.fmt.bufPrint(
+            &header_buf,
+            "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nDate: {s}\r\nConnection: keep-alive\r\n\r\n",
+            .{ res.status, statusText(res.status), res_ct, res.body.len, &date_buf },
+        ) catch "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+    return .{ .head = head, .body = res.body };
+}
 
 fn statusText(status: u16) []const u8 {
     return switch (status) {
@@ -297,20 +374,6 @@ fn formatHttpDate(buf: *[29]u8) void {
     @memcpy(buf, tmp[0..29]);
 }
 
-fn headerPrefixClose(status: u16) ?[]const u8 {
-    return switch (status) {
-        200 => "HTTP/1.1 200 OK\r\nContent-Length: ",
-        201 => "HTTP/1.1 201 Created\r\nContent-Length: ",
-        204 => "HTTP/1.1 204 No Content\r\nContent-Length: ",
-        400 => "HTTP/1.1 400 Bad Request\r\nContent-Length: ",
-        401 => "HTTP/1.1 401 Unauthorized\r\nContent-Length: ",
-        403 => "HTTP/1.1 403 Forbidden\r\nContent-Length: ",
-        404 => "HTTP/1.1 404 Not Found\r\nContent-Length: ",
-        500 => "HTTP/1.1 500 Internal Server Error\r\nContent-Length: ",
-        else => null,
-    };
-}
-
 fn headerPrefixKeepAlive(status: u16) ?[]const u8 {
     return switch (status) {
         200 => "HTTP/1.1 200 OK\r\nContent-Length: ",
@@ -325,424 +388,13 @@ fn headerPrefixKeepAlive(status: u16) ?[]const u8 {
     };
 }
 
-fn writeAll(fd: posix.fd_t, data: []const u8) bool {
-    var offset: usize = 0;
-    while (offset < data.len) {
-        const n = posix.write(fd, data[offset..]) catch return false;
-        if (n == 0) return false;
-        offset += @intCast(n);
-    }
-    return true;
-}
-
-fn workerLoop(ctx: *WorkerContext) void {
-    var events: [MAX_EVENTS]Kevent = undefined;
-    var no_changes: [0]Kevent = undefined;
-
-    while (ctx.running.load(.acquire)) {
-        var timeout = std.posix.timespec{ .sec = 0, .nsec = 100_000_000 };
-        const n = c.kevent(ctx.kq, &no_changes, 0, &events, MAX_EVENTS, &timeout);
-        if (n <= 0) continue;
-
-        for (events[0..@intCast(n)]) |event| {
-            const fd: posix.fd_t = @intCast(event.ident);
-            const slot: usize = @intCast(@mod(fd, CONNS_PER_WORKER));
-            if (ctx.connections[slot]) |*conn| {
-                if (conn.state == .reading) {
-                    var buffer: [4096]u8 = undefined;
-                    const bytes_read = posix.read(fd, &buffer) catch 0;
-                    if (bytes_read == 0) {
-                        posix.close(fd);
-                        ctx.connections[slot] = null;
-                        continue;
-                    }
-
-                    const request = buffer[0..bytes_read];
-                    var method: []const u8 = "GET";
-                    var path: []const u8 = "/";
-
-                    var i: usize = 0;
-                    while (i < request.len and request[i] != ' ') : (i += 1) {}
-                    if (i < request.len) {
-                        method = request[0..i];
-                        i += 1;
-                        var j: usize = i;
-                        while (j < request.len and request[j] != ' ') : (j += 1) {}
-                        if (j > i) {
-                            path = request[i..j];
-                        }
-                    }
-
-                    // Extract ETag from If-None-Match header
-                    var client_etag: ?[]const u8 = null;
-                    if (std.mem.indexOf(u8, request, "If-None-Match: ")) |etag_start| {
-                        const etag_val_start = etag_start + 15;
-                        if (std.mem.indexOf(u8, request[etag_val_start..], "\r\n")) |etag_end| {
-                            var etag_raw = request[etag_val_start..etag_val_start + etag_end];
-                            if (etag_raw.len >= 2 and etag_raw[0] == '"' and etag_raw[etag_raw.len - 1] == '"') {
-                                etag_raw = etag_raw[1..etag_raw.len - 1];
-                            }
-                            client_etag = etag_raw;
-                        }
-                    }
-
-                    conn.state = .writing;
-
-                    // Parse body
-                    var body: ?[]const u8 = null;
-                    if (std.mem.indexOf(u8, request, "\r\n\r\n")) |header_end| {
-                        const body_start = header_end + 4;
-                        if (body_start < request.len) {
-                            body = request[body_start..];
-                        }
-                    }
-
-                    var req = Request{
-                        .method = method,
-                        .path = path,
-                        .body = body,
-                        .if_none_match = client_etag,
-                        .allocator = std.heap.page_allocator,
-                    };
-
-                    const res = @This().handler_event.handler(.{ .req = &req });
-
-                    // Pre-built HTTP response (starts with "HTTP/1.") — write directly
-                    if (std.mem.startsWith(u8, res.body, "HTTP/1.")) {
-                        if (!writeAll(fd, res.body)) {
-                            posix.close(fd);
-                            ctx.connections[slot] = null;
-                            continue;
-                        }
-                    } else {
-                        const res_ct = if (res.content_type) |ct_str| ct_str else "text/plain";
-                        var date_buf: [29]u8 = undefined;
-                        formatHttpDate(&date_buf);
-                        var header_buf: [512]u8 = undefined;
-                        const header = if (headerPrefixKeepAlive(res.status)) |prefix|
-                            std.fmt.bufPrint(&header_buf, "{s}{d}\r\nContent-Type: {s}\r\nDate: {s}\r\nConnection: keep-alive\r\n\r\n", .{ prefix, res.body.len, res_ct, &date_buf }) catch
-                                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        else
-                            std.fmt.bufPrint(
-                                &header_buf,
-                                "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nDate: {s}\r\nConnection: keep-alive\r\n\r\n",
-                                .{ res.status, statusText(res.status), res_ct, res.body.len, &date_buf },
-                            ) catch "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-
-                        if (!writeAll(fd, header) or !writeAll(fd, res.body)) {
-                            posix.close(fd);
-                            ctx.connections[slot] = null;
-                            continue;
-                        }
-                    }
-
-                    conn.state = .reading;
-                    var keep_alive_event: [1]Kevent = .{.{
-                        .ident = @intCast(fd),
-                        .filter = c.EVFILT.READ,
-                        .flags = c.EV.ADD | c.EV.ONESHOT,
-                        .fflags = 0,
-                        .data = 0,
-                        .udata = undefined,
-                    }};
-                    var keep_alive_empty: [0]Kevent = undefined;
-                    _ = c.kevent(ctx.kq, &keep_alive_event, 1, &keep_alive_empty, 0, null);
-                }
-            }
-        }
-    }
-}
-
-~proc serve|zig {
-    const address = std.net.Address.parseIp("0.0.0.0", port) catch {
-        return .{ .failed = "Invalid address" };
-    };
-
-    var server = address.listen(.{
-        .reuse_address = true,
-        .kernel_backlog = 512,
-    }) catch {
-        return .{ .failed = "Failed to listen" };
-    };
-
-    const O_NONBLOCK: u32 = 0x0004;
-    const listen_fd = server.stream.handle;
-    const flags = posix.fcntl(listen_fd, posix.F.GETFL, 0) catch 0;
-    _ = posix.fcntl(listen_fd, posix.F.SETFL, flags | O_NONBLOCK) catch {};
-
-    var running = std.atomic.Value(bool).init(true);
-    var workers: [NUM_WORKERS]WorkerContext = undefined;
-    var worker_threads: [NUM_WORKERS]std.Thread = undefined;
-
-    for (0..NUM_WORKERS) |i| {
-        const worker_kq = posix.kqueue() catch {
-            return .{ .failed = "Failed to create worker kqueue" };
-        };
-
-        workers[i] = WorkerContext{
-            .id = i,
-            .kq = worker_kq,
-            .connections = .{null} ** CONNS_PER_WORKER,
-            .running = &running,
-        };
-
-        worker_threads[i] = std.Thread.spawn(.{}, workerLoop, .{&workers[i]}) catch {
-            return .{ .failed = "Failed to spawn worker thread" };
-        };
-    }
-
-    var next_worker: usize = 0;
-
-    std.debug.print("Orisha listening on http://0.0.0.0:{}\n", .{port});
-    std.debug.print("Running with {} workers + kqueue + TCP_NODELAY + keep-alive\n", .{NUM_WORKERS});
-
-    while (true) {
-        const conn = server.accept() catch continue;
-        const client_fd = conn.stream.handle;
-
-        const enable: i32 = 1;
-        posix.setsockopt(client_fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, std.mem.asBytes(&enable)) catch {};
-
-        const client_flags = posix.fcntl(client_fd, posix.F.GETFL, 0) catch 0;
-        _ = posix.fcntl(client_fd, posix.F.SETFL, client_flags | O_NONBLOCK) catch continue;
-
-        const worker_id = next_worker;
-        next_worker = (next_worker + 1) % NUM_WORKERS;
-        const worker = &workers[worker_id];
-
-        const slot: usize = @intCast(@mod(client_fd, CONNS_PER_WORKER));
-        worker.connections[slot] = .{ .fd = client_fd, .state = .reading };
-
-        var add_event: [1]Kevent = .{.{
-            .ident = @intCast(client_fd),
-            .filter = c.EVFILT.READ,
-            .flags = c.EV.ADD | c.EV.ONESHOT,
-            .fflags = 0,
-            .data = 0,
-            .udata = undefined,
-        }};
-        var no_events: [0]Kevent = undefined;
-        _ = c.kevent(worker.kq, &add_event, 1, &no_events, 0, null);
-    }
-
-    return .{ .shutdown = "Server stopped" };
-}
-
 // ============================================================================
-// SERVE|EPOLL - Linux epoll variant
+// PLATFORM SELECTION
 // ============================================================================
-// Same architecture: N workers, non-blocking I/O, keep-alive.
-// Uses epoll instead of kqueue for Linux targets.
-// Structs and worker loop at module level (like kqueue) so @This() resolves
-// to the module — giving access to handler_event.
-
-const EpollConn = struct {
-    fd: posix.fd_t,
-    state: enum { reading, writing },
-};
-
-const EpollWorkerCtx = struct {
-    id: usize,
-    epfd: i32,
-    connections: [CONNS_PER_WORKER]?EpollConn,
-    running: *std.atomic.Value(bool),
-};
-
-fn epollWorkerLoop(ctx: *EpollWorkerCtx) void {
-    const linux = std.os.linux;
-    var events: [MAX_EVENTS]linux.epoll_event = undefined;
-
-    while (ctx.running.load(.acquire)) {
-        const rc = linux.epoll_wait(ctx.epfd, &events, MAX_EVENTS, 100);
-        const n: isize = @bitCast(rc);
-        if (n <= 0) continue;
-
-        for (events[0..@intCast(@as(usize, @bitCast(n)))]) |event| {
-            const fd: posix.fd_t = event.data.fd;
-            const slot: usize = @intCast(@mod(fd, CONNS_PER_WORKER));
-            if (ctx.connections[slot]) |*conn| {
-                if (conn.state == .reading) {
-                    var buffer: [4096]u8 = undefined;
-                    const bytes_read = posix.read(fd, &buffer) catch 0;
-                    if (bytes_read == 0) {
-                        posix.close(fd);
-                        ctx.connections[slot] = null;
-                        continue;
-                    }
-
-                    const request = buffer[0..bytes_read];
-                    var method: []const u8 = "GET";
-                    var path: []const u8 = "/";
-
-                    var i: usize = 0;
-                    while (i < request.len and request[i] != ' ') : (i += 1) {}
-                    if (i < request.len) {
-                        method = request[0..i];
-                        i += 1;
-                        var j: usize = i;
-                        while (j < request.len and request[j] != ' ') : (j += 1) {}
-                        if (j > i) {
-                            path = request[i..j];
-                        }
-                    }
-
-                    // Extract ETag from If-None-Match header
-                    var client_etag: ?[]const u8 = null;
-                    if (std.mem.indexOf(u8, request, "If-None-Match: ")) |etag_start| {
-                        const etag_val_start = etag_start + 15;
-                        if (std.mem.indexOf(u8, request[etag_val_start..], "\r\n")) |etag_end| {
-                            var etag_raw = request[etag_val_start..etag_val_start + etag_end];
-                            if (etag_raw.len >= 2 and etag_raw[0] == '"' and etag_raw[etag_raw.len - 1] == '"') {
-                                etag_raw = etag_raw[1..etag_raw.len - 1];
-                            }
-                            client_etag = etag_raw;
-                        }
-                    }
-
-                    conn.state = .writing;
-
-                    // Parse body
-                    var body: ?[]const u8 = null;
-                    if (std.mem.indexOf(u8, request, "\r\n\r\n")) |header_end| {
-                        const body_start = header_end + 4;
-                        if (body_start < request.len) {
-                            body = request[body_start..];
-                        }
-                    }
-
-                    var req = Request{
-                        .method = method,
-                        .path = path,
-                        .body = body,
-                        .if_none_match = client_etag,
-                        .allocator = std.heap.page_allocator,
-                    };
-
-                    const res = @This().handler_event.handler(.{ .req = &req });
-
-                    // Pre-built HTTP response (starts with "HTTP/1.") — write directly
-                    if (std.mem.startsWith(u8, res.body, "HTTP/1.")) {
-                        if (!writeAll(fd, res.body)) {
-                            posix.close(fd);
-                            ctx.connections[slot] = null;
-                            continue;
-                        }
-                    } else {
-                        const res_ct = if (res.content_type) |ct_str| ct_str else "text/plain";
-                        var date_buf: [29]u8 = undefined;
-                        formatHttpDate(&date_buf);
-                        var header_buf: [512]u8 = undefined;
-                        const header = if (headerPrefixKeepAlive(res.status)) |prefix|
-                            std.fmt.bufPrint(&header_buf, "{s}{d}\r\nContent-Type: {s}\r\nDate: {s}\r\nConnection: keep-alive\r\n\r\n", .{ prefix, res.body.len, res_ct, &date_buf }) catch
-                                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        else
-                            std.fmt.bufPrint(
-                                &header_buf,
-                                "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nDate: {s}\r\nConnection: keep-alive\r\n\r\n",
-                                .{ res.status, statusText(res.status), res_ct, res.body.len, &date_buf },
-                            ) catch "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-
-                        if (!writeAll(fd, header) or !writeAll(fd, res.body)) {
-                            posix.close(fd);
-                            ctx.connections[slot] = null;
-                            continue;
-                        }
-                    }
-
-                    conn.state = .reading;
-                    var re_event = linux.epoll_event{
-                        .events = linux.EPOLL.IN | linux.EPOLL.ONESHOT,
-                        .data = .{ .fd = fd },
-                    };
-                    _ = linux.epoll_ctl(ctx.epfd, linux.EPOLL.CTL_MOD, fd, &re_event);
-                }
-            }
-        }
-    }
-}
-
-~proc serve|epoll {
-    const linux = std.os.linux;
-
-    const address = std.net.Address.parseIp("0.0.0.0", port) catch {
-        return .{ .failed = "Invalid address" };
-    };
-
-    var server = address.listen(.{
-        .reuse_address = true,
-        .kernel_backlog = 512,
-    }) catch {
-        return .{ .failed = "Failed to listen" };
-    };
-
-    const O_NONBLOCK: u32 = 0x0800; // Linux O_NONBLOCK
-    const listen_fd = server.stream.handle;
-    const flags = posix.fcntl(listen_fd, posix.F.GETFL, 0) catch 0;
-    _ = posix.fcntl(listen_fd, posix.F.SETFL, flags | O_NONBLOCK) catch {};
-
-    var running = std.atomic.Value(bool).init(true);
-    var workers: [NUM_WORKERS]EpollWorkerCtx = undefined;
-    var worker_threads: [NUM_WORKERS]std.Thread = undefined;
-
-    for (0..NUM_WORKERS) |i| {
-        const epfd_rc = linux.epoll_create1(0);
-        const epfd: i32 = @bitCast(@as(u32, @truncate(epfd_rc)));
-        if (epfd < 0) {
-            return .{ .failed = "Failed to create worker epoll" };
-        }
-
-        workers[i] = EpollWorkerCtx{
-            .id = i,
-            .epfd = epfd,
-            .connections = .{null} ** CONNS_PER_WORKER,
-            .running = &running,
-        };
-
-        worker_threads[i] = std.Thread.spawn(.{}, epollWorkerLoop, .{&workers[i]}) catch {
-            return .{ .failed = "Failed to spawn worker thread" };
-        };
-    }
-
-    var next_worker: usize = 0;
-
-    std.debug.print("Orisha listening on http://0.0.0.0:{}\n", .{port});
-    std.debug.print("Running with {} workers + epoll + TCP_NODELAY + keep-alive\n", .{NUM_WORKERS});
-
-    while (true) {
-        const conn = server.accept() catch continue;
-        const client_fd = conn.stream.handle;
-
-        const enable: i32 = 1;
-        posix.setsockopt(client_fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, std.mem.asBytes(&enable)) catch {};
-
-        const client_flags = posix.fcntl(client_fd, posix.F.GETFL, 0) catch 0;
-        _ = posix.fcntl(client_fd, posix.F.SETFL, client_flags | O_NONBLOCK) catch continue;
-
-        const worker_id = next_worker;
-        next_worker = (next_worker + 1) % NUM_WORKERS;
-        const worker = &workers[worker_id];
-
-        const slot: usize = @intCast(@mod(client_fd, CONNS_PER_WORKER));
-        worker.connections[slot] = .{ .fd = client_fd, .state = .reading };
-
-        var add_event = linux.epoll_event{
-            .events = linux.EPOLL.IN | linux.EPOLL.ONESHOT,
-            .data = .{ .fd = client_fd },
-        };
-        _ = linux.epoll_ctl(worker.epfd, linux.EPOLL.CTL_ADD, client_fd, &add_event);
-    }
-
-    return .{ .shutdown = "Server stopped" };
-}
-
-// ============================================================================
-// VARIANT SELECTION - Platform-specific server implementation
-// ============================================================================
-// Default (no --build flag): uses bare ~proc serve (kqueue/macOS)
-// With --build=linux: selects epoll variant
+// One line per platform. The pump is what changes; serve never does.
 
 ~[build(linux)]std/build:variants {
-    "orisha:serve": "epoll"
+    "orisha/pump:run": "epoll"
 }
 | configured _ |> _
 | skipped _ |> _
