@@ -20,7 +20,20 @@ const ast = @import("ast");
 const Program = ast.Program;
 const posix = std.posix;
 const c = std.c;
-const time_c = @cImport(@cInclude("time.h"));
+// The ONE clock symbol Orisha needs, declared rather than @cImport-ed.
+//
+// `@cImport(@cInclude("time.h"))` needs libc HEADERS at compile time, and a
+// freestanding target has none — it was one of the two things stopping Orisha
+// from linking into a unikernel at all (`error: 'time.h' file not found`). An
+// `extern fn` needs no header: it resolves at link time against whatever libc
+// the image actually has, which on Unikraft is nolibc, in the same address
+// space. Same trick koru/examples/unikraft-net uses for socket/bind/listen.
+//
+// `gmtime_r` and `strftime` are gone with it — see formatHttpDate, which now
+// does the calendar arithmetic itself. Fewer symbols to find on a platform
+// that may not have them, and the HTTP date format is fixed by RFC 9110
+// anyway, so there was never anything for strftime to decide.
+extern fn time(t: ?*i64) i64;
 
 // ============================================================================
 // PUBLIC TYPES
@@ -202,6 +215,36 @@ pub const ContentType = []const u8;
 // is sound because a pump delivers one exchange at a time — see orisha/pump.
 var header_buf: [512]u8 = undefined;
 
+// ============================================================================
+// THE ALLOCATOR SEAM
+// ============================================================================
+// `Request.allocator` used to be `std.heap.page_allocator` outright. That is an
+// OPERATING SYSTEM allocator: it reaches `std.posix` for mmap, and on
+// x86_64-freestanding `std.posix` has no `MAP` and no `MREMAP` to reach for.
+// It was the second of the two things that stopped Orisha linking into a
+// unikernel — and, unlike the libc time header, it is not a missing symbol but
+// a missing MACHINE. There is no kernel to ask for pages.
+//
+// So the allocator becomes a seam, the same way the readiness loop did. A
+// hosted build keeps the page allocator. A freestanding build gets a fixed
+// arena carved out of the image itself, reset at the top of every exchange —
+// which is sound for exactly the reason the header buffer above is sound: a
+// pump delivers one exchange at a time. Nothing above this line changes, and
+// `answer` still never names a platform.
+const koru_builtin = @import("builtin");
+const orisha_freestanding = koru_builtin.target.os.tag == .freestanding;
+
+var request_arena_buf: [64 * 1024]u8 = undefined;
+var request_arena = std.heap.FixedBufferAllocator.init(&request_arena_buf);
+
+fn requestAllocator() std.mem.Allocator {
+    if (orisha_freestanding) {
+        request_arena.reset();
+        return request_arena.allocator();
+    }
+    return std.heap.page_allocator;
+}
+
 ~proc answer|zig {
     var method: []const u8 = "GET";
     var path: []const u8 = "/";
@@ -243,7 +286,7 @@ var header_buf: [512]u8 = undefined;
         .path = path,
         .body = body,
         .if_none_match = client_etag,
-        .allocator = std.heap.page_allocator,
+        .allocator = $mod.requestAllocator(),
     };
 
     const res = $mod.handler_event.handler(.{ .req = &req });
@@ -285,13 +328,59 @@ fn statusText(status: u16) []const u8 {
     };
 }
 
+/// `Sun, 09 Aug 2026 14:41:49 GMT` — exactly 29 bytes, the only shape RFC 9110
+/// allows in a Date header. Calendar arithmetic rather than strftime, so this
+/// needs one C symbol (`time`) instead of three, and works on a target whose
+/// libc has a clock and nothing else.
 fn formatHttpDate(buf: *[29]u8) void {
-    const epoch = time_c.time(null);
-    var tm: time_c.struct_tm = undefined;
-    _ = time_c.gmtime_r(&epoch, &tm);
-    var tmp: [30]u8 = undefined;
-    _ = time_c.strftime(&tmp, 30, "%a, %d %b %Y %H:%M:%S GMT", &tm);
-    @memcpy(buf, tmp[0..29]);
+    const epoch = time(null);
+    const days = @divFloor(epoch, 86400);
+    const secs = @as(u32, @intCast(epoch - days * 86400));
+
+    // Howard Hinnant's civil_from_days: shift the era to March so the leap day
+    // lands at the end of a year and the month lengths become a linear formula.
+    const z = days + 719468;
+    const era = @divFloor(z, 146097);
+    const doe = @as(u32, @intCast(z - era * 146097));
+    const yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const y0 = @as(i64, yoe) + era * 400;
+    const doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const mp = (5 * doy + 2) / 153;
+    const d = doy - (153 * mp + 2) / 5 + 1;
+    const m = if (mp < 10) mp + 3 else mp - 9;
+    const y = if (m <= 2) y0 + 1 else y0;
+
+    const wday = @as(u32, @intCast(@mod(days + 4, 7))); // 1970-01-01 was a Thursday
+    const DAY = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+    const MON = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+
+    @memcpy(buf[0..3], DAY[wday]);
+    buf[3] = ',';
+    buf[4] = ' ';
+    two(buf[5..7], d);
+    buf[7] = ' ';
+    @memcpy(buf[8..11], MON[m - 1]);
+    buf[11] = ' ';
+    four(buf[12..16], @as(u32, @intCast(y)));
+    buf[16] = ' ';
+    two(buf[17..19], secs / 3600);
+    buf[19] = ':';
+    two(buf[20..22], (secs % 3600) / 60);
+    buf[22] = ':';
+    two(buf[23..25], secs % 60);
+    @memcpy(buf[25..29], " GMT");
+}
+
+fn two(dst: *[2]u8, v: u32) void {
+    dst[0] = '0' + @as(u8, @intCast((v / 10) % 10));
+    dst[1] = '0' + @as(u8, @intCast(v % 10));
+}
+
+fn four(dst: *[4]u8, v: u32) void {
+    dst[0] = '0' + @as(u8, @intCast((v / 1000) % 10));
+    dst[1] = '0' + @as(u8, @intCast((v / 100) % 10));
+    dst[2] = '0' + @as(u8, @intCast((v / 10) % 10));
+    dst[3] = '0' + @as(u8, @intCast(v % 10));
 }
 
 fn headerPrefixKeepAlive(status: u16) ?[]const u8 {

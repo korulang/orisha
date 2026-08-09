@@ -1,41 +1,46 @@
-// Orisha in a unikernel — the source is ready, the LINK IS NOT. Read this
-// before quoting the example as working.
+// Orisha in a unikernel — the whole server, no operating system.
 //
-// Nothing in this file is unikernel-specific, and that part is real. The
-// handler and `serve` are the same two lines a hosted Orisha program writes;
-// what changes is one build flag, which selects a different `~proc run|…`
-// inside orisha/pump and nothing else. That is the pump seam doing its job.
+// Nothing in this file is unikernel-specific. The handler and `serve` are the
+// same two lines a hosted Orisha program writes; what changes is one build
+// flag, which selects a different `~proc run|…` inside orisha/pump and nothing
+// else. That is the pump seam doing its job.
 //
-//   koruc main.kz --build=unikraft        ✅ works — emits output_emitted.zig
-//
+//   koruc main.kz --build=unikraft
 //   zig build-lib wrapper.zig -target x86_64-freestanding \
 //       -O ReleaseSmall -fno-stack-protector -femit-bin=libkoruapp.a
-//                                          ❌ FAILS TODAY, two errors:
+//   UK_CFLAGS="-std=gnu17" kraft build --arch x86_64 --plat qemu --no-prompt
+//   qemu-system-x86_64 -kernel .unikraft/build/orisha_qemu-x86_64 \
+//     -cpu 'qemu64,+pdpe1gb,+rdrand,+rdseed,-vmx,-svm' \
+//     -m 64M -nographic -no-reboot -display none -parallel none \
+//     -netdev user,id=n0,hostfwd=tcp::18335-:8080 \
+//     -device virtio-net-pci,netdev=n0
 //
-//     std/heap.zig:57: freestanding/other page_size_max must provided with
-//                      std.options.page_size_max
-//       reached through std.heap.PageAllocator — Orisha asks for a host page
-//       allocator at module level, and a machine with no OS has no pages to ask
-//       about.
+// Measured 2026-08-09, three requests over the host-forwarded port:
 //
-//     output_emitted.zig:87: C import failed — 'time.h' file not found
-//       `const time_c = @cImport(@cInclude("time.h"))` in orisha/lib/index.kz,
-//       for the HTTP Date header. No libc on this target.
+//   HTTP/1.1 200 OK
+//   Content-Length: 39
+//   Content-Type: text/plain
+//   Date: Sun, 09 Aug 2026 14:52:40 GMT
+//   Connection: keep-alive
 //
-// Both are ORISHA'S, not the compiler's or Unikraft's, and both want the same
-// treatment the readiness loop already got: a seam with a body per platform.
-// Until they land, this directory builds a Linux binary and nothing boots.
+//   Hello from Orisha, inside a unikernel.
 //
-// ⚠️ THEREFORE: Orisha CANNOT BE BENCHMARKED IN A UNIKERNEL YET. The image that
-// does boot and serve is koru/examples/unikraft-net, which is not Orisha — it is
-// a hand-written Koru program whose proc answers with a hardcoded 18-byte string
-// and stops after three requests (`while (served < 3)`). It is a proof that the
-// network reaches Koru on freestanding; it is not a server, and a load generator
-// would outrun it before its first report.
+// Two things had to leave lib/index.kz before this could link, and both were
+// Orisha's own, not the compiler's and not Unikraft's:
 //
-// Measured 2026-08-09 by running the two commands above, in this directory.
-// koru/examples/unikraft-net/BUILD.md has the QEMU line and the image sizes for
-// the demo that does boot.
+//   `@cImport(@cInclude("time.h"))` for the Date header — replaced by one
+//   `extern fn time`, with the calendar arithmetic written out. A freestanding
+//   target has no libc HEADERS; it does have the symbol, at link time.
+//
+//   `std.heap.page_allocator` on every Request — that is an OS allocator and
+//   reaches std.posix for mmap. It is now a seam: hosted keeps the page
+//   allocator, freestanding gets a fixed arena in the image, reset per
+//   exchange because a pump delivers one at a time.
+//
+// The handler is written as a record return. A `~proc orisha:handler|zig`
+// implementation compiles and links and then does NOT attach — the server
+// comes up and answers with Orisha's built-in 404 instead. Measured the same
+// day on both targets; it is a real defect and it is not this example's.
 
 ~import orisha
 
@@ -43,14 +48,7 @@
 // spelling the library's docs showed; it was removed from the language on
 // 2026-08-09 (koru 050b3549) because a single outcome does not get a name, so
 // there is nothing to prefer this over any more — a handler returns the record.
-~proc orisha:handler|zig {
-    _ = &req;
-    return .{
-        .status = 200,
-        .body = "Hello from Orisha, inside a unikernel.\n",
-        .content_type = "text/plain",
-    };
-}
+~orisha:handler -> { status: 200, body: "Hello from Orisha, inside a unikernel.\n", content_type: "text/plain" }
 
 ~orisha:serve(port: 8080)
 | shutdown _ |> _
