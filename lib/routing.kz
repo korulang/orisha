@@ -1,16 +1,8 @@
-// Orisha Router - Pattern-matching HTTP router
+// Orisha's router — the implementation.
 //
-// Standalone module for testing and benchmarking routing logic
-// without network overhead.
-//
-// Usage:
-//   ~test(Route matching) {
-//       ~router.match = ok { path: "/users/42", pattern: "/users/:id" }
-//       ~router.match(path: "/users/42", pattern: "/users/:id")
-//       | ok m |> assert.ok()
-//   }
-
-~import std/testing
+// The Zig for pattern matching. The declaration it implements is in the
+// companion `routing.k`; this file has a host language in it, which is what the
+// `~` on the proc below is for.
 
 const router_std = @import("std");
 
@@ -54,10 +46,6 @@ pub const Route = struct {
 
 // Match a path against a pattern like "/users/:id/posts/:post_id"
 // Returns match result with extracted parameters
-~pub tor match { path: string, pattern: string }
-| ok RouteMatch
-| no-match
-
 ~[pure] proc match|zig {
     var result = RouteMatch{
         .matched = false,

@@ -77,11 +77,6 @@ var uk_read_buf: [READ_BUFFER]u8 = undefined;
 // RUN — the loop. One variant per platform.
 // ============================================================================
 
-~pub tor run { port: u16 }
-! arrived *Exchange
-| stopped string
-| failed string
-
 // ---------------------------------------------------------------------------
 // Shared helpers — identical on every POSIX platform, written once.
 // ---------------------------------------------------------------------------
@@ -326,10 +321,6 @@ fn writeAll(fd: posix.fd_t, data: []const u8) bool {
 // Write an answer back. `head` and `body` go out in that order; a caller that
 // already holds a whole rendered response passes it as `head` with an empty
 // `body`, which is what a pre-rendered static route does.
-~pub tor reply { x: *Exchange, head: string, body: string }
-| sent
-| broken string
-
 ~proc reply|zig {
     if (!writeAll(x.fd, head)) {
         x.keep_alive = false;
@@ -370,12 +361,8 @@ fn writeAll(fd: posix.fd_t, data: []const u8) bool {
 }
 
 // Refuse to keep the connection. The pump closes it when the arm returns.
-~pub tor hang-up { x: *Exchange }
-
 ~proc hang-up|zig {
     x.keep_alive = false;
 }
 
 // The raw request bytes, for the parsing layer.
-~pub tor raw { x: *Exchange } -> string
-~raw -> x.raw
