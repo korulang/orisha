@@ -1,22 +1,48 @@
-// Orisha in a unikernel — the whole server, no operating system.
+// Orisha in a unikernel — the source is ready, the LINK IS NOT. Read this
+// before quoting the example as working.
 //
-// Nothing here is unikernel-specific. The handler and `serve` are the same two
-// lines a hosted Orisha program writes; what changes is one build flag, which
-// selects a different `~proc run|…` inside orisha/pump and nothing else. That
-// is the entire point of the pump seam.
+// Nothing in this file is unikernel-specific, and that part is real. The
+// handler and `serve` are the same two lines a hosted Orisha program writes;
+// what changes is one build flag, which selects a different `~proc run|…`
+// inside orisha/pump and nothing else. That is the pump seam doing its job.
 //
-//   koruc main.kz --build=unikraft        -> output_emitted.zig
+//   koruc main.kz --build=unikraft        ✅ works — emits output_emitted.zig
+//
 //   zig build-lib wrapper.zig -target x86_64-freestanding \
 //       -O ReleaseSmall -fno-stack-protector -femit-bin=libkoruapp.a
-//   UK_CFLAGS="-std=gnu17" kraft build --arch x86_64 --plat qemu --no-prompt
+//                                          ❌ FAILS TODAY, two errors:
 //
-// See BUILD.md for the QEMU line and the measurements.
+//     std/heap.zig:57: freestanding/other page_size_max must provided with
+//                      std.options.page_size_max
+//       reached through std.heap.PageAllocator — Orisha asks for a host page
+//       allocator at module level, and a machine with no OS has no pages to ask
+//       about.
+//
+//     output_emitted.zig:87: C import failed — 'time.h' file not found
+//       `const time_c = @cImport(@cInclude("time.h"))` in orisha/lib/index.kz,
+//       for the HTTP Date header. No libc on this target.
+//
+// Both are ORISHA'S, not the compiler's or Unikraft's, and both want the same
+// treatment the readiness loop already got: a seam with a body per platform.
+// Until they land, this directory builds a Linux binary and nothing boots.
+//
+// ⚠️ THEREFORE: Orisha CANNOT BE BENCHMARKED IN A UNIKERNEL YET. The image that
+// does boot and serve is koru/examples/unikraft-net, which is not Orisha — it is
+// a hand-written Koru program whose proc answers with a hardcoded 18-byte string
+// and stops after three requests (`while (served < 3)`). It is a proof that the
+// network reaches Koru on freestanding; it is not a server, and a load generator
+// would outrun it before its first report.
+//
+// Measured 2026-08-09 by running the two commands above, in this directory.
+// koru/examples/unikraft-net/BUILD.md has the QEMU line and the image sizes for
+// the demo that does boot.
 
 ~import orisha
 
-// The handler is implemented with a proc rather than the `response { … }`
-// constructor the library's doc comment shows: that spelling resolves to an
-// event invocation and garbles the record (see BUILD.md, known-not-done).
+// The handler is implemented with a proc. `response { … }` used to be the
+// spelling the library's docs showed; it was removed from the language on
+// 2026-08-09 (koru 050b3549) because a single outcome does not get a name, so
+// there is nothing to prefer this over any more — a handler returns the record.
 ~proc orisha:handler|zig {
     _ = &req;
     return .{
