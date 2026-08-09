@@ -1,31 +1,14 @@
-// Orisha - High-performance web framework for Koru
+// Orisha — the implementation.
 //
-// Public API:
-//   ~orisha:serve(port)              - Start server (calls abstract handler for each request)
-//   ~orisha:handler                  - Abstract event users implement for request handling
-//   ~orisha:router(req)              - Pattern-branch router transform
-//   ~orisha:static(name, root, ...)  - Declare static files to embed at compile time
-//   ~orisha:static_router(name)      - Transform: inline static file lookup + fallback
+// Zig lives here: the socket calls, the request parser, the router transform,
+// the static-asset embedder. Every Koru declaration this module exposes is in
+// the companion `index.k` beside this file, which is why that one has no `~`
+// in it and this one does — the character is a parser switch, and there is a
+// host language here to switch out of.
 //
-// Example (pure static site):
-//   ~import orisha
-//   ~orisha:static(name: "site", root: "build", fallback: "200.html")
-//   ~orisha:handler = orisha:static_router(name: "site")
-//   ~orisha:serve(port: 3000)
-//
-// Example (API + static):
-//   ~orisha:handler = orisha:router(req)
-//   | [GET /api/health] |> response { status: 200, body: "ok", content-type: "application/json" }
-//   | [*] |> orisha:static_router(name: "site")
-//
-// Example (simplest server):
-//   ~orisha:handler = response { status: 200, body: "Hello!", content-type: "text/plain" }
-//   ~orisha:serve(port: 3001)
-
-~import std/compiler
-~import std/io
-~import std/build
-~import orisha/pump
+// The two files share a stem and are ONE module. A `~pub tor` may not be
+// declared here while that companion exists (KORU111): the public surface is
+// the contract's job.
 
 ~std/compiler:requires {
     exe.linkSystemLibrary("z");
@@ -64,12 +47,8 @@ pub const ConnHandle = struct {
 };
 
 // ============================================================================
-// LISTEN - Start listening on a port
+// LISTEN — open the socket
 // ============================================================================
-
-~pub tor listen { port: u16 }
-| listening *ServerHandle
-| failed string
 
 ~proc listen|zig {
     const allocator = std.heap.c_allocator;
@@ -93,15 +72,6 @@ pub const ConnHandle = struct {
     std.debug.print("Orisha listening on http://0.0.0.0:{}\n", .{port});
     return .{ .listening = handle };
 }
-
-// ============================================================================
-// ACCEPT - Accept connection and parse HTTP request
-// ============================================================================
-
-~pub tor accept { server: *ServerHandle }
-| request { req: *Request, conn: *ConnHandle, server: *ServerHandle }
-| failed { msg: string, server: *ServerHandle }
-
 ~proc accept|zig {
     const allocator = server.allocator;
 
@@ -168,14 +138,6 @@ pub const ConnHandle = struct {
     return .{ .request = .{ .req = req, .conn = conn_handle, .server = server } };
 }
 
-// ============================================================================
-// SEND - Send HTTP response and close connection
-// ============================================================================
-
-~pub tor send { conn: *ConnHandle, status: u16, body: string, content_type: ?string }
-| sent
-| failed string
-
 ~proc send|zig {
     const allocator = conn.allocator;
     const ct = if (content_type) |ct_str| ct_str else "text/plain";
@@ -227,10 +189,6 @@ pub const ConnHandle = struct {
     return .{ .sent = {} };
 }
 
-// ============================================================================
-// HANDLER - Abstract event for request handling
-// ============================================================================
-// Users implement this to handle requests. Default returns 404.
 
 // The response's content type. `?string` in a RETURN RECORD does not lower to
 // Zig yet (params lower via emitter_helpers.zig:907 / regression 400_181; the
@@ -238,44 +196,6 @@ pub const ConnHandle = struct {
 // the optional field names this module-local alias instead — the same
 // mechanism `*Request` uses.
 pub const ContentType = []const u8;
-
-// @retain: handler_event is referenced from serve proc's raw Zig code
-// via $mod.handler_event.handler(...) — invisible to the dead-stripper.
-~[abstract|retain]pub tor handler { req: *Request } -> { status: u16, body: string, content_type: ?ContentType }
-
-// Default implementation - 404 for everything
-~handler -> { status: 404, body: "Not Found", content_type: null }
-
-// ============================================================================
-// SERVE — a Koru flow over a platform pump
-// ============================================================================
-// `serve` used to be two ~200-line Zig bodies, one per readiness mechanism,
-// that differed in about twenty lines and duplicated everything else. The loop
-// now lives in orisha/pump, one variant per platform; what remains here is the
-// part that is the same everywhere, and it is a flow.
-//
-// Adding a platform is a `~proc run|<name>` in orisha/pump plus a line in the
-// variants block. Nothing in this file changes.
-
-~pub tor serve { port: u16 }
-| shutdown string
-| failed string
-
-~serve =
-    orisha/pump:run(port)
-    ! arrived x |> orisha/pump:raw(x): raw |> orisha:answer(raw): a |> orisha/pump:reply(x, a.head, a.body)
-        | sent |> _
-        | broken _ |> _
-    | stopped s -> shutdown s
-    | failed e -> failed e
-
-// ============================================================================
-// ANSWER — parse one request, run the handler, shape the response
-// ============================================================================
-// Platform-free by construction: it takes bytes and returns bytes, and never
-// names a file descriptor. Every pump shares it.
-
-~pub tor answer { raw: string } -> { head: string, body: string }
 
 // The header is built into a module-level buffer rather than a stack frame,
 // because a slice of a dead frame is the bug this file has shipped before. It
@@ -388,47 +308,6 @@ fn headerPrefixKeepAlive(status: u16) ?[]const u8 {
     };
 }
 
-// ============================================================================
-// PLATFORM SELECTION
-// ============================================================================
-// One line per platform. The pump is what changes; serve never does.
-
-~[build(linux)]std/build:variants {
-    "orisha/pump:run": "epoll"
-}
-| configured _ |> _
-| skipped _ |> _
-| invalid-event _ |> _
-
-// A unikernel selects BOTH: the loop, and the writer. `reply`'s default body
-// goes through `posix.write`, which has no implementation on a freestanding
-// target, and it is reached from the `arrived` arm on every request — so it is
-// not one of the bodies the target can simply leave unanalyzed.
-~[build(unikraft)]std/build:variants {
-    "orisha/pump:run": "unikraft",
-    "orisha/pump:reply": "unikraft"
-}
-| configured _ |> _
-| skipped _ |> _
-| invalid-event _ |> _
-
-// ============================================================================
-// ROUTER - Pattern-branch router transform
-// ============================================================================
-// Transforms pattern branches into dispatch logic
-//
-// Usage:
-//   ~orisha:handler = orisha:router(req)
-//   | [GET /] _ |> response { status: 200, body: "Hello", content-type: "text/plain" }
-//   | [GET /users/:id] p |> response { status: 200, body: p.id, content-type: "text/plain" }
-//   | [*] _ |> response { status: 404, body: "Not Found", content-type: "text/plain" }
-
-~[comptime|transform]pub tor router {
-    invocation: *const Invocation,
-    item: *const Item,
-    program: *const Program,
-    allocator: std.mem.Allocator
-} -> SiteResult
 
 ~proc router|zig {
     const ast_mod = @import("ast");
@@ -992,31 +871,6 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const Process
     defer file.close();
     try file.writeAll(output.items);
 }
-
-// Data-only event: declares static files to embed at compile time
-// - name: identifier for referencing via static_router
-// - root: directory to embed (relative to .kz file)
-// - fallback: optional file for SPA fallback (relative to root, e.g. "200.html")
-~[comptime]pub tor static { name: string, root: string, fallback: ?string }
-
-// ============================================================================
-// STATIC ROUTER - Compile-time transform for static file dispatch
-// ============================================================================
-// Generates inline lookup code that:
-//   1. Imports generated/<name>_routes.zig
-//   2. Calls lookupWithEtag(method, path, if_none_match)
-//   3. Returns pre-built response (or fallback, or 404)
-//
-// Works as top-level handler or nested in a router catch-all:
-//   ~orisha:handler = orisha:static_router(name: "site")
-//   | [*] |> orisha:static_router(name: "site")
-
-~[comptime|transform]pub tor static-router {
-    invocation: *const Invocation,
-    item: *const Item,
-    program: *const Program,
-    allocator: std.mem.Allocator
-} -> SiteResult
 
 ~proc static-router|zig {
     const ast_mod = @import("ast");
