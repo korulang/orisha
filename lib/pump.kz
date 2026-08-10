@@ -40,6 +40,16 @@ pub const Exchange = struct {
 const READ_BUFFER = 4096;
 const MAX_EVENTS = 64;
 
+// io_uring: how deep the submission ring is, and the tag that marks an accept
+// completion apart from a connection's.
+//
+// kqueue and epoll ask "which of these is ready, so I can then read it". io_uring
+// inverts that: the read is submitted UP FRONT and the completion says it already
+// happened. So this pump has no readiness step at all — the loop body handles a
+// result, never a hint.
+const URING_ENTRIES: u16 = 256;
+const URING_ACCEPT: u64 = std.math.maxInt(u64);
+
 // One read is not one request.
 //
 // A browser opening a page fires its asset requests back to back, and TCP is
@@ -562,6 +572,121 @@ const WRITE_WAIT_MS: i32 = 10_000;
                 .data = .{ .fd = fd },
             };
             _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &rearm);
+        }
+    }
+
+    return .{ .stopped = "Server stopped" };
+}
+
+// ---------------------------------------------------------------------------
+// io_uring — Linux 5.x and later. Selected by `--build=io-uring`.
+// ---------------------------------------------------------------------------
+// The other three pumps ask the kernel WHICH descriptor is ready and then do the
+// read themselves. This one submits the read up front and is told it has already
+// happened — so there is no readiness step, and the loop body handles a result
+// rather than a hint.
+//
+// That is a different shape, not a faster spelling of the same one, and it is
+// the reason the seam is worth having: everything above `run` is untouched by
+// the inversion. Framing, buffering and the idle timeout are the shared helpers
+// the other pumps use; only the way bytes arrive is new.
+//
+// A blocking write is used for the reply (the `reply|zig` body, unchanged): the
+// connections here are never marked non-blocking, so `write` completes or waits,
+// and there is no readiness to wait for anyway.
+
+~proc run|io-uring {
+    // `std.os.linux.IoUring` cannot be NAMED on a non-Linux target — it reaches
+    // for `linux.E` and a macOS build has `darwin.E` instead, so this is a type
+    // error, not a missing feature. The guard is comptime-known, so the body
+    // below is never analysed when the host is not Linux, and `koruc` can still
+    // produce its host executable on a laptop.
+    if (@import("builtin").os.tag != .linux) {
+        return .{ .failed = "io_uring is a Linux mechanism — build with --build=linux for this host" };
+    }
+
+    const linux = std.os.linux;
+
+    const server = $mod.openListener(port) orelse return .{ .failed = "Failed to listen" };
+    const listen_fd = server.stream.handle;
+
+    var ring = linux.IoUring.init($mod.URING_ENTRIES, 0) catch
+        return .{ .failed = "io_uring unavailable — needs Linux 5.1 or later" };
+
+    _ = ring.accept($mod.URING_ACCEPT, listen_fd, null, null, 0) catch
+        return .{ .failed = "io_uring accept" };
+
+    std.debug.print("Orisha listening on http://0.0.0.0:{}\n", .{port});
+    std.debug.print("Pump: io_uring, keep-alive, TCP_NODELAY\n", .{});
+
+    var cqes: [$mod.MAX_EVENTS]linux.io_uring_cqe = undefined;
+
+    while (true) {
+        _ = ring.submit_and_wait(1) catch continue;
+        const ready = ring.copy_cqes(&cqes, 1) catch continue;
+
+        for (cqes[0..ready]) |cqe| {
+            if (cqe.user_data == $mod.URING_ACCEPT) {
+                // Re-arm FIRST. A burst of connections is otherwise serialised
+                // behind whatever this one turns into.
+                _ = ring.accept($mod.URING_ACCEPT, listen_fd, null, null, 0) catch {};
+                if (cqe.res < 0) continue;
+
+                const client_fd: $mod.posix.fd_t = @intCast(cqe.res);
+                $mod.disableNagle(client_fd);
+
+                const fresh = $mod.connState(client_fd) orelse {
+                    $mod.posix.close(client_fd);
+                    continue;
+                };
+                fresh.len = 0;
+                // The buffer lives in the connection's own state, which is
+                // heap-stable — the kernel writes into it before we are told.
+                _ = ring.recv(@intCast(client_fd), client_fd, .{ .buffer = fresh.buf[0..] }, 0) catch {
+                    $mod.releaseConn(client_fd);
+                    $mod.posix.close(client_fd);
+                };
+                continue;
+            }
+
+            const fd: $mod.posix.fd_t = @intCast(cqe.user_data);
+            const st = $mod.connState(fd) orelse continue;
+
+            if (cqe.res <= 0) {
+                $mod.releaseConn(fd);
+                $mod.posix.close(fd);
+                continue;
+            }
+            st.len += @intCast(cqe.res);
+
+            // Answer every COMPLETE request — the same helpers the other pumps
+            // use, so a browser is handled identically here.
+            var consumed: usize = 0;
+            var alive = true;
+            while (consumed < st.len) {
+                const take = $mod.requestLen(st.buf[consumed..st.len]) orelse break;
+                var exchange = $mod.Exchange{ .fd = fd, .raw = st.buf[consumed .. consumed + take] };
+                arrived(&exchange);
+                consumed += take;
+                if (!exchange.keep_alive) {
+                    alive = false;
+                    break;
+                }
+            }
+            st.len = $mod.retainTail(&st.buf, st.len, consumed);
+            if (alive and st.len == st.buf.len) alive = false;
+
+            if (!alive) {
+                $mod.releaseConn(fd);
+                $mod.posix.close(fd);
+                continue;
+            }
+
+            // Ask for the next bytes, appending to whatever is unfinished.
+            _ = ring.recv(@intCast(fd), fd, .{ .buffer = st.buf[st.len..] }, 0) catch {
+                $mod.releaseConn(fd);
+                $mod.posix.close(fd);
+            };
         }
     }
 

@@ -121,6 +121,17 @@ pub tor answer { raw: string } -> { head: string, body: string }
 | skipped _ |> _
 | invalid-event _ |> _
 
+// Linux again, with the newer mechanism. epoll answers "which of these is
+// ready"; io_uring is told the read ALREADY HAPPENED, so the loop handles a
+// result rather than a hint. Needs Linux 5.1, which is why it is a separate
+// choice rather than the Linux default.
+[build(io-uring)]std/build:variants {
+    "orisha/pump:run": "io-uring"
+}
+| configured _ |> _
+| skipped _ |> _
+| invalid-event _ |> _
+
 // A unikernel selects BOTH: the loop, and the writer. `reply`'s default body
 // goes through `posix.write`, which has no implementation on a freestanding
 // target, and it is reached from the `arrived` arm on every request — so it is
