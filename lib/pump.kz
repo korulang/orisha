@@ -158,10 +158,95 @@ const SockaddrIn = extern struct {
     zero: [8]u8 = [_]u8{0} ** 8,
 };
 
-// The unikernel pump reads into a module-level buffer rather than a stack frame:
-// same reasoning as `answer`'s header buffer in index.kz, and sound for the same
-// reason — one exchange is in flight at a time.
-var uk_read_buf: [READ_BUFFER]u8 = undefined;
+// `poll`, from the same place the socket calls come from — Unikraft's
+// posix-socket layer, as an ordinary symbol in the same address space.
+//
+// The unikernel pump needs it for the reason the hosted pumps need kqueue and
+// epoll: a browser opens SEVERAL connections and holds them all open. A loop
+// that accepts one connection and serves it to completion answers the first
+// browser connection and never accepts the second, so the page never finishes
+// loading. Measured 2026-08-10 against korulang.org in this very image: curl
+// worked perfectly (it closes between requests) and Firefox timed out on every
+// page, because the difference is not the requests, it is how many sockets are
+// open at once.
+const PollFd = extern struct { fd: c_int, events: c_short, revents: c_short };
+const POLLIN: c_short = 0x001;
+// A hangup is not readability. `poll` reports a peer that went away through
+// these, and it may report them WITHOUT POLLIN — so a loop that waits only for
+// readable data never learns the connection is dead and never frees its slot.
+// The table then fills with sockets nobody is on the other end of, and the next
+// real connection is the one that suffers.
+const POLLERR: c_short = 0x008;
+const POLLHUP: c_short = 0x010;
+const POLLNVAL: c_short = 0x020;
+extern fn poll(fds: [*]PollFd, nfds: c_ulong, timeout: c_int) c_int;
+
+// One in-flight connection per slot, each owning the request it has not
+// finished reading.
+//
+// A browser does not close a connection when it is finished with it — it keeps
+// it open in case there is more to fetch. One page of korulang.org issues 68
+// requests, spread over however many sockets Firefox feels like holding, and
+// those sockets stay open across page loads. So slots do not free themselves on
+// any timescale the server controls.
+const MAX_UK_CONNS = 64;
+
+const UkConn = struct {
+    fd: c_int = -1,
+    buf: [REQUEST_BUFFER]u8 = undefined,
+    len: usize = 0,
+    /// When this connection was last heard from. Only the ORDER matters.
+    seq: u64 = 0,
+    /// Which tick it was last heard from on — for the idle timeout.
+    tick: u64 = 0,
+};
+
+var uk_conns: [MAX_UK_CONNS]UkConn = [_]UkConn{.{}} ** MAX_UK_CONNS;
+var uk_seq: u64 = 0;
+var uk_tick: u64 = 0;
+
+// Hang up on a connection nobody is using.
+//
+// A slot is not the scarce thing — lwip's own connection pool is, and it is
+// sized in the image config (CONFIG_LWIP_NUM_TCPCON). A browser holds keep-alive
+// sockets open indefinitely, so if the server never hangs up, that pool fills
+// with connections nobody is on and the NEXT visitor gets a reset. Waiting for
+// the client to close is waiting for something that does not happen.
+//
+// Every other HTTP server has this timeout; this one did not until 2026-08-10,
+// and the symptom was a browser that loaded eighteen pages and then could not
+// load any.
+const POLL_TICK_MS: c_int = 1000;
+const KEEPALIVE_IDLE_TICKS: u64 = 5;
+
+// Give a newly accepted connection a slot, evicting the longest-idle one if
+// every slot is taken.
+//
+// Refusing the NEW connection instead — which is what this did first — drops
+// the request somebody is actually waiting for in favour of sockets a browser
+// has finished with but not closed. Firefox reports that as NS_ERROR_NET_RESET
+// and the page fails to load, after three page loads had filled the table.
+fn ukAdmit(incoming: c_int) void {
+    uk_seq += 1;
+    for (&uk_conns) |*s| {
+        if (s.fd >= 0) continue;
+        s.fd = incoming;
+        s.len = 0;
+        s.seq = uk_seq;
+        s.tick = uk_tick;
+        return;
+    }
+
+    var oldest: *UkConn = &uk_conns[0];
+    for (&uk_conns) |*s| {
+        if (s.seq < oldest.seq) oldest = s;
+    }
+    _ = close(oldest.fd);
+    oldest.fd = incoming;
+    oldest.len = 0;
+    oldest.seq = uk_seq;
+    oldest.tick = uk_tick;
+}
 
 // ============================================================================
 // RUN — the loop. One variant per platform.
@@ -459,27 +544,84 @@ const WRITE_WAIT_MS: i32 = 10_000;
     if ($mod.bind(fd, &addr, @sizeOf($mod.SockaddrIn)) < 0) return .{ .failed = "bind" };
     if ($mod.listen(fd, 512) < 0) return .{ .failed = "listen" };
 
+    // Wait on the listener AND every live connection at once. Serving one
+    // connection to completion before accepting the next is what made a browser
+    // hang here while curl was perfectly happy.
     while (true) {
-        const conn = $mod.accept(fd, null, null);
-        if (conn < 0) continue;
+        var pfds: [$mod.MAX_UK_CONNS + 1]$mod.PollFd = undefined;
+        var slot: [$mod.MAX_UK_CONNS + 1]i32 = undefined;
+        var n: usize = 0;
 
-        // Keep-alive: serve requests off the same connection until the peer
-        // stops sending or an arm sets keep_alive false through `hang-up`.
-        var used: usize = 0;
-        while (true) {
+        pfds[n] = .{ .fd = fd, .events = $mod.POLLIN, .revents = 0 };
+        slot[n] = -1; // the listener
+        n += 1;
+
+        for (&$mod.uk_conns, 0..) |*conn, i| {
+            if (conn.fd < 0) continue;
+            pfds[n] = .{ .fd = conn.fd, .events = $mod.POLLIN, .revents = 0 };
+            slot[n] = @intCast(i);
+            n += 1;
+        }
+
+        const ready = $mod.poll(&pfds, @intCast(n), $mod.POLL_TICK_MS);
+
+        // Time passes whether or not anything arrived, so the sweep runs here.
+        $mod.uk_tick += 1;
+        for (&$mod.uk_conns) |*idle| {
+            if (idle.fd < 0) continue;
+            if (idle.len != 0) continue; // mid-request; it is still talking
+            if ($mod.uk_tick - idle.tick <= $mod.KEEPALIVE_IDLE_TICKS) continue;
+            _ = $mod.close(idle.fd);
+            idle.fd = -1;
+        }
+
+        if (ready <= 0) continue;
+
+        for (pfds[0..n], slot[0..n]) |p, which| {
+            const gone = p.revents & ($mod.POLLERR | $mod.POLLHUP | $mod.POLLNVAL) != 0;
+
+            // A dead connection frees its slot even when there is nothing to read.
+            if (which >= 0 and gone) {
+                const dead = &$mod.uk_conns[@intCast(which)];
+                _ = $mod.close(dead.fd);
+                dead.fd = -1;
+                dead.len = 0;
+                continue;
+            }
+
+            if (p.revents & $mod.POLLIN == 0) continue;
+
+            if (which < 0) {
+                const accepted = $mod.accept(fd, null, null);
+                if (accepted < 0) continue;
+                $mod.ukAdmit(accepted);
+                continue;
+            }
+
+            const live = &$mod.uk_conns[@intCast(which)];
+
             // Read onto the END of what is already held, so a request split
-            // across two reads is finished rather than restarted. A unikernel
-            // faces the same browser as a hosted build does.
-            const n = $mod.recv(conn, @ptrCast(&$mod.uk_read_buf[used]), $mod.uk_read_buf.len - used, 0);
-            if (n <= 0) break;
-            used += @intCast(n);
+            // across two reads is finished rather than restarted.
+            const got = $mod.recv(live.fd, @ptrCast(&live.buf[live.len]), live.buf.len - live.len, 0);
+            if (got <= 0) {
+                _ = $mod.close(live.fd);
+                live.fd = -1;
+                live.len = 0;
+                continue;
+            }
+            live.len += @intCast(got);
+
+            // Heard from — so it is no longer the idlest.
+            $mod.uk_seq += 1;
+            live.seq = $mod.uk_seq;
+            live.tick = $mod.uk_tick;
 
             // Answer every COMPLETE request — see requestLen and retainTail.
             var consumed: usize = 0;
             var alive = true;
-            while (consumed < used) {
-                const take = $mod.requestLen($mod.uk_read_buf[consumed..used]) orelse break;
-                var x = $mod.Exchange{ .fd = conn, .raw = $mod.uk_read_buf[consumed .. consumed + take] };
+            while (consumed < live.len) {
+                const take = $mod.requestLen(live.buf[consumed..live.len]) orelse break;
+                var x = $mod.Exchange{ .fd = live.fd, .raw = live.buf[consumed .. consumed + take] };
                 arrived(&x);
                 consumed += take;
                 if (!x.keep_alive) {
@@ -487,12 +629,15 @@ const WRITE_WAIT_MS: i32 = 10_000;
                     break;
                 }
             }
-            used = $mod.retainTail(&$mod.uk_read_buf, used, consumed);
-            if (alive and used == $mod.uk_read_buf.len) alive = false;
-            if (!alive) break;
-        }
+            live.len = $mod.retainTail(&live.buf, live.len, consumed);
+            if (alive and live.len == live.buf.len) alive = false;
 
-        _ = $mod.close(conn);
+            if (!alive) {
+                _ = $mod.close(live.fd);
+                live.fd = -1;
+                live.len = 0;
+            }
+        }
     }
 
     return .{ .stopped = "Server stopped" };

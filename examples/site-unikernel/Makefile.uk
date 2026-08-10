@@ -1,0 +1,3 @@
+$(eval $(call addlib,apporisha))
+APPORISHA_SRCS-y += $(APPORISHA_BASE)/main.c
+APPORISHA_ALIBS-y += $(APPORISHA_BASE)/libkoruapp.a
