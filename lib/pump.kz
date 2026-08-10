@@ -147,6 +147,15 @@ extern fn recv(fd: c_int, buf: [*]u8, len: usize, flags: c_int) isize;
 extern fn send(fd: c_int, buf: [*]const u8, len: usize, flags: c_int) isize;
 extern fn close(fd: c_int) c_int;
 
+// Wall-clock seconds. The idle timeout below has to be measured in TIME, and
+// the pump's own loop is not a clock — see KEEPALIVE_IDLE_SECONDS.
+//
+// Bound through `@extern` rather than declared as `extern fn time`, because the
+// companion contract already declares that symbol for the Date header and the
+// two modules are emitted into ONE file: two declarations of the same name are
+// an ambiguous reference, not a duplicate the compiler can silently accept.
+const wallClockSeconds = @extern(*const fn (?*i64) callconv(.c) i64, .{ .name = "time" });
+
 // Unikraft's nolibc imports musl's `netinet/in.h`, where there is NO `sin_len`
 // byte: the family is a u16 at offset 0. Writing the BSD layout instead puts
 // 0x0210 where the family belongs, and then `socket` and `listen` both succeed
@@ -189,7 +198,15 @@ extern fn poll(fds: [*]PollFd, nfds: c_ulong, timeout: c_int) c_int;
 // requests, spread over however many sockets Firefox feels like holding, and
 // those sockets stay open across page loads. So slots do not free themselves on
 // any timescale the server controls.
-const MAX_UK_CONNS = 64;
+// Keep this comfortably BELOW lwip's own pool (CONFIG_LWIP_NUM_TCPCON in the
+// Kraftfile), so the pump is what runs out first and does so gracefully —
+// hanging up on its idlest connection — rather than the network stack refusing
+// a connection the pump never hears about.
+//
+// Measured 2026-08-10: with both set to 64 they collided exactly there. Load at
+// 48 concurrent connections was clean; 64 produced dropped reads, because two
+// independent limits with the same value have no headroom between them.
+const MAX_UK_CONNS = 128;
 
 const UkConn = struct {
     fd: c_int = -1,
@@ -197,13 +214,12 @@ const UkConn = struct {
     len: usize = 0,
     /// When this connection was last heard from. Only the ORDER matters.
     seq: u64 = 0,
-    /// Which tick it was last heard from on — for the idle timeout.
-    tick: u64 = 0,
+    /// Wall-clock second this connection was last heard from.
+    last_seen: i64 = 0,
 };
 
 var uk_conns: [MAX_UK_CONNS]UkConn = [_]UkConn{.{}} ** MAX_UK_CONNS;
 var uk_seq: u64 = 0;
-var uk_tick: u64 = 0;
 
 // Hang up on a connection nobody is using.
 //
@@ -217,7 +233,20 @@ var uk_tick: u64 = 0;
 // and the symptom was a browser that loaded eighteen pages and then could not
 // load any.
 const POLL_TICK_MS: c_int = 1000;
-const KEEPALIVE_IDLE_TICKS: u64 = 5;
+
+// Idle time is measured with a CLOCK, not by counting loop iterations.
+//
+// This counted iterations until 2026-08-10, and an event loop is not a clock:
+// when there is work to do `poll` returns immediately, so the loop spins
+// thousands of times a second and "5 ticks" becomes a few milliseconds. Any
+// connection that simply had no data ready for five consecutive iterations —
+// which under load is most of them, most of the time — was hung up on mid-use.
+//
+// The measurement hid it: an IDLE browser lets `poll` block its full second, so
+// ticks and seconds coincide exactly when nothing is happening. It only bit
+// under load, as a slow drip of dropped reads — 19 in 30 seconds at just 32
+// connections, scaling with both concurrency and duration.
+const KEEPALIVE_IDLE_SECONDS: i64 = 5;
 
 // Give a newly accepted connection a slot, evicting the longest-idle one if
 // every slot is taken.
@@ -233,8 +262,8 @@ fn ukAdmit(incoming: c_int) void {
         s.fd = incoming;
         s.len = 0;
         s.seq = uk_seq;
-        s.tick = uk_tick;
-        return;
+        s.last_seen = wallClockSeconds(null);
+            return;
     }
 
     var oldest: *UkConn = &uk_conns[0];
@@ -245,7 +274,7 @@ fn ukAdmit(incoming: c_int) void {
     oldest.fd = incoming;
     oldest.len = 0;
     oldest.seq = uk_seq;
-    oldest.tick = uk_tick;
+    oldest.last_seen = wallClockSeconds(null);
 }
 
 // ============================================================================
@@ -566,11 +595,11 @@ const WRITE_WAIT_MS: i32 = 10_000;
         const ready = $mod.poll(&pfds, @intCast(n), $mod.POLL_TICK_MS);
 
         // Time passes whether or not anything arrived, so the sweep runs here.
-        $mod.uk_tick += 1;
+        const now = $mod.wallClockSeconds(null);
         for (&$mod.uk_conns) |*idle| {
             if (idle.fd < 0) continue;
             if (idle.len != 0) continue; // mid-request; it is still talking
-            if ($mod.uk_tick - idle.tick <= $mod.KEEPALIVE_IDLE_TICKS) continue;
+            if (now - idle.last_seen <= $mod.KEEPALIVE_IDLE_SECONDS) continue;
             _ = $mod.close(idle.fd);
             idle.fd = -1;
         }
@@ -614,7 +643,7 @@ const WRITE_WAIT_MS: i32 = 10_000;
             // Heard from — so it is no longer the idlest.
             $mod.uk_seq += 1;
             live.seq = $mod.uk_seq;
-            live.tick = $mod.uk_tick;
+            live.last_seen = now;
 
             // Answer every COMPLETE request — see requestLen and retainTail.
             var consumed: usize = 0;
