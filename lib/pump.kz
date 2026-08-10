@@ -101,15 +101,47 @@ fn disableNagle(fd: posix.fd_t) void {
     posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, std.mem.asBytes(&enable)) catch {};
 }
 
+// Write the whole thing, and treat "would block" as what it is — a request to
+// wait, not a failure.
+//
+// Every accepted connection is non-blocking (markNonBlocking, below). So once a
+// response is bigger than the kernel's send buffer, `write` stops accepting and
+// says WouldBlock. Catching that alongside real errors and returning false — as
+// this did until 2026-08-10 — abandons the response part-written and closes the
+// connection, while the headers have already promised the full Content-Length.
+//
+// Nothing about that looks like a failure from the outside. Small responses fit
+// in one buffer and always arrived, so the bug was invisible until something
+// large went through: measured against korulang.org, one 1.5 MB image returned
+// 327093, 1561984, 1348077, 768057 and 498501 bytes on five consecutive
+// requests. A browser renders half an image, and a truncated JavaScript module
+// simply fails to import.
 fn writeAll(fd: posix.fd_t, data: []const u8) bool {
     var offset: usize = 0;
     while (offset < data.len) {
-        const n = posix.write(fd, data[offset..]) catch return false;
+        const n = posix.write(fd, data[offset..]) catch |err| switch (err) {
+            error.WouldBlock => {
+                // Wait for the socket to drain, then carry on from the same
+                // offset. A peer that never drains hits the timeout and the
+                // connection is genuinely broken.
+                var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
+                const ready = posix.poll(&pfd, WRITE_WAIT_MS) catch return false;
+                if (ready == 0) return false;
+                if (pfd[0].revents & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) return false;
+                continue;
+            },
+            else => return false,
+        };
         if (n == 0) return false;
         offset += @intCast(n);
     }
     return true;
 }
+
+// How long to wait for a stalled peer to drain before calling the connection
+// broken. Long enough that a slow link finishes a large asset, short enough
+// that a dead peer cannot pin the worker.
+const WRITE_WAIT_MS: i32 = 10_000;
 
 // ---------------------------------------------------------------------------
 // kqueue — macOS and the BSDs. The default variant.

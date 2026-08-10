@@ -114,7 +114,9 @@ pub const ConnHandle = struct {
         method = request_data[0..method_end];
         const after_method = request_data[method_end + 1..];
         if (std.mem.indexOf(u8, after_method, " ")) |path_end| {
-            path = after_method[0..path_end];
+            // Same seam as `answer` below — a query string and percent-encoding
+            // both belong to the request target, not to the resource name.
+            path = requestPathKey(allocator, after_method[0..path_end]);
         }
     }
 
@@ -245,7 +247,57 @@ fn requestAllocator() std.mem.Allocator {
     return std.heap.page_allocator;
 }
 
+// The request target is not the lookup key, and the difference is invisible
+// until a real site is behind it.
+//
+// A browser sends what the LINK says. `/blog?utm_source=x` and `/blog` want the
+// same page, and a filename with a space in it arrives percent-encoded — the
+// route table holds the decoded name, because that is what the file is called.
+// Matching the target verbatim, as this did until 2026-08-10, misses both, and
+// the miss is silent: the SPA fallback answers 200 with the shell, so the
+// browser renders something and only the missing image tells you.
+//
+// Measured against korulang.org: two screenshots referenced from studio.html and
+// a blog post never arrived, and every link carrying a query string — including
+// the site's own `?status=` lesson filter — landed on the fallback.
+fn requestPathKey(allocator: std.mem.Allocator, target: []const u8) []const u8 {
+    // A query string addresses the same resource.
+    const without_query = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[0..q] else target;
+
+    // Common case allocates nothing.
+    if (std.mem.indexOfScalar(u8, without_query, '%') == null) return without_query;
+
+    var out = allocator.alloc(u8, without_query.len) catch return without_query;
+    var w: usize = 0;
+    var r: usize = 0;
+    while (r < without_query.len) {
+        if (without_query[r] == '%' and r + 2 < without_query.len) {
+            const hi = std.fmt.charToDigit(without_query[r + 1], 16) catch {
+                out[w] = without_query[r];
+                w += 1;
+                r += 1;
+                continue;
+            };
+            const lo = std.fmt.charToDigit(without_query[r + 2], 16) catch {
+                out[w] = without_query[r];
+                w += 1;
+                r += 1;
+                continue;
+            };
+            out[w] = hi * 16 + lo;
+            w += 1;
+            r += 3;
+        } else {
+            out[w] = without_query[r];
+            w += 1;
+            r += 1;
+        }
+    }
+    return out[0..w];
+}
+
 ~proc answer|zig {
+    const req_allocator = $mod.requestAllocator();
     var method: []const u8 = "GET";
     var path: []const u8 = "/";
 
@@ -257,7 +309,7 @@ fn requestAllocator() std.mem.Allocator {
         var j: usize = i;
         while (j < raw.len and raw[j] != ' ') : (j += 1) {}
         if (j > i) {
-            path = raw[i..j];
+            path = $mod.requestPathKey(req_allocator, raw[i..j]);
         }
     }
 
@@ -286,7 +338,7 @@ fn requestAllocator() std.mem.Allocator {
         .path = path,
         .body = body,
         .if_none_match = client_etag,
-        .allocator = $mod.requestAllocator(),
+        .allocator = req_allocator,
     };
 
     const res = $mod.handler_event.handler(.{ .req = &req });
