@@ -767,7 +767,7 @@ fn headerPrefixKeepAlive(status: u16) ?[]const u8 {
 //
 // Usage:
 //   ~orisha:static(name: "site", root: "public", fallback: "200.html")
-//   ~orisha:handler = orisha:static_router(name: "site")
+//   ~orisha:handler = orisha:static-router(name: "site")
 //   ~orisha:serve(port: 3000)
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -806,6 +806,28 @@ fn processDirectory(allocator: std.mem.Allocator, routes: *std.ArrayList(Process
         routes.append(allocator, .{ .method = method, .path = route_path, .response = http_resp.response, .etag = http_resp.etag }) catch continue;
         if (std.mem.eql(u8, entry.path, "index.html") and std.mem.eql(u8, base_path, "/")) {
             routes.append(allocator, .{ .method = method, .path = "/", .response = http_resp.response, .etag = http_resp.etag }) catch continue;
+        }
+
+        // A page is requested at /blog, and it is stored as blog.html. Serving
+        // only the literal name is what every other static server resolves for
+        // you, and skipping it does not look like a bug — the SPA fallback
+        // answers 200 with the empty shell, so the browser fills the page in and
+        // only a crawler can tell. Measured against korulang.org's own build on
+        // 2026-08-10: 233 real pages embedded, ONE of them (the root) reachable.
+        //
+        // Both spellings get registered, with and without the trailing slash,
+        // because a link may carry either and neither should be a miss.
+        if (std.mem.endsWith(u8, route_path, ".html")) {
+            const stem = route_path[0 .. route_path.len - ".html".len];
+            const target = if (std.mem.endsWith(u8, stem, "/index"))
+                stem[0 .. stem.len - "/index".len] // /docs/index.html -> /docs
+            else
+                stem; // /blog.html -> /blog
+            if (target.len > 0) {
+                routes.append(allocator, .{ .method = method, .path = target, .response = http_resp.response, .etag = http_resp.etag }) catch continue;
+                const slashed = std.fmt.allocPrint(allocator, "{s}/", .{target}) catch continue;
+                routes.append(allocator, .{ .method = method, .path = slashed, .response = http_resp.response, .etag = http_resp.etag }) catch continue;
+            }
         }
     }
 }
@@ -965,7 +987,7 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const Process
     const ast_mod = @import("ast");
     const ast_functional = @import("ast_functional");
 
-    // Get the flow containing this static_router invocation
+    // Get the flow containing this static-router invocation
     const flow = if (item.* == .flow)
         &item.flow
     else
@@ -987,7 +1009,7 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const Process
         }
     }
 
-    std.debug.print("[STATIC_ROUTER TRANSFORM] Processing static_router for '{s}'\n", .{static_name});
+    std.debug.print("[STATIC_ROUTER TRANSFORM] Processing static-router for '{s}'\n", .{static_name});
 
     // Find the matching ~orisha:static(name: "...") declaration in the program
     var static_root: ?[]const u8 = null;
@@ -1071,13 +1093,20 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const Process
     std.debug.print("[STATIC_ROUTER TRANSFORM] Generated inline dispatch:\n{s}\n", .{inline_body_str});
 
     // Check if this invocation is the flow's top-level invocation or nested in a continuation.
-    // If the flow's invocation IS static_router, we're standalone (top-level handler).
+    // If the flow's invocation IS static-router, we're standalone (top-level handler).
     // If it's something else (e.g., router), we're nested in a catch-all continuation.
+    //
+    // The name is the DECLARED one — kebab, as `[comptime|transform]pub tor
+    // static-router` spells it in the companion contract. It read `static_router`
+    // here until 2026-08-10, and a name that never matches does not fail loudly:
+    // the nested branch below finds no continuation either, and falls through to
+    // replacing the WHOLE flow. Standalone handlers survived that by coincidence;
+    // a router with a static catch-all had every one of its own routes discarded.
     const flow_inv_name = if (flow.inv().path.segments.len > 0)
         flow.inv().path.segments[flow.inv().path.segments.len - 1]
     else
         "";
-    const is_top_level = std.mem.eql(u8, flow_inv_name, "static_router");
+    const is_top_level = std.mem.eql(u8, flow_inv_name, "static-router");
 
     if (!is_top_level) {
         // Nested case: only replace the continuation's node, preserving the parent flow
@@ -1091,7 +1120,7 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const Process
             nested_code = nested_code[prefix.len..];
         }
 
-        // Find the continuation whose node is the static_router invocation and replace its node
+        // Find the continuation whose node is the static-router invocation and replace its node
         var new_conts = allocator.alloc(ast_mod.Continuation, flow.body.continuations.len) catch unreachable;
         var replaced = false;
         for (flow.body.continuations, 0..) |cont, ci| {
@@ -1099,7 +1128,7 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const Process
                 if (cont.node) |node| {
                     if (node == .invocation) {
                         const segs = node.invocation.path.segments;
-                        if (segs.len > 0 and std.mem.eql(u8, segs[segs.len - 1], "static_router")) {
+                        if (segs.len > 0 and std.mem.eql(u8, segs[segs.len - 1], "static-router")) {
                             // Verify name arg matches
                             var name_match = false;
                             for (node.invocation.args) |arg| {
@@ -1169,13 +1198,16 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const Process
 
     const new_item = ast_mod.Item{ .flow = transformed_flow };
 
-    const maybe_new_program = ast_functional.replaceFlowRecursive(allocator, program, flow, new_item) catch unreachable;
-    if (maybe_new_program) |new_program_val| {
-        const result = allocator.create(ast_mod.Program) catch unreachable;
-        result.* = new_program_val;
-        return .{ .whole_program = result };
-    } else {
-        std.debug.print("ERROR: Static router transform failed - flow not found in program\n", .{});
-        return .{};
-    }
+    // Hand the runner the change as a VALUE and let it own the placement.
+    //
+    // This used to rewrite the whole program itself and return it through the
+    // `whole_program` escape. That escape is reserved for transforms that are
+    // irreducibly global, and this one is not — it replaces exactly one site.
+    // The cost was not style: the runner presents a NESTED site (a static
+    // catch-all inside a router) as a synthetic top-level view, so the rewrite
+    // landed on that synthetic copy and the real invocation was never replaced.
+    // The compiler calls that out as KORU124 rather than letting it through.
+    // `replacement` works for both positions — root swaps the whole item,
+    // nested swaps the holding continuation's node.
+    return .{ .replacement = new_item };
 }

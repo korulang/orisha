@@ -2,7 +2,7 @@
 //
 // Demonstrates tree-structured routing:
 //   - API routes handled by orisha:router pattern matching
-//   - Static files served by orisha:static_router as catch-all
+//   - Static files served by orisha:static-router as catch-all
 //   - Both compose through a single orisha:handler
 //
 // Build & Run:
@@ -21,16 +21,10 @@
 ~orisha:static(name: "site", root: "public", fallback: "index.html")
 
 ~orisha:handler = orisha:router(req)
-| [GET /api/health] |> response {
-    status: 200,
-    body: "{\"status\":\"ok\"}",
-    content_type: "application/json"
-}
-| [GET /api/info] |> response {
-    status: 200, body: "{\"server\":\"orisha\",\"version\":\"0.1.0\"}",
-    content_type: "application/json" }
-| [*] |> orisha:static_router(name: "site")
+! [GET /api/health] -> { status: 200, body: "{\"status\":\"ok\"}", content_type: "application/json" }
+! [GET /api/info] -> { status: 200, body: "{\"server\":\"orisha\",\"version\":\"0.1.0\"}", content_type: "application/json" }
+! [*] |> orisha:static-router(name: "site")
 
 ~orisha:serve(port: 3000)
-| shutdown s |> std/io:print.ln(s.reason)
-| failed f |> std/io:print.ln(f.msg)
+| shutdown s |> std/io:print.ln(s)
+| failed f |> std/io:print.ln(f)

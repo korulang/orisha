@@ -16,7 +16,7 @@
 //   orisha:handler                  - Abstract event users implement for request handling
 //   orisha:router(req)              - Pattern-branch router transform
 //   orisha:static(name, root, ...)  - Declare static files to embed at compile time
-//   orisha:static_router(name)      - Transform: inline static file lookup + fallback
+//   orisha:static-router(name)      - Transform: inline static file lookup + fallback
 //
 // Example (simplest server):
 //   ~orisha:handler -> { status: 200, body: "Hello!", content_type: "text/plain" }
@@ -25,12 +25,12 @@
 // Example (API + static):
 //   ~orisha:handler = orisha:router(req)
 //   | [GET /api/health] |> { status: 200, body: "ok", content_type: "application/json" }
-//   | [*] |> orisha:static_router(name: "site")
+//   | [*] |> orisha:static-router(name: "site")
 //
 // Example (pure static site):
 //   ~import orisha
 //   ~orisha:static(name: "site", root: "build", fallback: "200.html")
-//   ~orisha:handler = orisha:static_router(name: "site")
+//   ~orisha:handler = orisha:static-router(name: "site")
 //   ~orisha:serve(port: 3000)
 
 import std/compiler
@@ -170,8 +170,8 @@ pub tor answer { raw: string } -> { head: string, body: string }
 //   3. Returns pre-built response (or fallback, or 404)
 //
 // Works as top-level handler or nested in a router catch-all:
-//   ~orisha:handler = orisha:static_router(name: "site")
-//   | [*] |> orisha:static_router(name: "site")
+//   ~orisha:handler = orisha:static-router(name: "site")
+//   | [*] |> orisha:static-router(name: "site")
 
 [comptime|transform]pub tor static-router {
     invocation: *const Invocation,

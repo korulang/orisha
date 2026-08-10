@@ -46,7 +46,7 @@
 ! [GET /admin] |> orisha:router(req)
     ! [GET /admin] |> response { status: 200, body: "{\"admin\":\"home\"}", content_type: "application/json" }
     ! [*] |> response { status: 404, body: "{\"error\":\"admin_not_found\"}", content_type: "application/json" }
-! [*] |> orisha:static_router(name: "site")
+! [*] |> orisha:static-router(name: "site")
 
 ~orisha:serve(port: 3000)
 | shutdown s |> std/io:print.ln(s)

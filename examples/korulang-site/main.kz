@@ -19,8 +19,8 @@
 
 ~orisha:static(name: "site", root: "../../../korulang_org/build", fallback: "200.html")
 
-~orisha:handler = orisha:static_router(name: "site")
+~orisha:handler = orisha:static-router(name: "site")
 
 ~orisha:serve(port: 3000)
-| shutdown s |> std/io:print.ln(s.reason)
-| failed f |> std/io:print.ln(f.msg)
+| shutdown s |> std/io:print.ln(s)
+| failed f |> std/io:print.ln(f)
