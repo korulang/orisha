@@ -66,6 +66,54 @@ fn requestLen(buf: []const u8) ?usize {
     return total;
 }
 
+// A request can arrive in pieces, so a connection needs somewhere to keep the
+// part that has not finished yet.
+//
+// Without this the pump had only the bytes of one read. A burst bigger than the
+// read buffer therefore split a request down the middle, and the tail was then
+// parsed as if it were the start of a new one — which produced EXTRA responses,
+// not fewer: measured 43 responses to 40 pipelined requests. A client counting
+// replies against its own outstanding requests is desynchronised from then on,
+// and what it renders depends on where the split happened to land. That is the
+// "sometimes it works" shape.
+const REQUEST_BUFFER = 16 * 1024;
+const MAX_TRACKED_FD = 4096;
+
+const ConnState = struct {
+    buf: [REQUEST_BUFFER]u8 = undefined,
+    len: usize = 0,
+};
+
+var conn_states: [MAX_TRACKED_FD]?*ConnState = .{null} ** MAX_TRACKED_FD;
+
+fn connState(fd: posix.fd_t) ?*ConnState {
+    const idx: usize = @intCast(fd);
+    if (idx >= MAX_TRACKED_FD) return null;
+    if (conn_states[idx]) |s| return s;
+    const s = std.heap.c_allocator.create(ConnState) catch return null;
+    s.* = .{};
+    conn_states[idx] = s;
+    return s;
+}
+
+fn releaseConn(fd: posix.fd_t) void {
+    const idx: usize = @intCast(fd);
+    if (idx >= MAX_TRACKED_FD) return;
+    if (conn_states[idx]) |s| {
+        std.heap.c_allocator.destroy(s);
+        conn_states[idx] = null;
+    }
+}
+
+// Drop the requests already answered and slide the unfinished tail to the
+// front, so the next read continues it instead of mistaking it for a new one.
+fn retainTail(buf: []u8, len: usize, consumed: usize) usize {
+    if (consumed == 0) return len;
+    const remaining = len - consumed;
+    if (remaining > 0) std.mem.copyForwards(u8, buf[0..remaining], buf[consumed..len]);
+    return remaining;
+}
+
 fn contentLength(head: []const u8) ?usize {
     var line_start: usize = 0;
     while (line_start < head.len) {
@@ -199,7 +247,6 @@ const WRITE_WAIT_MS: i32 = 10_000;
     var changes: [1]$mod.c.Kevent = undefined;
     var no_changes: [0]$mod.c.Kevent = undefined;
     var events: [$mod.MAX_EVENTS]$mod.c.Kevent = undefined;
-    var buffer: [$mod.READ_BUFFER]u8 = undefined;
 
     // Arm the listener itself, so accept and read wait in one place.
     changes[0] = .{
@@ -244,27 +291,26 @@ const WRITE_WAIT_MS: i32 = 10_000;
                 continue;
             }
 
-            const bytes_read = $mod.posix.read(fd, &buffer) catch 0;
+            const st = $mod.connState(fd) orelse {
+                $mod.posix.close(fd);
+                continue;
+            };
+
+            const bytes_read = $mod.posix.read(fd, st.buf[st.len..]) catch 0;
             if (bytes_read == 0) {
+                $mod.releaseConn(fd);
                 $mod.posix.close(fd);
                 continue;
             }
+            st.len += bytes_read;
 
-            // Answer EVERY request in the buffer, not just the first.
+            // Answer every COMPLETE request; keep any unfinished tail for the
+            // next read rather than parsing it as a fresh request.
             var consumed: usize = 0;
             var alive = true;
-            while (consumed < bytes_read) {
-                const take = $mod.requestLen(buffer[consumed..bytes_read]) orelse {
-                    // No complete request left. A request split across reads is
-                    // a separate, still-open limitation — this pump keeps no
-                    // per-connection buffer — and handing the partial text to
-                    // the handler is what it has always done. Unchanged here.
-                    var partial = $mod.Exchange{ .fd = fd, .raw = buffer[consumed..bytes_read] };
-                    arrived(&partial);
-                    alive = partial.keep_alive;
-                    break;
-                };
-                var exchange = $mod.Exchange{ .fd = fd, .raw = buffer[consumed .. consumed + take] };
+            while (consumed < st.len) {
+                const take = $mod.requestLen(st.buf[consumed..st.len]) orelse break;
+                var exchange = $mod.Exchange{ .fd = fd, .raw = st.buf[consumed .. consumed + take] };
                 arrived(&exchange);
                 consumed += take;
                 if (!exchange.keep_alive) {
@@ -272,8 +318,13 @@ const WRITE_WAIT_MS: i32 = 10_000;
                     break;
                 }
             }
+            st.len = $mod.retainTail(&st.buf, st.len, consumed);
+
+            // Headers that never end are not a request this server can answer.
+            if (alive and st.len == st.buf.len) alive = false;
 
             if (!alive) {
+                $mod.releaseConn(fd);
                 $mod.posix.close(fd);
                 continue;
             }
@@ -316,7 +367,6 @@ const WRITE_WAIT_MS: i32 = 10_000;
     _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_ADD, listen_fd, &listen_event);
 
     var events: [$mod.MAX_EVENTS]linux.epoll_event = undefined;
-    var buffer: [$mod.READ_BUFFER]u8 = undefined;
 
     std.debug.print("Orisha listening on http://0.0.0.0:{}\n", .{port});
     std.debug.print("Pump: epoll, keep-alive, TCP_NODELAY\n", .{});
@@ -345,23 +395,25 @@ const WRITE_WAIT_MS: i32 = 10_000;
                 continue;
             }
 
-            const bytes_read = $mod.posix.read(fd, &buffer) catch 0;
+            const st = $mod.connState(fd) orelse {
+                $mod.posix.close(fd);
+                continue;
+            };
+
+            const bytes_read = $mod.posix.read(fd, st.buf[st.len..]) catch 0;
             if (bytes_read == 0) {
+                $mod.releaseConn(fd);
                 $mod.posix.close(fd);
                 continue;
             }
+            st.len += bytes_read;
 
-            // Answer EVERY request in the buffer — see requestLen.
+            // Same shape as the kqueue pump — see requestLen and retainTail.
             var consumed: usize = 0;
             var alive = true;
-            while (consumed < bytes_read) {
-                const take = $mod.requestLen(buffer[consumed..bytes_read]) orelse {
-                    var partial = $mod.Exchange{ .fd = fd, .raw = buffer[consumed..bytes_read] };
-                    arrived(&partial);
-                    alive = partial.keep_alive;
-                    break;
-                };
-                var exchange = $mod.Exchange{ .fd = fd, .raw = buffer[consumed .. consumed + take] };
+            while (consumed < st.len) {
+                const take = $mod.requestLen(st.buf[consumed..st.len]) orelse break;
+                var exchange = $mod.Exchange{ .fd = fd, .raw = st.buf[consumed .. consumed + take] };
                 arrived(&exchange);
                 consumed += take;
                 if (!exchange.keep_alive) {
@@ -369,8 +421,11 @@ const WRITE_WAIT_MS: i32 = 10_000;
                     break;
                 }
             }
+            st.len = $mod.retainTail(&st.buf, st.len, consumed);
+            if (alive and st.len == st.buf.len) alive = false;
 
             if (!alive) {
+                $mod.releaseConn(fd);
                 $mod.posix.close(fd);
                 continue;
             }
@@ -410,22 +465,20 @@ const WRITE_WAIT_MS: i32 = 10_000;
 
         // Keep-alive: serve requests off the same connection until the peer
         // stops sending or an arm sets keep_alive false through `hang-up`.
+        var used: usize = 0;
         while (true) {
-            const n = $mod.recv(conn, &$mod.uk_read_buf, $mod.uk_read_buf.len, 0);
-            if (n <= 0) break;
-
-            // Answer EVERY request in the buffer — see requestLen. A unikernel
+            // Read onto the END of what is already held, so a request split
+            // across two reads is finished rather than restarted. A unikernel
             // faces the same browser as a hosted build does.
-            const got: usize = @intCast(n);
+            const n = $mod.recv(conn, @ptrCast(&$mod.uk_read_buf[used]), $mod.uk_read_buf.len - used, 0);
+            if (n <= 0) break;
+            used += @intCast(n);
+
+            // Answer every COMPLETE request — see requestLen and retainTail.
             var consumed: usize = 0;
             var alive = true;
-            while (consumed < got) {
-                const take = $mod.requestLen($mod.uk_read_buf[consumed..got]) orelse {
-                    var partial = $mod.Exchange{ .fd = conn, .raw = $mod.uk_read_buf[consumed..got] };
-                    arrived(&partial);
-                    alive = partial.keep_alive;
-                    break;
-                };
+            while (consumed < used) {
+                const take = $mod.requestLen($mod.uk_read_buf[consumed..used]) orelse break;
                 var x = $mod.Exchange{ .fd = conn, .raw = $mod.uk_read_buf[consumed .. consumed + take] };
                 arrived(&x);
                 consumed += take;
@@ -434,6 +487,8 @@ const WRITE_WAIT_MS: i32 = 10_000;
                     break;
                 }
             }
+            used = $mod.retainTail(&$mod.uk_read_buf, used, consumed);
+            if (alive and used == $mod.uk_read_buf.len) alive = false;
             if (!alive) break;
         }
 
