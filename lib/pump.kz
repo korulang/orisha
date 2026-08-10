@@ -40,6 +40,48 @@ pub const Exchange = struct {
 const READ_BUFFER = 4096;
 const MAX_EVENTS = 64;
 
+// One read is not one request.
+//
+// A browser opening a page fires its asset requests back to back, and TCP is
+// free to hand all of them over in a single read. Answering only the first —
+// which is what all three pumps did until 2026-08-10 — does not drop those
+// requests visibly. The connection stays open and the client keeps waiting, so
+// when a later response finally arrives the client matches it to the OLDEST
+// request it has outstanding. The bytes are then read as the wrong resource:
+// Firefox reports a JavaScript module "blocked because of a disallowed MIME
+// type (text/html)", because it is being handed the HTML document's response.
+//
+// curl cannot see this. It waits for each response before sending the next, so
+// every request is alone in its packet and the bug never fires. Only a client
+// that pipelines reaches it — which is every browser.
+//
+// This function answers the one question the three pumps share: where does the
+// first request in this buffer end? The loops that use it are mechanical; this
+// is the part that must not be written three times.
+fn requestLen(buf: []const u8) ?usize {
+    const head_end = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse return null;
+    var total = head_end + 4;
+    if (contentLength(buf[0..total])) |body_len| total += body_len;
+    if (total > buf.len) return null; // body still in flight
+    return total;
+}
+
+fn contentLength(head: []const u8) ?usize {
+    var line_start: usize = 0;
+    while (line_start < head.len) {
+        const line_end = std.mem.indexOfPos(u8, head, line_start, "\r\n") orelse break;
+        const line = head[line_start..line_end];
+        if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
+            // Header names are case-insensitive — RFC 9110.
+            if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " \t"), "content-length")) {
+                return std.fmt.parseInt(usize, std.mem.trim(u8, line[colon + 1 ..], " \t"), 10) catch null;
+            }
+        }
+        line_start = line_end + 2;
+    }
+    return null;
+}
+
 // ---------------------------------------------------------------------------
 // The unikernel's sockets, as plain C.
 // ---------------------------------------------------------------------------
@@ -208,10 +250,30 @@ const WRITE_WAIT_MS: i32 = 10_000;
                 continue;
             }
 
-            var exchange = $mod.Exchange{ .fd = fd, .raw = buffer[0..bytes_read] };
-            arrived(&exchange);
+            // Answer EVERY request in the buffer, not just the first.
+            var consumed: usize = 0;
+            var alive = true;
+            while (consumed < bytes_read) {
+                const take = $mod.requestLen(buffer[consumed..bytes_read]) orelse {
+                    // No complete request left. A request split across reads is
+                    // a separate, still-open limitation — this pump keeps no
+                    // per-connection buffer — and handing the partial text to
+                    // the handler is what it has always done. Unchanged here.
+                    var partial = $mod.Exchange{ .fd = fd, .raw = buffer[consumed..bytes_read] };
+                    arrived(&partial);
+                    alive = partial.keep_alive;
+                    break;
+                };
+                var exchange = $mod.Exchange{ .fd = fd, .raw = buffer[consumed .. consumed + take] };
+                arrived(&exchange);
+                consumed += take;
+                if (!exchange.keep_alive) {
+                    alive = false;
+                    break;
+                }
+            }
 
-            if (!exchange.keep_alive) {
+            if (!alive) {
                 $mod.posix.close(fd);
                 continue;
             }
@@ -289,10 +351,26 @@ const WRITE_WAIT_MS: i32 = 10_000;
                 continue;
             }
 
-            var exchange = $mod.Exchange{ .fd = fd, .raw = buffer[0..bytes_read] };
-            arrived(&exchange);
+            // Answer EVERY request in the buffer — see requestLen.
+            var consumed: usize = 0;
+            var alive = true;
+            while (consumed < bytes_read) {
+                const take = $mod.requestLen(buffer[consumed..bytes_read]) orelse {
+                    var partial = $mod.Exchange{ .fd = fd, .raw = buffer[consumed..bytes_read] };
+                    arrived(&partial);
+                    alive = partial.keep_alive;
+                    break;
+                };
+                var exchange = $mod.Exchange{ .fd = fd, .raw = buffer[consumed .. consumed + take] };
+                arrived(&exchange);
+                consumed += take;
+                if (!exchange.keep_alive) {
+                    alive = false;
+                    break;
+                }
+            }
 
-            if (!exchange.keep_alive) {
+            if (!alive) {
                 $mod.posix.close(fd);
                 continue;
             }
@@ -335,9 +413,28 @@ const WRITE_WAIT_MS: i32 = 10_000;
         while (true) {
             const n = $mod.recv(conn, &$mod.uk_read_buf, $mod.uk_read_buf.len, 0);
             if (n <= 0) break;
-            var x = $mod.Exchange{ .fd = conn, .raw = $mod.uk_read_buf[0..@intCast(n)] };
-            arrived(&x);
-            if (!x.keep_alive) break;
+
+            // Answer EVERY request in the buffer — see requestLen. A unikernel
+            // faces the same browser as a hosted build does.
+            const got: usize = @intCast(n);
+            var consumed: usize = 0;
+            var alive = true;
+            while (consumed < got) {
+                const take = $mod.requestLen($mod.uk_read_buf[consumed..got]) orelse {
+                    var partial = $mod.Exchange{ .fd = conn, .raw = $mod.uk_read_buf[consumed..got] };
+                    arrived(&partial);
+                    alive = partial.keep_alive;
+                    break;
+                };
+                var x = $mod.Exchange{ .fd = conn, .raw = $mod.uk_read_buf[consumed .. consumed + take] };
+                arrived(&x);
+                consumed += take;
+                if (!x.keep_alive) {
+                    alive = false;
+                    break;
+                }
+            }
+            if (!alive) break;
         }
 
         _ = $mod.close(conn);
