@@ -285,7 +285,20 @@ fn ukAdmit(incoming: c_int) void {
 // Shared helpers — identical on every POSIX platform, written once.
 // ---------------------------------------------------------------------------
 
-const O_NONBLOCK: u32 = 0x0004;
+// Ask the TARGET what non-blocking means; do not assert it.
+//
+// This was `0x0004` — the macOS value — hardcoded, and the Linux pump used it
+// too. On Linux the bit is `0x800`, so the flag never took: the socket stayed
+// blocking, and an accept loop whose only exit is "would block" never exits.
+// The Linux build therefore accepted connections forever and read none of them.
+// It printed "Orisha listening", accepted the first connection, and went silent
+// — a server that looks up and answers nothing.
+//
+// A number copied from one platform's headers is a fact about THAT platform. The
+// pump seam exists precisely so each platform states its own; this one line went
+// around it, which is why the bug survived until the program was first run on
+// Linux (2026-08-10, in a container).
+const O_NONBLOCK: u32 = @as(u32, @bitCast(posix.O{ .NONBLOCK = true }));
 
 fn openListener(port: u16) ?std.net.Server {
     const address = std.net.Address.parseIp("0.0.0.0", port) catch return null;
