@@ -42,14 +42,14 @@
 // comes up and answers with Orisha's built-in 404 instead. Measured the same
 // day on both targets; it is a real defect and it is not this example's.
 
-~import orisha
+import orisha
 
 // The handler is implemented with a proc. `response { … }` used to be the
 // spelling the library's docs showed; it was removed from the language on
 // 2026-08-09 (koru 050b3549) because a single outcome does not get a name, so
 // there is nothing to prefer this over any more — a handler returns the record.
-~orisha:handler -> { status: 200, body: "Hello from Orisha, inside a unikernel.\n", content_type: "text/plain" }
+orisha:handler -> { status: 200, body: "Hello from Orisha, inside a unikernel.\n", content_type: "text/plain" }
 
-~orisha:serve(port: 8080)
+orisha:serve(port: 8080)
 | shutdown _ |> _
 | failed _ |> _

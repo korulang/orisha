@@ -11,12 +11,12 @@
 //       -O ReleaseSmall -fno-stack-protector -femit-bin=libkoruapp.a
 //   UK_CFLAGS="-std=gnu17" kraft build --arch x86_64 --plat qemu --no-prompt
 
-~import orisha
+import orisha
 
-~orisha:static(name: "site", root: "../../../korulang_org/build", fallback: "200.html")
+orisha:static(name: "site", root: "../../../korulang_org/build", fallback: "200.html")
 
-~orisha:handler = orisha:static-router(name: "site")
+orisha:handler = orisha:static-router(name: "site")
 
-~orisha:serve(port: 8080)
+orisha:serve(port: 8080)
 | shutdown _ |> _
 | failed _ |> _

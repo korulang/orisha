@@ -5,29 +5,29 @@
 //
 // Run: koruc main.kz && ./a.out
 
-~import orisha
-~import std/runtime
-~import std/io
-~import std/fmt
+import orisha
+import std/runtime
+import std/io
+import std/fmt
 
 // ============================================================================
 // API EVENTS - These are compiled Zig procs, NOT interpreted
 // ============================================================================
 
-~pub tor greet { name: string } -> string
+pub tor greet { name: string } -> string
 
-~greet = std/fmt:ln("Hello, {{name:s}}!")
+greet = std/fmt:ln("Hello, {{name:s}}!")
 | line l -> l.text
 
-~pub tor add { a: i64, b: i64 } -> i64
+pub tor add { a: i64, b: i64 } -> i64
 
-~add -> { a + b }
+add -> { a + b }
 
 // ============================================================================
 // REGISTER SCOPE - maps event names to compiled implementations with costs
 // ============================================================================
 
-~std/runtime:register(scope: "api") {
+std/runtime:register(scope: "api") {
     greet(5)   // 5 budget per call
     add(2)     // 2 budget per call
 }
@@ -36,7 +36,7 @@
 // SERVER
 // ============================================================================
 
-~orisha:handler = orisha:router(req)
+orisha:handler = orisha:router(req)
 | [GET /] |> response { status: 200, body: "Orisha Interpreter Server - POST Koru source to /eval", content_type: "text/plain" }
 | [POST /eval] _ |> std/runtime:run(source: req.body orelse "", scope: "api", budget: 1000)
     | result r |> std/fmt:ln("{\"result\":{{ r.value.toJsonBuf():s }},\"budget_used\":{{ r.used }}}")
@@ -57,6 +57,6 @@
         | line l |> response { status: 500, body: l.text, content_type: "application/json" }
 | [*] |> response { status: 404, body: "{\"error\":\"not_found\"}", content_type: "application/json" }
 
-~orisha:serve(port: 3000)
+orisha:serve(port: 3000)
 | shutdown _ |> _
 | failed f |> std/io:print.ln(f)

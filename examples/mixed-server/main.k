@@ -15,16 +15,16 @@
 //   curl http://localhost:3000/api/info      → {"server":"orisha","version":"0.1.0"}
 //   curl http://localhost:3000/unknown/path  → SPA fallback (index.html)
 
-~import orisha
-~import std/io
+import orisha
+import std/io
 
-~orisha:static(name: "site", root: "public", fallback: "index.html")
+orisha:static(name: "site", root: "public", fallback: "index.html")
 
-~orisha:handler = orisha:router(req)
+orisha:handler = orisha:router(req)
 ! [GET /api/health] -> { status: 200, body: "{\"status\":\"ok\"}", content_type: "application/json" }
 ! [GET /api/info] -> { status: 200, body: "{\"server\":\"orisha\",\"version\":\"0.1.0\"}", content_type: "application/json" }
 ! [*] |> orisha:static-router(name: "site")
 
-~orisha:serve(port: 3000)
+orisha:serve(port: 3000)
 | shutdown s |> std/io:print.ln(s)
 | failed f |> std/io:print.ln(f)

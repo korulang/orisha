@@ -1,28 +1,28 @@
 // Simple Orisha server test
 // Tests the new Koru-flow-based server architecture
 
-~import orisha
-~import std/io
-~import std/build
-~import koru/docker
+import orisha
+import std/io
+import std/build
+import koru/docker
 
 // Implement the handler — bare-return produce (`-> { record }`), the same
 // spelling as the lib's own default impl. The old `= response { ... }` form
 // named a branch the handler no longer declares (it moved to `-> record`).
-~orisha:handler -> { status: 200, body: "Hello from Koru!", content_type: "text/plain" }
+orisha:handler -> { status: 200, body: "Hello from Koru!", content_type: "text/plain" }
 
 // Start the server
-~orisha:serve(port: 3001)
+orisha:serve(port: 3001)
 | shutdown s |> std/io:print.ln(s)
 | failed f |> std/io:print.ln(f)
 
 // Cross-compilation: koruc simple_server.kz --build=linux
-~[build(linux)]std/build:config {
+[build(linux)]std/build:config {
     "target": "x86_64-linux-musl"
 }
 
 // Container image: koruc simple_server.kz --build=linux docker build
-~[build(linux)]koru/docker:image(tag: "koru-server:latest") {
+[build(linux)]koru/docker:image(tag: "koru-server:latest") {
     FROM scratch
     COPY a.out /server
     EXPOSE 3001

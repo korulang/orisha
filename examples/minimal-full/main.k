@@ -12,26 +12,26 @@
 //
 // Build & run:  koruc main.kz && ./a.out
 
-~import orisha
-~import std/runtime
-~import std/fmt
-~import std/io
+import orisha
+import std/runtime
+import std/fmt
+import std/io
 
 // One compiled event the interpreter is allowed to call, budgeted.
-~pub tor greet { name: string } -> string
+pub tor greet { name: string } -> string
 
-~greet = std/fmt:ln("Hello, {{name:s}}!")
+greet = std/fmt:ln("Hello, {{name:s}}!")
 | line l -> l.text
 
-~std/runtime:register(scope: "api") {
+std/runtime:register(scope: "api") {
     greet(5)
 }
 
 // Static files embedded at compile time.
-~orisha:static(name: "site", root: "public", fallback: "index.html")
+orisha:static(name: "site", root: "public", fallback: "index.html")
 
 // One handler, three modes + a nested router.
-~orisha:handler = orisha:router(req)
+orisha:handler = orisha:router(req)
 ! [GET /api/health] |> response { status: 200, body: "{\"status\":\"ok\"}", content_type: "application/json" }
 ! [POST /api/eval] _ |> std/runtime:run(source: req.body orelse "", scope: "api", budget: 1000)
     | result r |> std/fmt:ln("{\"result\":{{ r.value.toJsonBuf():s }}}")
@@ -48,6 +48,6 @@
     ! [*] |> response { status: 404, body: "{\"error\":\"admin_not_found\"}", content_type: "application/json" }
 ! [*] |> orisha:static-router(name: "site")
 
-~orisha:serve(port: 3000)
+orisha:serve(port: 3000)
 | shutdown s |> std/io:print.ln(s)
 | failed f |> std/io:print.ln(f)

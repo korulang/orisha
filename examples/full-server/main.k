@@ -17,29 +17,29 @@
 //                                                            → {"result":...}
 //   curl http://localhost:3000/any/path                      → SPA fallback
 
-~import orisha
-~import std/runtime
-~import std/io
-~import std/fmt
+import orisha
+import std/runtime
+import std/io
+import std/fmt
 
 // ============================================================================
 // COMPILED EVENTS — native Zig speed, called by the interpreter
 // ============================================================================
 
-~pub tor greet { name: string } -> string
+pub tor greet { name: string } -> string
 
-~greet = std/fmt:ln("Hello, {{name:s}}!")
+greet = std/fmt:ln("Hello, {{name:s}}!")
 | line l -> l.text
 
-~pub tor add { a: i64, b: i64 } -> i64
+pub tor add { a: i64, b: i64 } -> i64
 
-~add -> { a + b }
+add -> { a + b }
 
 // ============================================================================
 // INTERPRETER SCOPE — sandbox: only greet + add, budgeted
 // ============================================================================
 
-~std/runtime:register(scope: "api") {
+std/runtime:register(scope: "api") {
     greet(5)
     add(2)
 }
@@ -48,33 +48,33 @@
 // STATIC FILES — embedded at compile time, gzipped, ETag'd
 // ============================================================================
 
-~orisha:static(name: "site", root: "public", fallback: "index.html")
+orisha:static(name: "site", root: "public", fallback: "index.html")
 
 // ============================================================================
 // HANDLER — tree-structured routing, all three modes in one
 // ============================================================================
 
-~orisha:handler = orisha:router(req)
-| [GET /api/health] |> response { status: 200, body: "{\"status\":\"ok\"}", content_type: "application/json" }
-| [POST /api/eval] _ |> std/runtime:run(source: req.body orelse "", scope: "api", budget: 1000)
+orisha:handler = orisha:router(req)
+! [GET /api/health] -> { status: 200, body: "{\"status\":\"ok\"}", content_type: "application/json" }
+! [POST /api/eval] _ |> std/runtime:run(source: req.body orelse "", scope: "api", budget: 1000)
     | result r |> std/fmt:ln("{\"result\":{{r.value.toJsonBuf():s}},\"budget_used\":{{r.used}}}")
-        | line l |> response { status: 200, body: l.text, content_type: "application/json" }
+        | line l -> { status: 200, body: l.text, content_type: "application/json" }
     | exhausted e |> std/fmt:ln("{\"error\":\"budget_exhausted\",\"used\":{{e.used}},\"last_event\":\"{{e.last_event:s}}\"}")
-        | line l |> response { status: 429, body: l.text, content_type: "application/json" }
+        | line l -> { status: 429, body: l.text, content_type: "application/json" }
     | parse-error e |> std/fmt:ln("{\"error\":\"parse_error\",\"message\":\"{{e.message:s}}\"}")
-        | line l |> response { status: 400, body: l.text, content_type: "application/json" }
-    | validation-error e |> std/fmt:ln("{\"error\":\"validation_error\",\"message\":\"{{e.message:s}}\"}")
-        | line l |> response { status: 400, body: l.text, content_type: "application/json" }
+        | line l -> { status: 400, body: l.text, content_type: "application/json" }
+    | validation-error e |> std/fmt:ln("{\"error\":\"validation_error\",\"message\":\"{{e:s}}\"}")
+        | line l -> { status: 400, body: l.text, content_type: "application/json" }
     | shape-error e |> std/fmt:ln("{\"error\":\"shape_error\",\"branch\":\"{{e.branch:s}}\"}")
-        | line l |> response { status: 400, body: l.text, content_type: "application/json" }
-    | event-denied e |> std/fmt:ln("{\"error\":\"event_denied\",\"name\":\"{{e.name:s}}\"}")
-        | line l |> response { status: 403, body: l.text, content_type: "application/json" }
+        | line l -> { status: 400, body: l.text, content_type: "application/json" }
+    | event-denied e |> std/fmt:ln("{\"error\":\"event_denied\",\"name\":\"{{e:s}}\"}")
+        | line l -> { status: 403, body: l.text, content_type: "application/json" }
     | dispatch-error e |> std/fmt:ln("{\"error\":\"dispatch_error\",\"event\":\"{{e.event_name:s}}\"}")
-        | line l |> response { status: 500, body: l.text, content_type: "application/json" }
-    | scope-not-found e |> std/fmt:ln("{\"error\":\"scope_not_found\",\"scope\":\"{{e.scope_name:s}}\"}")
-        | line l |> response { status: 500, body: l.text, content_type: "application/json" }
-| [*] |> orisha:static_router(name: "site")
+        | line l -> { status: 500, body: l.text, content_type: "application/json" }
+    | scope-not-found e |> std/fmt:ln("{\"error\":\"scope_not_found\",\"scope\":\"{{e:s}}\"}")
+        | line l -> { status: 500, body: l.text, content_type: "application/json" }
+! [*] |> orisha:static-router(name: "site")
 
-~orisha:serve(port: 3000)
-| shutdown s |> std/io:print.ln(s.reason)
-| failed f |> std/io:print.ln(f.msg)
+orisha:serve(port: 3000)
+| shutdown s |> std/io:print.ln(s)
+| failed f |> std/io:print.ln(f)
