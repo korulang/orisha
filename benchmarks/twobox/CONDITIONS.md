@@ -134,3 +134,29 @@ pressure; this experiment had none.
 `results/<timestamp>/` holds the report, the raw per-round lines, and the machine
 provenance for every run — including the runs where most contestants were
 excluded by our own misconfiguration, which are kept rather than deleted.
+
+## Open: the tail
+
+Orisha has the highest median throughput in the field and the worst tail in it.
+On the droplet, p99 came in at 21, 68 and 113 ms across three rounds while p50
+stayed at 537 µs. H2O holds 3–7 ms and nginx 2.7–6.3 ms on the same workload, and
+our own io_uring pump holds 2.2–2.5 ms on the same dispatch — so it is the
+kqueue/epoll worker path, not the route lookup.
+
+Two obvious explanations are ruled out by measurement rather than argument.
+Locally, at a range of connection counts:
+
+    c=20    p50 93 µs     p99 22.42 ms
+    c=50    p50 166 µs    p99 31.13 ms
+    c=200   p50 595 µs    p99 36.53 ms
+    c=500   p50 1.45 ms   p99 54.06 ms
+
+A 240x median-to-tail ratio at **twenty** connections is not head-of-line
+blocking behind a slow client, and it is not the single accept thread
+serialising setup — both of those would scale hard with concurrency, and this
+barely does. The tail is largely fixed and present at any load, which points at
+something periodic rather than something contended.
+
+Diagnosing it needs timing inside the server rather than more benchmark rounds,
+and it is worth doing: a server with a 113 ms p99 is worse than one 40% slower
+with a 4 ms p99 for anything a person is waiting on.
