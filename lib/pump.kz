@@ -385,6 +385,28 @@ fn writeAll(fd: posix.fd_t, data: []const u8) bool {
 const WRITE_WAIT_MS: i32 = 10_000;
 
 // ---------------------------------------------------------------------------
+// How many loops a hosted pump runs.
+// ---------------------------------------------------------------------------
+// One readiness loop saturates one core and no more, so a single-threaded pump
+// on a twelve-core machine is measured against eleven idle ones. This is the
+// same choice nginx spells `worker_processes auto`, and comparing against nginx
+// with that set while running one loop is not a comparison — it is a handicap
+// nobody wrote down.
+//
+// Each worker owns a private readiness instance and the connections handed to
+// it. Nothing is shared: a descriptor belongs to exactly one worker for its
+// whole life, so the connection table is only ever touched at an index one
+// thread owns. The one genuinely shared thing in a request's path — the buffer
+// the response header is built into — is `threadlocal` in the companion, and
+// was the ONLY thing that had to change above this file.
+const MAX_WORKERS = 16;
+
+fn workerCount() usize {
+    const n = std.Thread.getCpuCount() catch return 1;
+    return @min(@max(n, 1), MAX_WORKERS);
+}
+
+// ---------------------------------------------------------------------------
 // FILL — the read seam. One variant per platform, mirroring `reply`.
 // ---------------------------------------------------------------------------
 
@@ -426,68 +448,86 @@ const WRITE_WAIT_MS: i32 = 10_000;
 
 ~proc run|zig {
     var server = $mod.openListener(port) orelse return .{ .failed = "Failed to listen" };
-    const listen_fd = server.stream.handle;
-    $mod.markNonBlocking(listen_fd);
 
-    const kq = $mod.posix.kqueue() catch return .{ .failed = "Failed to create kqueue" };
+    const n_workers = $mod.workerCount();
 
-    var changes: [1]$mod.c.Kevent = undefined;
-    var no_changes: [0]$mod.c.Kevent = undefined;
-    var events: [$mod.MAX_EVENTS]$mod.c.Kevent = undefined;
+    // The listener is NOT in anybody's readiness set. This thread does nothing
+    // but accept, and blocks while it waits — which is why the listener stays
+    // blocking where the connections do not. Arming it inside a worker's kqueue
+    // would make that one worker answer every new connection as well as its own
+    // traffic.
+    var kqs: [$mod.MAX_WORKERS]i32 = undefined;
 
-    // Arm the listener itself, so accept and read wait in one place.
-    changes[0] = .{
-        .ident = @intCast(listen_fd),
-        .filter = $mod.c.EVFILT.READ,
-        .flags = $mod.c.EV.ADD,
-        .fflags = 0,
-        .data = 0,
-        .udata = undefined,
-    };
-    _ = $mod.c.kevent(kq, &changes, 1, &no_changes, 0, null);
+    // The per-connection half of the loop, which is the whole loop now that
+    // accepting has moved out. One runs per worker, each on its own kqueue,
+    // each seeing only the descriptors handed to it.
+    const Worker = struct {
+        fn loop(kq: i32) void {
+            var changes: [1]$mod.c.Kevent = undefined;
+            var no_changes: [0]$mod.c.Kevent = undefined;
+            var events: [$mod.MAX_EVENTS]$mod.c.Kevent = undefined;
 
-    std.debug.print("Orisha listening on http://0.0.0.0:{}\n", .{port});
-    std.debug.print("Pump: kqueue, keep-alive, TCP_NODELAY\n", .{});
+            while (true) {
+                const n = $mod.c.kevent(kq, &no_changes, 0, &events, $mod.MAX_EVENTS, null);
+                if (n <= 0) continue;
 
-    while (true) {
-        const n = $mod.c.kevent(kq, &no_changes, 0, &events, $mod.MAX_EVENTS, null);
-        if (n <= 0) continue;
+                for (events[0..@intCast(n)]) |event| {
+                    const fd: $mod.posix.fd_t = @intCast(event.ident);
 
-        for (events[0..@intCast(n)]) |event| {
-            const fd: $mod.posix.fd_t = @intCast(event.ident);
-
-            if (fd == listen_fd) {
-                // One readiness notification can cover several pending
-                // connections; drain until the backlog is empty.
-                while (true) {
-                    const conn = server.accept() catch break;
-                    const client_fd = conn.stream.handle;
-                    $mod.disableNagle(client_fd);
-                    $mod.markNonBlocking(client_fd);
-
-                    changes[0] = .{
-                        .ident = @intCast(client_fd),
-                        .filter = $mod.c.EVFILT.READ,
-                        .flags = $mod.c.EV.ADD | $mod.c.EV.ONESHOT,
-                        .fflags = 0,
-                        .data = 0,
-                        .udata = undefined,
+                    const st = $mod.connState(fd) orelse {
+                        $mod.posix.close(fd);
+                        continue;
                     };
-                    _ = $mod.c.kevent(kq, &changes, 1, &no_changes, 0, null);
-                }
-                continue;
-            }
 
-            const st = $mod.connState(fd) orelse {
-                $mod.posix.close(fd);
-                continue;
-            };
+                    switch ($mod.fill_event.handler(.{ .st = st })) {
+                        .more => {},
+                        // Nothing new to frame, but the connection is alive.
+                        // Re-arm and wait rather than closing it.
+                        .idle => {
+                            changes[0] = .{
+                                .ident = @intCast(fd),
+                                .filter = $mod.c.EVFILT.READ,
+                                .flags = $mod.c.EV.ADD | $mod.c.EV.ONESHOT,
+                                .fflags = 0,
+                                .data = 0,
+                                .udata = undefined,
+                            };
+                            _ = $mod.c.kevent(kq, &changes, 1, &no_changes, 0, null);
+                            continue;
+                        },
+                        .gone => {
+                            $mod.releaseConn(fd);
+                            $mod.posix.close(fd);
+                            continue;
+                        },
+                    }
 
-            switch ($mod.fill_event.handler(.{ .st = st })) {
-                .more => {},
-                // Nothing new to frame, but the connection is alive. Re-arm and
-                // wait rather than closing it.
-                .idle => {
+                    // Answer every COMPLETE request; keep any unfinished tail
+                    // for the next read rather than parsing it as a fresh one.
+                    var consumed: usize = 0;
+                    var alive = true;
+                    while (consumed < st.len) {
+                        const take = $mod.requestLen(st.buf[consumed..st.len]) orelse break;
+                        var exchange = $mod.Exchange{ .fd = fd, .raw = st.buf[consumed .. consumed + take] };
+                        arrived(&exchange);
+                        consumed += take;
+                        if (!exchange.keep_alive) {
+                            alive = false;
+                            break;
+                        }
+                    }
+                    st.len = $mod.retainTail(&st.buf, st.len, consumed);
+
+                    // Headers that never end are not a request this server can answer.
+                    if (alive and st.len == st.buf.len) alive = false;
+
+                    if (!alive) {
+                        $mod.releaseConn(fd);
+                        $mod.posix.close(fd);
+                        continue;
+                    }
+
+                    // ONESHOT disarms on delivery — re-arm for the next request.
                     changes[0] = .{
                         .ident = @intCast(fd),
                         .filter = $mod.c.EVFILT.READ,
@@ -497,51 +537,42 @@ const WRITE_WAIT_MS: i32 = 10_000;
                         .udata = undefined,
                     };
                     _ = $mod.c.kevent(kq, &changes, 1, &no_changes, 0, null);
-                    continue;
-                },
-                .gone => {
-                    $mod.releaseConn(fd);
-                    $mod.posix.close(fd);
-                    continue;
-                },
-            }
-
-            // Answer every COMPLETE request; keep any unfinished tail for the
-            // next read rather than parsing it as a fresh request.
-            var consumed: usize = 0;
-            var alive = true;
-            while (consumed < st.len) {
-                const take = $mod.requestLen(st.buf[consumed..st.len]) orelse break;
-                var exchange = $mod.Exchange{ .fd = fd, .raw = st.buf[consumed .. consumed + take] };
-                arrived(&exchange);
-                consumed += take;
-                if (!exchange.keep_alive) {
-                    alive = false;
-                    break;
                 }
             }
-            st.len = $mod.retainTail(&st.buf, st.len, consumed);
-
-            // Headers that never end are not a request this server can answer.
-            if (alive and st.len == st.buf.len) alive = false;
-
-            if (!alive) {
-                $mod.releaseConn(fd);
-                $mod.posix.close(fd);
-                continue;
-            }
-
-            // ONESHOT disarms on delivery — re-arm for the next request.
-            changes[0] = .{
-                .ident = @intCast(fd),
-                .filter = $mod.c.EVFILT.READ,
-                .flags = $mod.c.EV.ADD | $mod.c.EV.ONESHOT,
-                .fflags = 0,
-                .data = 0,
-                .udata = undefined,
-            };
-            _ = $mod.c.kevent(kq, &changes, 1, &no_changes, 0, null);
         }
+    };
+
+    for (0..n_workers) |i| {
+        kqs[i] = $mod.posix.kqueue() catch return .{ .failed = "Failed to create kqueue" };
+        _ = std.Thread.spawn(.{}, Worker.loop, .{kqs[i]}) catch
+            return .{ .failed = "Failed to spawn worker" };
+    }
+
+    std.debug.print("Orisha listening on http://0.0.0.0:{}\n", .{port});
+    std.debug.print("Pump: kqueue, {} workers, keep-alive, TCP_NODELAY\n", .{n_workers});
+
+    // Hand each new connection to the next worker in turn. A descriptor belongs
+    // to that worker for the rest of its life, which is what makes the shared
+    // connection table safe without a lock: no index is ever touched twice.
+    var next: usize = 0;
+    var arm: [1]$mod.c.Kevent = undefined;
+    var none: [0]$mod.c.Kevent = undefined;
+    while (true) {
+        const conn = server.accept() catch continue;
+        const client_fd = conn.stream.handle;
+        $mod.disableNagle(client_fd);
+        $mod.markNonBlocking(client_fd);
+
+        arm[0] = .{
+            .ident = @intCast(client_fd),
+            .filter = $mod.c.EVFILT.READ,
+            .flags = $mod.c.EV.ADD | $mod.c.EV.ONESHOT,
+            .fflags = 0,
+            .data = 0,
+            .udata = undefined,
+        };
+        _ = $mod.c.kevent(kqs[next], &arm, 1, &none, 0, null);
+        next = (next + 1) % n_workers;
     }
 
     return .{ .stopped = "Server stopped" };
@@ -555,98 +586,111 @@ const WRITE_WAIT_MS: i32 = 10_000;
     const linux = std.os.linux;
 
     var server = $mod.openListener(port) orelse return .{ .failed = "Failed to listen" };
-    const listen_fd = server.stream.handle;
-    $mod.markNonBlocking(listen_fd);
 
-    const epfd_rc = linux.epoll_create1(0);
-    const epfd: i32 = @bitCast(@as(u32, @truncate(epfd_rc)));
-    if (epfd < 0) return .{ .failed = "Failed to create epoll" };
+    const n_workers = $mod.workerCount();
 
-    var listen_event = linux.epoll_event{
-        .events = linux.EPOLL.IN,
-        .data = .{ .fd = listen_fd },
-    };
-    _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_ADD, listen_fd, &listen_event);
+    // The listener is NOT in anybody's readiness set. This thread does nothing
+    // but accept, and it blocks while it waits — which is why the listener is
+    // left blocking where the connections are not. Multiplexing the listener
+    // into a worker's epoll would make one worker answer every new connection
+    // as well as its own traffic.
+    var epfds: [$mod.MAX_WORKERS]i32 = undefined;
 
-    var events: [$mod.MAX_EVENTS]linux.epoll_event = undefined;
+    // The per-connection half of the loop, which is the whole loop now that
+    // accepting has moved out. One of these runs per worker, each on its own
+    // epoll instance, each seeing only the descriptors handed to it.
+    const Worker = struct {
+        fn loop(epfd: i32) void {
+            var events: [$mod.MAX_EVENTS]linux.epoll_event = undefined;
+            while (true) {
+                const n_rc = linux.epoll_wait(epfd, &events, $mod.MAX_EVENTS, -1);
+                const n: i32 = @bitCast(@as(u32, @truncate(n_rc)));
+                if (n <= 0) continue;
 
-    std.debug.print("Orisha listening on http://0.0.0.0:{}\n", .{port});
-    std.debug.print("Pump: epoll, keep-alive, TCP_NODELAY\n", .{});
+                for (events[0..@intCast(n)]) |event| {
+                    const fd: $mod.posix.fd_t = event.data.fd;
 
-    while (true) {
-        const n_rc = linux.epoll_wait(epfd, &events, $mod.MAX_EVENTS, -1);
-        const n: i32 = @bitCast(@as(u32, @truncate(n_rc)));
-        if (n <= 0) continue;
-
-        for (events[0..@intCast(n)]) |event| {
-            const fd: $mod.posix.fd_t = event.data.fd;
-
-            if (fd == listen_fd) {
-                while (true) {
-                    const conn = server.accept() catch break;
-                    const client_fd = conn.stream.handle;
-                    $mod.disableNagle(client_fd);
-                    $mod.markNonBlocking(client_fd);
-
-                    var client_event = linux.epoll_event{
-                        .events = linux.EPOLL.IN | linux.EPOLL.ONESHOT,
-                        .data = .{ .fd = client_fd },
+                    const st = $mod.connState(fd) orelse {
+                        $mod.posix.close(fd);
+                        continue;
                     };
-                    _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_ADD, client_fd, &client_event);
-                }
-                continue;
-            }
 
-            const st = $mod.connState(fd) orelse {
-                $mod.posix.close(fd);
-                continue;
-            };
+                    switch ($mod.fill_event.handler(.{ .st = st })) {
+                        .more => {},
+                        .idle => {
+                            var wait = linux.epoll_event{
+                                .events = linux.EPOLL.IN | linux.EPOLL.ONESHOT,
+                                .data = .{ .fd = fd },
+                            };
+                            _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &wait);
+                            continue;
+                        },
+                        .gone => {
+                            $mod.releaseConn(fd);
+                            $mod.posix.close(fd);
+                            continue;
+                        },
+                    }
 
-            switch ($mod.fill_event.handler(.{ .st = st })) {
-                .more => {},
-                .idle => {
-                    var wait = linux.epoll_event{
+                    // Same shape as the kqueue pump — see requestLen and retainTail.
+                    var consumed: usize = 0;
+                    var alive = true;
+                    while (consumed < st.len) {
+                        const take = $mod.requestLen(st.buf[consumed..st.len]) orelse break;
+                        var exchange = $mod.Exchange{ .fd = fd, .raw = st.buf[consumed .. consumed + take] };
+                        arrived(&exchange);
+                        consumed += take;
+                        if (!exchange.keep_alive) {
+                            alive = false;
+                            break;
+                        }
+                    }
+                    st.len = $mod.retainTail(&st.buf, st.len, consumed);
+                    if (alive and st.len == st.buf.len) alive = false;
+
+                    if (!alive) {
+                        $mod.releaseConn(fd);
+                        $mod.posix.close(fd);
+                        continue;
+                    }
+
+                    var rearm = linux.epoll_event{
                         .events = linux.EPOLL.IN | linux.EPOLL.ONESHOT,
                         .data = .{ .fd = fd },
                     };
-                    _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &wait);
-                    continue;
-                },
-                .gone => {
-                    $mod.releaseConn(fd);
-                    $mod.posix.close(fd);
-                    continue;
-                },
-            }
-
-            // Same shape as the kqueue pump — see requestLen and retainTail.
-            var consumed: usize = 0;
-            var alive = true;
-            while (consumed < st.len) {
-                const take = $mod.requestLen(st.buf[consumed..st.len]) orelse break;
-                var exchange = $mod.Exchange{ .fd = fd, .raw = st.buf[consumed .. consumed + take] };
-                arrived(&exchange);
-                consumed += take;
-                if (!exchange.keep_alive) {
-                    alive = false;
-                    break;
+                    _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &rearm);
                 }
             }
-            st.len = $mod.retainTail(&st.buf, st.len, consumed);
-            if (alive and st.len == st.buf.len) alive = false;
-
-            if (!alive) {
-                $mod.releaseConn(fd);
-                $mod.posix.close(fd);
-                continue;
-            }
-
-            var rearm = linux.epoll_event{
-                .events = linux.EPOLL.IN | linux.EPOLL.ONESHOT,
-                .data = .{ .fd = fd },
-            };
-            _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &rearm);
         }
+    };
+
+    for (0..n_workers) |i| {
+        const rc = linux.epoll_create1(0);
+        epfds[i] = @bitCast(@as(u32, @truncate(rc)));
+        if (epfds[i] < 0) return .{ .failed = "Failed to create epoll" };
+        _ = std.Thread.spawn(.{}, Worker.loop, .{epfds[i]}) catch
+            return .{ .failed = "Failed to spawn worker" };
+    }
+
+    std.debug.print("Orisha listening on http://0.0.0.0:{}\n", .{port});
+    std.debug.print("Pump: epoll, {} workers, keep-alive, TCP_NODELAY\n", .{n_workers});
+
+    // Hand each new connection to the next worker in turn. A descriptor belongs
+    // to that worker for the rest of its life, which is what makes the shared
+    // connection table safe without a lock: no index is ever touched twice.
+    var next: usize = 0;
+    while (true) {
+        const conn = server.accept() catch continue;
+        const client_fd = conn.stream.handle;
+        $mod.disableNagle(client_fd);
+        $mod.markNonBlocking(client_fd);
+
+        var client_event = linux.epoll_event{
+            .events = linux.EPOLL.IN | linux.EPOLL.ONESHOT,
+            .data = .{ .fd = client_fd },
+        };
+        _ = linux.epoll_ctl(epfds[next], linux.EPOLL.CTL_ADD, client_fd, &client_event);
+        next = (next + 1) % n_workers;
     }
 
     return .{ .stopped = "Server stopped" };

@@ -24,8 +24,8 @@
 //
 // Example (API + static):
 //   ~orisha:handler = orisha:router(req)
-//   | [GET /api/health] |> { status: 200, body: "ok", content_type: "application/json" }
-//   | [*] |> orisha:static-router(name: "site")
+//   ! [GET /api/health] -> { status: 200, body: "ok", content_type: "application/json" }
+//   ! [*] |> orisha:static-router(name: "site")
 //
 // Example (pure static site):
 //   ~import orisha
@@ -157,9 +157,9 @@ pub tor answer { raw: string } -> { head: string, body: string }
 //
 // Usage:
 //   ~orisha:handler = orisha:router(req)
-//   | [GET /] _ |> { status: 200, body: "Hello", content_type: "text/plain" }
-//   | [GET /users/:id] p |> { status: 200, body: p.id, content_type: "text/plain" }
-//   | [*] _ |> { status: 404, body: "Not Found", content_type: "text/plain" }
+//   ! [GET /] _ -> { status: 200, body: "Hello", content_type: "text/plain" }
+//   ! [GET /users/:id] p -> { status: 200, body: p.id, content_type: "text/plain" }
+//   ! [*] _ -> { status: 404, body: "Not Found", content_type: "text/plain" }
 
 [comptime|transform]pub tor router {
     invocation: *const Invocation,
@@ -188,7 +188,7 @@ pub tor answer { raw: string } -> { head: string, body: string }
 //
 // Works as top-level handler or nested in a router catch-all:
 //   ~orisha:handler = orisha:static-router(name: "site")
-//   | [*] |> orisha:static-router(name: "site")
+//   ! [*] |> orisha:static-router(name: "site")
 
 [comptime|transform]pub tor static-router {
     invocation: *const Invocation,

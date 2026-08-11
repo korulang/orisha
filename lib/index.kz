@@ -212,10 +212,21 @@ pub const ConnHandle = struct {
 // mechanism `*Request` uses.
 pub const ContentType = []const u8;
 
-// The header is built into a module-level buffer rather than a stack frame,
-// because a slice of a dead frame is the bug this file has shipped before. It
-// is sound because a pump delivers one exchange at a time — see orisha/pump.
-var header_buf: [512]u8 = undefined;
+// The header is built into a buffer that outlives the frame, because `answer`
+// returns a SLICE of it and a slice of a dead frame is a bug this file has
+// shipped before.
+//
+// `threadlocal` is what makes that safe once a pump runs more than one loop.
+// A worker pool has several exchanges in flight at once, and a single shared
+// buffer would have two threads writing headers over each other — which does
+// not crash, it ships one response wearing another's Content-Length. That is
+// the same "sometimes it works" shape as every other bug in this file's
+// history, and the only reason a plain `var` was ever sound here is that the
+// pump had exactly one thread from the day the workers were removed.
+//
+// Freestanding gets one too. The unikernel never spawns a thread, so it has
+// exactly one of these — the cost is the same 512 bytes it already had.
+threadlocal var header_buf: [512]u8 = undefined;
 
 // ============================================================================
 // THE ALLOCATOR SEAM
