@@ -1,0 +1,5 @@
+{
+  "name": "koru-vercel-wasm",
+  "private": true,
+  "type": "module"
+}

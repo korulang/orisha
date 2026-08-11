@@ -1,0 +1,109 @@
+// korulang.org's server as a pure function, compiled to WebAssembly.
+//
+// Vercel does not give you a socket. It accepts the connection, parses the
+// HTTP, and calls you once with a request — so the readiness loop that every
+// Orisha pump owns is the platform's here, and there is nothing for a pump to
+// do. What is left is the half of a server that answers: path in, response out.
+//
+// That half is a pure function, which is why it can be a wasm reactor — a
+// module a host instantiates once and calls, rather than a program that runs
+// and exits. It imports nothing at all, so the same artifact runs under Node,
+// under an edge runtime, or in a browser.
+//
+// The contract with the host is three exports and a shared block of memory:
+//
+//   request_ptr()   where the host writes the path it was asked for
+//   handle(len)     answer it; returns how many bytes the answer is
+//   response_ptr()  where the host reads those bytes back from
+//
+// No allocation crosses the boundary and no pointer is passed in, which is what
+// keeps the JS side to a dozen lines with nothing to get wrong.
+
+const std = @import("std");
+
+~import std/build
+
+~std/build:config {
+    "target": "wasm32-freestanding"
+}
+
+// A reactor rather than a command, and no libc: a wasm host supplies neither a
+// process to start nor a C runtime to link against.
+~std/build:requires {
+    exe.entry = .disabled;
+    exe.rdynamic = true;
+    exe.root_module.link_libc = false;
+    // Size is the whole constraint on this target: the module ships in the
+    // function bundle and is re-instantiated on every cold start.
+    exe.root_module.optimize = .ReleaseSmall;
+}
+
+// The two windows the host writes and reads through. Fixed and statically
+// sized, because a request path has a bound and growing one would mean handing
+// the host an allocator across a boundary that cannot carry ownership.
+var request_buf: [2048]u8 = undefined;
+var response_buf: [65536]u8 = undefined;
+var response_len: usize = 0;
+
+// ---------------------------------------------------------------------------
+// The Koru half: a path becomes a page.
+// ---------------------------------------------------------------------------
+
+// @retain: reached only from the host seam's raw Zig below, which the
+// dead-stripper cannot see — the same reason orisha/pump:fill is retained.
+~[retain]pub tor body-for { path: string } -> string
+
+~proc body-for|zig {
+    if (std.mem.eql(u8, path, "/"))
+        return "<!doctype html><meta charset=utf-8><title>Koru on Vercel</title>" ++
+            "<h1>This page was rendered by WebAssembly compiled from Koru.</h1>" ++
+            "<p>No operating system, no libc, no sockets — the platform owns the " ++
+            "loop and this module owns the answer.</p><p><a href=/about>about</a></p>";
+    if (std.mem.eql(u8, path, "/about"))
+        return "<!doctype html><meta charset=utf-8><title>about</title>" ++
+            "<h1>What this is</h1><p>A Koru program compiled to a wasm reactor. " ++
+            "It imports nothing and allocates nothing across the host boundary.</p>";
+    if (std.mem.eql(u8, path, "/health"))
+        return "{\"status\":\"ok\",\"runtime\":\"koru/wasm\"}";
+    return "";
+}
+
+// ---------------------------------------------------------------------------
+// The host seam.
+// ---------------------------------------------------------------------------
+
+export fn request_ptr() [*]u8 {
+    return &request_buf;
+}
+
+export fn request_cap() u32 {
+    return @intCast(request_buf.len);
+}
+
+export fn response_ptr() [*]u8 {
+    return &response_buf;
+}
+
+// Answer the path currently sitting in `request_buf`, and report how long the
+// answer is. A path nothing claims produces a 404 rather than an empty body —
+// the status line is part of the answer, so the host never has to decide.
+export fn handle(path_len: u32) u32 {
+    const path = request_buf[0..@min(path_len, request_buf.len)];
+    const body = main_module.body_for_event.handler(.{ .path = path });
+
+    const status = if (body.len == 0) "404 Not Found" else "200 OK";
+    const content_type = if (body.len > 0 and body[0] == '{')
+        "application/json"
+    else
+        "text/html; charset=utf-8";
+    const shown = if (body.len == 0) "<!doctype html><title>404</title><h1>Not found</h1>" else body;
+
+    var stream = std.io.fixedBufferStream(&response_buf);
+    stream.writer().print(
+        "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ status, content_type, shown.len, shown },
+    ) catch return 0;
+
+    response_len = stream.pos;
+    return @intCast(response_len);
+}
