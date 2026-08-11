@@ -1023,20 +1023,43 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const Process
         }
         try output.appendSlice(allocator, "\" },\n");
     }
+    // The index, keyed on path, built while this program compiles.
+    //
+    // This was a linear walk of every route with a string compare per entry,
+    // which for this site meant up to 1,587 `memcmp`s to answer one request.
+    // It also made throughput a function of ALPHABETICAL POSITION: `/index.html`
+    // sits 10th and `/200.html` 832nd, and the two benchmarked 25% apart for
+    // that reason alone — a difference we spent a morning attributing to
+    // payload size.
+    //
+    // Nothing here needed discovering at runtime. Every route is known while
+    // the program compiles, which is the whole premise, and the dispatch was
+    // the one place not acting like it.
     try output.appendSlice(allocator,
         \\};
+        \\
+        \\/// path -> index into `routes`. Built at comptime; no scan at runtime.
+        \\pub const by_path = std.StaticStringMap(u32).initComptime(.{
+        \\
+    );
+    for (routes, 0..) |route, i| {
+        try appendFmt(allocator, &output, "    .{{ \"{s}\", {d} }},\n", .{ route.path, i });
+    }
+    try output.appendSlice(allocator,
+        \\});
+        \\
         \\pub fn lookup(method: []const u8, path: []const u8) ?[]const u8 {
-        \\    for (routes) |r| if (std.mem.eql(u8, r.method, method) and std.mem.eql(u8, r.path, path)) return r.response;
-        \\    return null;
+        \\    const i = by_path.get(path) orelse return null;
+        \\    const r = routes[i];
+        \\    if (!std.mem.eql(u8, r.method, method)) return null;
+        \\    return r.response;
         \\}
         \\pub fn lookupWithEtag(method: []const u8, path: []const u8, client_etag: ?[]const u8) ?[]const u8 {
-        \\    for (routes) |r| {
-        \\        if (std.mem.eql(u8, r.method, method) and std.mem.eql(u8, r.path, path)) {
-        \\            if (client_etag) |e| if (std.mem.eql(u8, e, r.etag)) return response_304;
-        \\            return r.response;
-        \\        }
-        \\    }
-        \\    return null;
+        \\    const i = by_path.get(path) orelse return null;
+        \\    const r = routes[i];
+        \\    if (!std.mem.eql(u8, r.method, method)) return null;
+        \\    if (client_etag) |e| if (std.mem.eql(u8, e, r.etag)) return response_304;
+        \\    return r.response;
         \\}
         \\
     );
