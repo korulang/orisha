@@ -1,0 +1,14 @@
+# Build artifacts — the deployable inputs are handler.kz's OUTPUT (wasm/) plus
+# the adapter in api/. Everything the Koru compiler leaves behind stays out.
+#
+# The local-proof harnesses are anchored with a leading slash on purpose: an
+# unanchored `serve.mjs` matches at ANY depth, which silently excluded
+# api/serve.mjs and failed the deploy with "doesn't match any Serverless
+# Functions inside the api directory".
+*.zig
+a.out
+zig-out/
+.zig-cache/
+program.ast.json
+/serve.mjs
+/test-adapter.mjs
