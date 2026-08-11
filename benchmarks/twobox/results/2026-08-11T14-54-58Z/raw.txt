@@ -1,0 +1,81 @@
+WIRE|orisha-epoll|Content-Encoding: gzip Content-Length: 13339 
+VERIFY|orisha-epoll|1118|0|1118
+WIRE|orisha-uring|Content-Encoding: gzip Content-Length: 13339 
+VERIFY|orisha-uring|1118|0|1118
+WIRE|nginx|Content-Encoding: gzip Content-Length: 13312 
+VERIFY|nginx|1118|0|1118
+WIRE|caddy|Content-Encoding: gzip Content-Length: 13312 
+VERIFY|caddy|1118|0|1118
+WIRE|sws|content-encoding: gzip 
+VERIFY|sws|1118|0|1118
+WIRE|h2o|Content-Length: 13312 content-encoding: gzip 
+VERIFY|h2o|1118|0|1118
+WIRE|ols|content-encoding: gzip content-length: 13339 
+VERIFY|ols|1118|0|1118
+RESULT|orisha-epoll|/index.html|200|18281.12|7.87ms|411.69ms|0
+RESULT|orisha-epoll|/index.html|50|18337.62|590.00us|207.85ms|0
+RESULT|orisha-epoll|/200.html|200|205340.36|537.00us|112.65ms|0
+STEAL|orisha-epoll|round1|15
+RESULT|orisha-uring|/index.html|200|18309.72|7.93ms|415.96ms|0
+RESULT|orisha-uring|/index.html|50|18344.68|500.00us|209.07ms|0
+RESULT|orisha-uring|/200.html|200|105633.05|1.82ms|2.45ms|0
+STEAL|orisha-uring|round1|3
+RESULT|nginx|/index.html|200|18163.11|7.78ms|576.17ms|0
+RESULT|nginx|/index.html|50|18182.50|555.00us|211.84ms|0
+RESULT|nginx|/200.html|200|120888.41|1.54ms|2.66ms|0
+STEAL|nginx|round1|13
+RESULT|caddy|/index.html|200|18218.20|7.90ms|609.02ms|0
+RESULT|caddy|/index.html|50|18180.20|2.00ms|215.85ms|0
+RESULT|caddy|/200.html|200|20389.73|9.13ms|37.42ms|0
+STEAL|caddy|round1|7
+RESULT|sws|/index.html|200|18153.36|7.70ms|427.46ms|0
+RESULT|sws|/index.html|50|18176.25|635.00us|209.02ms|0
+RESULT|sws|/200.html|200|51157.08|3.89ms|7.32ms|0
+STEAL|sws|round1|21
+RESULT|h2o|/index.html|200|18194.64|7.87ms|422.60ms|0
+RESULT|h2o|/index.html|50|18210.18|531.00us|207.79ms|0
+RESULT|h2o|/200.html|200|133366.41|1.43ms|4.06ms|0
+STEAL|h2o|round1|21
+RESULT|ols|/index.html|200|18132.81|7.99ms|535.37ms|0
+RESULT|ols|/index.html|50|18097.49|757.00us|208.91ms|0
+RESULT|ols|/200.html|200|97183.59|1.79ms|5.34ms|0
+STEAL|ols|round1|10
+RESULT|orisha-epoll|/index.html|200|18308.24|7.93ms|416.39ms|0
+RESULT|orisha-epoll|/index.html|50|18334.39|583.00us|211.78ms|0
+RESULT|orisha-epoll|/200.html|200|200605.55|346.00us|21.37ms|0
+STEAL|orisha-epoll|round2|12
+RESULT|orisha-uring|/index.html|200|18278.05|7.85ms|418.30ms|0
+RESULT|orisha-uring|/index.html|50|18345.96|477.00us|207.73ms|0
+RESULT|orisha-uring|/200.html|200|113104.74|1.64ms|2.22ms|0
+STEAL|orisha-uring|round2|5
+RESULT|nginx|/index.html|200|18199.75|7.81ms|536.08ms|0
+RESULT|nginx|/index.html|50|18184.05|547.00us|215.39ms|0
+RESULT|nginx|/200.html|200|118761.08|1.67ms|4.76ms|0
+STEAL|nginx|round2|11
+RESULT|caddy|/index.html|200|18223.49|8.05ms|579.60ms|0
+RESULT|caddy|/index.html|50|18176.13|1.92ms|227.86ms|0
+RESULT|caddy|/200.html|200|20106.67|9.24ms|38.53ms|0
+STEAL|caddy|round2|7
+RESULT|sws|/index.html|200|18109.07|7.71ms|436.24ms|0
+RESULT|sws|/index.html|50|18177.86|592.00us|207.03ms|0
+RESULT|sws|/200.html|200|51419.28|3.84ms|7.57ms|0
+STEAL|sws|round2|14
+RESULT|h2o|/index.html|200|18158.69|7.83ms|457.35ms|0
+RESULT|h2o|/index.html|50|18205.52|559.00us|207.48ms|0
+RESULT|h2o|/200.html|200|137025.92|1.33ms|3.32ms|0
+STEAL|h2o|round2|11
+RESULT|ols|/index.html|200|18108.81|7.96ms|528.26ms|0
+RESULT|ols|/index.html|50|18099.49|678.00us|212.86ms|0
+RESULT|ols|/200.html|200|98984.61|1.64ms|4.45ms|0
+STEAL|ols|round2|7
+RESULT|orisha-epoll|/index.html|200|18299.69|7.91ms|419.55ms|0
+RESULT|orisha-epoll|/index.html|50|18335.58|558.00us|207.40ms|0
+RESULT|orisha-epoll|/200.html|200|202677.97|569.00us|68.46ms|0
+STEAL|orisha-epoll|round3|20
+RESULT|orisha-uring|/index.html|200|18262.30|7.67ms|441.32ms|0
+RESULT|orisha-uring|/index.html|50|18348.23|486.00us|207.47ms|0
+RESULT|orisha-uring|/200.html|200|103856.67|2.00ms|2.27ms|0
+STEAL|orisha-uring|round3|5
+RESULT|nginx|/index.html|200|18182.56|7.77ms|569.77ms|0
+RESULT|nginx|/index.html|50|18180.90|575.00us|216.80ms|0
+RESULT|nginx|/200.html|200|116731.74|1.55ms|6.32ms|0

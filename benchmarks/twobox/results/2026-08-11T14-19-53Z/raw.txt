@@ -1,0 +1,91 @@
+WIRE|orisha-epoll|Content-Encoding: gzip Content-Length: 13339 
+VERIFY|orisha-epoll|1118|0|1118
+WIRE|orisha-uring|Content-Encoding: gzip Content-Length: 13339 
+VERIFY|orisha-uring|1118|0|1118
+WIRE|nginx|Content-Encoding: gzip Content-Length: 13312 
+VERIFY|nginx|1118|0|1118
+WIRE|caddy|Content-Encoding: gzip Content-Length: 13312 
+VERIFY|caddy|1118|0|1118
+WIRE|sws|content-encoding: gzip 
+VERIFY|sws|1118|0|1118
+WIRE|h2o|Content-Length: 13312 content-encoding: gzip 
+VERIFY|h2o|1118|0|1118
+WIRE|ols|content-encoding: gzip content-length: 13339 
+    MISMATCH docs/event-continuations.html (want 19245, got 195)
+    MISMATCH docs/event-taps.html (want 23462, got 195)
+    MISMATCH docs/flows.html (want 23629, got 195)
+    MISMATCH docs/imports.html (want 101195, got 195)
+    MISMATCH docs/koruzon.html (want 19007, got 195)
+VERIFY|ols|1111|7|1118
+RESULT|orisha-epoll|/index.html|200|18267.61|7.69ms|525.30ms|0
+RESULT|orisha-epoll|/index.html|50|18279.17|1.12ms|214.44ms|0
+RESULT|orisha-epoll|/200.html|200|159380.65|0.87ms|6.32ms|0
+STEAL|orisha-epoll|round1|7
+RESULT|orisha-uring|/index.html|200|18247.37|7.88ms|474.64ms|0
+RESULT|orisha-uring|/index.html|50|18311.93|815.00us|246.19ms|0
+RESULT|orisha-uring|/200.html|200|68505.21|3.26ms|3.48ms|0
+STEAL|orisha-uring|round1|5
+RESULT|nginx|/index.html|200|18160.33|7.59ms|603.32ms|0
+RESULT|nginx|/index.html|50|18167.11|0.92ms|274.47ms|0
+RESULT|nginx|/200.html|200|119247.88|1.76ms|7.44ms|0
+STEAL|nginx|round1|8
+RESULT|caddy|/index.html|200|18199.56|8.12ms|596.76ms|0
+RESULT|caddy|/index.html|50|18169.80|2.02ms|209.76ms|0
+RESULT|caddy|/200.html|200|20391.56|8.94ms|39.40ms|0
+STEAL|caddy|round1|1
+RESULT|sws|/index.html|200|18049.02|7.56ms|569.39ms|0
+RESULT|sws|/index.html|50|18146.45|0.93ms|238.97ms|0
+RESULT|sws|/200.html|200|52277.94|3.78ms|7.34ms|0
+STEAL|sws|round1|22
+RESULT|h2o|/index.html|200|18140.26|7.64ms|541.79ms|0
+RESULT|h2o|/index.html|50|18160.90|0.93ms|215.44ms|0
+RESULT|h2o|/200.html|200|143085.53|1.22ms|5.95ms|0
+STEAL|h2o|round1|20
+RESULT|orisha-epoll|/index.html|200|18245.01|7.71ms|489.17ms|0
+RESULT|orisha-epoll|/index.html|50|18300.88|0.96ms|229.87ms|0
+RESULT|orisha-epoll|/200.html|200|160437.89|0.87ms|6.06ms|0
+STEAL|orisha-epoll|round2|14
+RESULT|orisha-uring|/index.html|200|18242.78|7.64ms|441.55ms|0
+RESULT|orisha-uring|/index.html|50|18296.92|0.90ms|214.04ms|0
+RESULT|orisha-uring|/200.html|200|71887.17|2.54ms|3.84ms|0
+STEAL|orisha-uring|round2|3
+RESULT|nginx|/index.html|200|18185.41|7.57ms|605.12ms|0
+RESULT|nginx|/index.html|50|18167.37|0.87ms|308.63ms|0
+RESULT|nginx|/200.html|200|122952.84|1.46ms|3.54ms|0
+STEAL|nginx|round2|14
+RESULT|caddy|/index.html|200|18194.11|8.26ms|539.62ms|0
+RESULT|caddy|/index.html|50|18171.37|2.01ms|208.27ms|0
+RESULT|caddy|/200.html|200|20436.79|9.05ms|36.26ms|0
+STEAL|caddy|round2|1
+RESULT|sws|/index.html|200|18041.57|7.56ms|553.97ms|0
+RESULT|sws|/index.html|50|18128.29|1.03ms|221.15ms|0
+RESULT|sws|/200.html|200|52026.90|3.79ms|7.37ms|0
+STEAL|sws|round2|39
+RESULT|h2o|/index.html|200|18114.78|7.60ms|539.12ms|0
+RESULT|h2o|/index.html|50|18181.49|838.00us|228.84ms|0
+RESULT|h2o|/200.html|200|141799.50|1.22ms|5.87ms|0
+STEAL|h2o|round2|12
+RESULT|orisha-epoll|/index.html|200|18308.88|7.78ms|528.37ms|0
+RESULT|orisha-epoll|/index.html|50|18316.07|801.00us|248.73ms|0
+RESULT|orisha-epoll|/200.html|200|157881.37|0.86ms|6.72ms|0
+STEAL|orisha-epoll|round3|25
+RESULT|orisha-uring|/index.html|200|18280.34|7.61ms|421.06ms|0
+RESULT|orisha-uring|/index.html|50|18308.82|818.00us|250.29ms|0
+RESULT|orisha-uring|/200.html|200|63534.20|2.87ms|4.14ms|0
+STEAL|orisha-uring|round3|3
+RESULT|nginx|/index.html|200|18162.96|7.51ms|616.43ms|0
+RESULT|nginx|/index.html|50|18156.30|0.96ms|241.97ms|0
+RESULT|nginx|/200.html|200|121398.70|1.51ms|4.73ms|0
+STEAL|nginx|round3|27
+RESULT|caddy|/index.html|200|18190.03|7.27ms|681.86ms|0
+RESULT|caddy|/index.html|50|18173.56|1.99ms|209.13ms|0
+RESULT|caddy|/200.html|200|20511.52|8.95ms|39.11ms|0
+STEAL|caddy|round3|2
+RESULT|sws|/index.html|200|18068.74|7.51ms|567.40ms|0
+RESULT|sws|/index.html|50|18130.76|1.01ms|227.86ms|0
+RESULT|sws|/200.html|200|52318.10|3.78ms|7.32ms|0
+STEAL|sws|round3|32
+RESULT|h2o|/index.html|200|18117.95|7.64ms|511.73ms|0
+RESULT|h2o|/index.html|50|18153.46|0.98ms|214.94ms|0
+RESULT|h2o|/200.html|200|142653.50|1.28ms|4.42ms|0
+STEAL|h2o|round3|14

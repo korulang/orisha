@@ -1,0 +1,69 @@
+WIRE|orisha-epoll|Content-Encoding: gzip Content-Length: 13345 
+VERIFY|orisha-epoll|1117|0|1117
+WIRE|orisha-uring|Content-Encoding: gzip Content-Length: 13345 
+VERIFY|orisha-uring|1117|0|1117
+WIRE|nginx|Content-Encoding: gzip Content-Length: 13316 
+    MISMATCH diagrams/event-flow.svg (want 19205, got 153)
+VERIFY|nginx|1116|1|1117
+WIRE|caddy|Content-Encoding: gzip Content-Length: 13316 
+VERIFY|caddy|1117|0|1117
+WIRE|sws|content-encoding: gzip 
+VERIFY|sws|1117|0|1117
+WIRE|h2o|Content-Length: 13316 content-encoding: gzip 
+    MISMATCH diagrams/event-flow.svg (want 19205, got 16)
+VERIFY|h2o|1116|1|1117
+WIRE|ols|content-encoding: gzip content-length: 13345 
+    MISMATCH diagrams/event-flow.svg (want 19205, got 1240)
+    MISMATCH docs/event-continuations.html (want 19245, got 195)
+    MISMATCH docs/event-taps.html (want 23462, got 195)
+    MISMATCH docs/flows.html (want 23629, got 195)
+    MISMATCH docs/imports.html (want 101223, got 195)
+VERIFY|ols|1109|8|1117
+RESULT|orisha-epoll|/index.html|200|18344.44|7.95ms|396.85ms|0
+RESULT|orisha-epoll|/index.html|50|18313.94|700.00us|211.31ms|0
+RESULT|orisha-epoll|/200.html|200|161524.63|0.93ms|5.31ms|0
+STEAL|orisha-epoll|round1|12
+RESULT|orisha-uring|/index.html|200|18361.40|7.89ms|383.37ms|0
+RESULT|orisha-uring|/index.html|50|18310.94|697.00us|210.29ms|0
+RESULT|orisha-uring|/200.html|200|62962.21|3.26ms|3.44ms|0
+STEAL|orisha-uring|round1|1
+RESULT|caddy|/index.html|200|18224.11|7.23ms|628.22ms|0
+RESULT|caddy|/index.html|50|18165.46|1.90ms|211.20ms|0
+RESULT|caddy|/200.html|200|20612.34|9.03ms|38.30ms|0
+STEAL|caddy|round1|2
+RESULT|sws|/index.html|200|18190.50|7.83ms|423.08ms|0
+RESULT|sws|/index.html|50|18154.75|753.00us|215.15ms|0
+RESULT|sws|/200.html|200|52629.81|3.76ms|7.33ms|0
+STEAL|sws|round1|15
+RESULT|orisha-epoll|/index.html|200|18352.37|7.96ms|409.01ms|0
+RESULT|orisha-epoll|/index.html|50|18315.07|685.00us|212.02ms|0
+RESULT|orisha-epoll|/200.html|200|164259.80|0.92ms|5.25ms|0
+STEAL|orisha-epoll|round2|6
+RESULT|orisha-uring|/index.html|200|18319.97|7.86ms|375.10ms|0
+RESULT|orisha-uring|/index.html|50|18323.48|651.00us|216.11ms|0
+RESULT|orisha-uring|/200.html|200|66052.65|3.41ms|3.79ms|0
+STEAL|orisha-uring|round2|4
+RESULT|caddy|/index.html|200|18201.61|6.92ms|624.99ms|0
+RESULT|caddy|/index.html|50|18157.17|1.84ms|214.85ms|0
+RESULT|caddy|/200.html|200|20171.14|9.14ms|39.23ms|0
+STEAL|caddy|round2|3
+RESULT|sws|/index.html|200|18187.16|7.78ms|413.33ms|0
+RESULT|sws|/index.html|50|18160.86|721.00us|213.86ms|0
+RESULT|sws|/200.html|200|51259.85|3.86ms|7.61ms|0
+STEAL|sws|round2|43
+RESULT|orisha-epoll|/index.html|200|18326.67|7.97ms|409.83ms|0
+RESULT|orisha-epoll|/index.html|50|18324.02|638.00us|215.45ms|0
+RESULT|orisha-epoll|/200.html|200|162039.56|0.95ms|5.45ms|0
+STEAL|orisha-epoll|round3|4
+RESULT|orisha-uring|/index.html|200|18334.59|7.85ms|370.18ms|0
+RESULT|orisha-uring|/index.html|50|18320.78|667.00us|212.86ms|0
+RESULT|orisha-uring|/200.html|200|69900.93|2.51ms|3.83ms|0
+STEAL|orisha-uring|round3|4
+RESULT|caddy|/index.html|200|18231.34|7.32ms|585.70ms|0
+RESULT|caddy|/index.html|50|18156.50|1.84ms|218.14ms|0
+RESULT|caddy|/200.html|200|20721.59|8.93ms|38.03ms|0
+STEAL|caddy|round3|1
+RESULT|sws|/index.html|200|18171.09|7.78ms|402.01ms|0
+RESULT|sws|/index.html|50|18163.42|708.00us|211.69ms|0
+RESULT|sws|/200.html|200|51852.01|3.85ms|7.14ms|0
+STEAL|sws|round3|29
