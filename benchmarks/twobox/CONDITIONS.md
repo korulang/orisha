@@ -104,6 +104,31 @@ Static files over HTTP/1.1 with keep-alive, one machine size, one datacenter, on
 site. Nothing here says anything about TLS, dynamic content, or behaviour under a
 real traffic mix.
 
+## The profile experiment: inconclusive, and why that is the honest word
+
+Compiling the site against a held-out sample of its own traffic gave a median
+2.8% over the unprofiled build (155,075 against 150,900 req/s). It is tempting to
+report that as a small win. It is not one.
+
+    orisha-cold   150,900   154,557   147,244     (5% spread, same binary)
+    orisha-warm   147,356   155,075   160,379     (9% spread, same binary)
+
+Cold led round one. Warm led rounds two and three. The difference *between* the
+builds is smaller than the difference between a build and itself, and three
+rounds cannot resolve that. The result is neither "layout helps" nor "layout does
+nothing" — it is "this rig cannot tell", which is a different claim and the only
+one the data supports.
+
+The controls are what make even that statement possible: nginx held a 2.4% spread
+across the same three rounds on a server nothing in the experiment could touch.
+That is the measured noise floor, and any effect smaller than it is invisible
+here by construction.
+
+**What would settle it.** More rounds, and a machine where residency is not free.
+A 23 MB binary on 8 GB is entirely resident within seconds, and where a response
+*sits* stops mattering when nothing has to be fetched. Layout pays under memory
+pressure; this experiment had none.
+
 ## Results
 
 `results/<timestamp>/` holds the report, the raw per-round lines, and the machine
