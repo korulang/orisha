@@ -167,11 +167,23 @@ the handler was wrong.
 The six genuinely slow exchanges clustered inside a ~370 ms window rather than
 spreading evenly, so there is a transient in there as well as the queueing.
 
-**What would fix it** is not faster handling — handling is already fast. It is
-fairness: more workers than cores so a blocked one does not hold its queue, or
-work-stealing between workers, or bounding how many ready connections a worker
-drains before returning to its readiness call. nginx and H2O both spread
-connections more evenly than round-robin-at-accept does.
+**The fairness theory was tested and failed.** Connection ownership was removed
+entirely — one shared readiness queue, every worker waiting on it, the kernel
+handing each ready connection to whoever asks next. Three interleaved rounds of
+each design:
+
+    owned    184,142  189,447  193,084     p99  6.48  6.88  6.68 ms
+    shared   192,995  197,264  197,065     p99  6.99  6.88  7.00 ms
+
+Throughput improved 4% and the tail did not move. The change was kept for the
+throughput and the simpler code, but it is not the fix it was written to be.
+
+**And the tail did not appear in that run at all.** Both designs sat near 7 ms
+while earlier runs of the owned design gave 11.86, 21, 68 and 113 ms. The tail is
+intermittent across runs of identical binaries, so it is environmental rather
+than architectural, and every explanation offered for it so far — queueing
+included — was reasoning about something that is not always present. Finding it
+needs a run that reproduces it on demand, which nothing here yet does.
 
 ## Results
 
