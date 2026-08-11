@@ -89,7 +89,19 @@ fn requestLen(buf: []const u8) ?usize {
 const REQUEST_BUFFER = 16 * 1024;
 const MAX_TRACKED_FD = 4096;
 
-const ConnState = struct {
+// One connection, and everything reading it needs: the socket, the bytes held
+// so far, and how many of them there are.
+//
+// `fd` lives here because `fill` takes a connection and nothing else. A read
+// step that has to be told which descriptor to read is not a seam — the caller
+// would still be the one holding the platform's idea of a socket.
+//
+// It is `c_int` for the same reason Exchange's is: this type is now reachable
+// from the unikernel pump too, and `x86_64-freestanding` has no `std.posix`
+// syscall layer to name a descriptor type with. On Linux and macOS `posix.fd_t`
+// already IS `c_int`, so the hosted pumps hand theirs over unchanged.
+pub const ConnState = struct {
+    fd: c_int = -1,
     buf: [REQUEST_BUFFER]u8 = undefined,
     len: usize = 0,
 };
@@ -101,7 +113,7 @@ fn connState(fd: posix.fd_t) ?*ConnState {
     if (idx >= MAX_TRACKED_FD) return null;
     if (conn_states[idx]) |s| return s;
     const s = std.heap.c_allocator.create(ConnState) catch return null;
-    s.* = .{};
+    s.* = .{ .fd = fd };
     conn_states[idx] = s;
     return s;
 }
@@ -218,10 +230,12 @@ extern fn poll(fds: [*]PollFd, nfds: c_ulong, timeout: c_int) c_int;
 // independent limits with the same value have no headroom between them.
 const MAX_UK_CONNS = 128;
 
+// A unikernel connection is a connection plus the bookkeeping only this pump
+// does. The socket and the held bytes are `ConnState`, the same type the hosted
+// pumps use, so `fill` takes one thing on every platform rather than two shapes
+// that happen to have the same fields.
 const UkConn = struct {
-    fd: c_int = -1,
-    buf: [REQUEST_BUFFER]u8 = undefined,
-    len: usize = 0,
+    st: ConnState = .{},
     /// When this connection was last heard from. Only the ORDER matters.
     seq: u64 = 0,
     /// Wall-clock second this connection was last heard from.
@@ -268,9 +282,9 @@ const KEEPALIVE_IDLE_SECONDS: i64 = 5;
 fn ukAdmit(incoming: c_int) void {
     uk_seq += 1;
     for (&uk_conns) |*s| {
-        if (s.fd >= 0) continue;
-        s.fd = incoming;
-        s.len = 0;
+        if (s.st.fd >= 0) continue;
+        s.st.fd = incoming;
+        s.st.len = 0;
         s.seq = uk_seq;
         s.last_seen = wallClockSeconds(null);
             return;
@@ -280,9 +294,9 @@ fn ukAdmit(incoming: c_int) void {
     for (&uk_conns) |*s| {
         if (s.seq < oldest.seq) oldest = s;
     }
-    _ = close(oldest.fd);
-    oldest.fd = incoming;
-    oldest.len = 0;
+    _ = close(oldest.st.fd);
+    oldest.st.fd = incoming;
+    oldest.st.len = 0;
     oldest.seq = uk_seq;
     oldest.last_seen = wallClockSeconds(null);
 }
@@ -371,6 +385,42 @@ fn writeAll(fd: posix.fd_t, data: []const u8) bool {
 const WRITE_WAIT_MS: i32 = 10_000;
 
 // ---------------------------------------------------------------------------
+// FILL — the read seam. One variant per platform, mirroring `reply`.
+// ---------------------------------------------------------------------------
+
+// The hosted read: everything with a `std.posix`.
+//
+// `read` says "nothing available right now" by returning error.WouldBlock, and
+// a peer that has finished says it by returning zero bytes. The loops used to
+// spell this `catch 0` and then treat zero as the end of the connection, which
+// gives those two answers the same meaning. They are not the same: one is a
+// connection with more to come, the other is a connection with nothing more
+// ever. Separating them is what `idle` is for.
+~proc fill|zig {
+    const n = $mod.posix.read(@intCast(st.fd), st.buf[st.len..]) catch |err| switch (err) {
+        error.WouldBlock => return .idle,
+        else => return .gone,
+    };
+    if (n == 0) return .gone;
+    st.len += n;
+    return .more;
+}
+
+// The unikernel's read. `posix.read` has no implementation on a freestanding
+// target; `recv` is the socket symbol this pump already uses for everything
+// else.
+//
+// A negative result is an error and zero is a closed peer — but this pump only
+// calls `fill` after `poll` said the socket was readable, so "nothing to read"
+// is not a case it reaches. Both fold to `gone`.
+~proc fill|unikraft {
+    const got = $mod.recv(st.fd, @ptrCast(&st.buf[st.len]), st.buf.len - st.len, 0);
+    if (got <= 0) return .gone;
+    st.len += @intCast(got);
+    return .more;
+}
+
+// ---------------------------------------------------------------------------
 // kqueue — macOS and the BSDs. The default variant.
 // ---------------------------------------------------------------------------
 
@@ -433,13 +483,28 @@ const WRITE_WAIT_MS: i32 = 10_000;
                 continue;
             };
 
-            const bytes_read = $mod.posix.read(fd, st.buf[st.len..]) catch 0;
-            if (bytes_read == 0) {
-                $mod.releaseConn(fd);
-                $mod.posix.close(fd);
-                continue;
+            switch ($mod.fill_event.handler(.{ .st = st })) {
+                .more => {},
+                // Nothing new to frame, but the connection is alive. Re-arm and
+                // wait rather than closing it.
+                .idle => {
+                    changes[0] = .{
+                        .ident = @intCast(fd),
+                        .filter = $mod.c.EVFILT.READ,
+                        .flags = $mod.c.EV.ADD | $mod.c.EV.ONESHOT,
+                        .fflags = 0,
+                        .data = 0,
+                        .udata = undefined,
+                    };
+                    _ = $mod.c.kevent(kq, &changes, 1, &no_changes, 0, null);
+                    continue;
+                },
+                .gone => {
+                    $mod.releaseConn(fd);
+                    $mod.posix.close(fd);
+                    continue;
+                },
             }
-            st.len += bytes_read;
 
             // Answer every COMPLETE request; keep any unfinished tail for the
             // next read rather than parsing it as a fresh request.
@@ -537,13 +602,22 @@ const WRITE_WAIT_MS: i32 = 10_000;
                 continue;
             };
 
-            const bytes_read = $mod.posix.read(fd, st.buf[st.len..]) catch 0;
-            if (bytes_read == 0) {
-                $mod.releaseConn(fd);
-                $mod.posix.close(fd);
-                continue;
+            switch ($mod.fill_event.handler(.{ .st = st })) {
+                .more => {},
+                .idle => {
+                    var wait = linux.epoll_event{
+                        .events = linux.EPOLL.IN | linux.EPOLL.ONESHOT,
+                        .data = .{ .fd = fd },
+                    };
+                    _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &wait);
+                    continue;
+                },
+                .gone => {
+                    $mod.releaseConn(fd);
+                    $mod.posix.close(fd);
+                    continue;
+                },
             }
-            st.len += bytes_read;
 
             // Same shape as the kqueue pump — see requestLen and retainTail.
             var consumed: usize = 0;
@@ -594,6 +668,14 @@ const WRITE_WAIT_MS: i32 = 10_000;
 // A blocking write is used for the reply (the `reply|zig` body, unchanged): the
 // connections here are never marked non-blocking, so `write` completes or waits,
 // and there is no readiness to wait for anyway.
+//
+// This is also the one pump that does NOT go through `fill`, and the inversion
+// is why: `fill` is a call that fetches bytes, and here nobody calls anything —
+// the bytes are already in the buffer by the time the loop hears about them, and
+// the count arrives in the completion. The three answers `fill` gives are all
+// still here, just read off `cqe.res` instead of returned. Anything that wants
+// to sit between the wire and the parser attaches at that harvest below, not at
+// a call site.
 
 ~proc run|io-uring {
     // `std.os.linux.IoUring` cannot be NAMED on a non-Linux target — it reaches
@@ -724,8 +806,8 @@ const WRITE_WAIT_MS: i32 = 10_000;
         n += 1;
 
         for (&$mod.uk_conns, 0..) |*conn, i| {
-            if (conn.fd < 0) continue;
-            pfds[n] = .{ .fd = conn.fd, .events = $mod.POLLIN, .revents = 0 };
+            if (conn.st.fd < 0) continue;
+            pfds[n] = .{ .fd = conn.st.fd, .events = $mod.POLLIN, .revents = 0 };
             slot[n] = @intCast(i);
             n += 1;
         }
@@ -735,11 +817,11 @@ const WRITE_WAIT_MS: i32 = 10_000;
         // Time passes whether or not anything arrived, so the sweep runs here.
         const now = $mod.wallClockSeconds(null);
         for (&$mod.uk_conns) |*idle| {
-            if (idle.fd < 0) continue;
-            if (idle.len != 0) continue; // mid-request; it is still talking
+            if (idle.st.fd < 0) continue;
+            if (idle.st.len != 0) continue; // mid-request; it is still talking
             if (now - idle.last_seen <= $mod.KEEPALIVE_IDLE_SECONDS) continue;
-            _ = $mod.close(idle.fd);
-            idle.fd = -1;
+            _ = $mod.close(idle.st.fd);
+            idle.st.fd = -1;
         }
 
         if (ready <= 0) continue;
@@ -750,9 +832,9 @@ const WRITE_WAIT_MS: i32 = 10_000;
             // A dead connection frees its slot even when there is nothing to read.
             if (which >= 0 and gone) {
                 const dead = &$mod.uk_conns[@intCast(which)];
-                _ = $mod.close(dead.fd);
-                dead.fd = -1;
-                dead.len = 0;
+                _ = $mod.close(dead.st.fd);
+                dead.st.fd = -1;
+                dead.st.len = 0;
                 continue;
             }
 
@@ -769,14 +851,24 @@ const WRITE_WAIT_MS: i32 = 10_000;
 
             // Read onto the END of what is already held, so a request split
             // across two reads is finished rather than restarted.
-            const got = $mod.recv(live.fd, @ptrCast(&live.buf[live.len]), live.buf.len - live.len, 0);
-            if (got <= 0) {
-                _ = $mod.close(live.fd);
-                live.fd = -1;
-                live.len = 0;
-                continue;
+            // `handler__unikraft`, named outright, because a variants block does
+            // NOT reach a call site written in raw Zig — it rewrites the ones the
+            // flow makes. `run` and `reply` are chosen for us that way; `fill` is
+            // called from inside a loop body, so this body says which reader it
+            // wants. Getting this wrong is invisible on a laptop: the default
+            // body is `posix.read`, which macOS has and a unikernel does not.
+            switch ($mod.fill_event.handler__unikraft(.{ .st = &live.st })) {
+                .more => {},
+                // `poll` said readable, so this pump has no idle case — but the
+                // seam has one, and waiting is always the safe answer to it.
+                .idle => continue,
+                .gone => {
+                    _ = $mod.close(live.st.fd);
+                    live.st.fd = -1;
+                    live.st.len = 0;
+                    continue;
+                },
             }
-            live.len += @intCast(got);
 
             // Heard from — so it is no longer the idlest.
             $mod.uk_seq += 1;
@@ -786,9 +878,9 @@ const WRITE_WAIT_MS: i32 = 10_000;
             // Answer every COMPLETE request — see requestLen and retainTail.
             var consumed: usize = 0;
             var alive = true;
-            while (consumed < live.len) {
-                const take = $mod.requestLen(live.buf[consumed..live.len]) orelse break;
-                var x = $mod.Exchange{ .fd = live.fd, .raw = live.buf[consumed .. consumed + take] };
+            while (consumed < live.st.len) {
+                const take = $mod.requestLen(live.st.buf[consumed..live.st.len]) orelse break;
+                var x = $mod.Exchange{ .fd = live.st.fd, .raw = live.st.buf[consumed .. consumed + take] };
                 arrived(&x);
                 consumed += take;
                 if (!x.keep_alive) {
@@ -796,13 +888,13 @@ const WRITE_WAIT_MS: i32 = 10_000;
                     break;
                 }
             }
-            live.len = $mod.retainTail(&live.buf, live.len, consumed);
-            if (alive and live.len == live.buf.len) alive = false;
+            live.st.len = $mod.retainTail(&live.st.buf, live.st.len, consumed);
+            if (alive and live.st.len == live.st.buf.len) alive = false;
 
             if (!alive) {
-                _ = $mod.close(live.fd);
-                live.fd = -1;
-                live.len = 0;
+                _ = $mod.close(live.st.fd);
+                live.st.fd = -1;
+                live.st.len = 0;
             }
         }
     }

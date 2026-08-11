@@ -18,6 +18,34 @@ pub tor run { port: u16 }
 | failed string
 
 // ============================================================================
+// FILL — get more bytes into a connection's buffer
+// ============================================================================
+// The mirror of `reply`. Writing has had a platform seam since the unikernel
+// arrived; reading did not, and each loop called the socket itself — three
+// spellings of one contract, with nothing in between the wire and the request
+// parser. This is that in-between.
+//
+// The three branches are the three answers, and `idle` is the one the old code
+// could not say. `posix.read` reports "nothing right now" as an error, which the
+// loops caught and turned into zero bytes — the same value a peer that hung up
+// produces. A connection that merely had nothing to say was therefore
+// indistinguishable from one that had gone away.
+//
+// It is also the seam a transport layer needs. Encryption consumes bytes from
+// the wire while producing none for the parser — a handshake is exactly `idle`
+// — and there is no way to express that when the loop reads straight into the
+// buffer the request parser reads out of.
+//
+// @retain: called from the run bodies' raw Zig via $mod.fill_event.handler(...),
+// which the dead-stripper cannot see — the same reason orisha:handler is
+// retained.
+
+[retain]pub tor fill { st: *ConnState }
+| more
+| idle
+| gone
+
+// ============================================================================
 // REPLY — write an answer back
 // ============================================================================
 // `head` and `body` go out in that order; a caller that already holds a whole
