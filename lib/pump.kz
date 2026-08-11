@@ -594,7 +594,23 @@ fn workerCount() usize {
     // left blocking where the connections are not. Multiplexing the listener
     // into a worker's epoll would make one worker answer every new connection
     // as well as its own traffic.
-    var epfds: [$mod.MAX_WORKERS]i32 = undefined;
+    // ONE readiness instance, shared by every worker.
+    //
+    // This was one epoll per worker, with each connection assigned at accept
+    // time and owned by that worker for life. Round-robin hands out connections
+    // without any idea how much work each will turn out to be, and a request
+    // could then only ever be served by the worker it was given to, however
+    // idle the others were.
+    //
+    // ONESHOT keeps the property that made the old design lock-free — exactly
+    // one worker holds a descriptor at a time, so the connection table still
+    // needs no lock. What changes is only WHICH worker, and that it is decided
+    // when the work appears rather than when the connection arrived.
+    //
+    // Measured: 197,065 against 189,447 req/s, winning all three rounds.
+    // It did NOT change the tail (6.99ms against 6.68ms at p99), which was the
+    // reason it was written — see benchmarks/twobox/CONDITIONS.md.
+    var shared_epfd: i32 = -1;
 
     // The per-connection half of the loop, which is the whole loop now that
     // accepting has moved out. One of these runs per worker, each on its own
@@ -664,21 +680,20 @@ fn workerCount() usize {
         }
     };
 
-    for (0..n_workers) |i| {
-        const rc = linux.epoll_create1(0);
-        epfds[i] = @bitCast(@as(u32, @truncate(rc)));
-        if (epfds[i] < 0) return .{ .failed = "Failed to create epoll" };
-        _ = std.Thread.spawn(.{}, Worker.loop, .{epfds[i]}) catch
+    const rc = linux.epoll_create1(0);
+    shared_epfd = @bitCast(@as(u32, @truncate(rc)));
+    if (shared_epfd < 0) return .{ .failed = "Failed to create epoll" };
+    for (0..n_workers) |_| {
+        _ = std.Thread.spawn(.{}, Worker.loop, .{shared_epfd}) catch
             return .{ .failed = "Failed to spawn worker" };
     }
 
     std.debug.print("Orisha listening on http://0.0.0.0:{}\n", .{port});
-    std.debug.print("Pump: epoll, {} workers, keep-alive, TCP_NODELAY\n", .{n_workers});
+    std.debug.print("Pump: epoll, {} workers on one shared queue, keep-alive, TCP_NODELAY\n", .{n_workers});
 
     // Hand each new connection to the next worker in turn. A descriptor belongs
     // to that worker for the rest of its life, which is what makes the shared
     // connection table safe without a lock: no index is ever touched twice.
-    var next: usize = 0;
     while (true) {
         const conn = server.accept() catch continue;
         const client_fd = conn.stream.handle;
@@ -689,8 +704,7 @@ fn workerCount() usize {
             .events = linux.EPOLL.IN | linux.EPOLL.ONESHOT,
             .data = .{ .fd = client_fd },
         };
-        _ = linux.epoll_ctl(epfds[next], linux.EPOLL.CTL_ADD, client_fd, &client_event);
-        next = (next + 1) % n_workers;
+        _ = linux.epoll_ctl(shared_epfd, linux.EPOLL.CTL_ADD, client_fd, &client_event);
     }
 
     return .{ .stopped = "Server stopped" };
