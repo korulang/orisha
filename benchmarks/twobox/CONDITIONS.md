@@ -135,6 +135,39 @@ pressure; this experiment had none.
 provenance for every run — including the runs where most contestants were
 excluded by our own misconfiguration, which are kept rather than deleted.
 
+## Open: the tail, and a retraction
+
+Orisha had the highest median throughput in the field and the worst tail in it.
+On the droplet, p99 came in at 21, 68 and 113 ms across three rounds while p50
+stayed at 537 µs. H2O held 3–7 ms and nginx 2.7–6.3 ms on the same workload, and
+our own io_uring pump held 2.2–2.5 ms on the same dispatch. **That part stands**
+— separate machines, dedicated CPU, load generator elsewhere.
+
+**Retracted:** an earlier version of this file reported a "240x median-to-tail
+ratio at twenty connections" measured on a laptop, and concluded from it that the
+tail was fixed rather than concurrency-driven. It does not reproduce. Re-measured
+on the same machine with the same server and the same command, p99 at twenty
+connections came back at 324 µs and 256 µs rather than 22.42 ms. The original
+figure was taken while other work was running on that machine and is an artifact
+of it. The conclusion drawn from it — that the stall is periodic — has no
+evidence behind it and is withdrawn.
+
+What that leaves is smaller and true: **on the droplet the tail is real and
+unexplained.** One thing is known about it. With per-exchange timing compiled
+into the worker, a local run recorded zero exchanges over 5 ms while serving at
+full rate — so wherever the time goes, it is not inside request handling. That
+points at the kernel, the socket path, or the measurement itself, and needs the
+same instrumentation run on the droplet where the tail actually appears.
+
+A server with a 113 ms p99 is worse than one 40% slower with a 4 ms p99 for
+anything a person is waiting on, so this is worth finishing.
+
+## Results
+
+`results/<timestamp>/` holds the report, the raw per-round lines, and the machine
+provenance for every run — including the runs where most contestants were
+excluded by our own misconfiguration, which are kept rather than deleted.
+
 ## Open: the tail
 
 Orisha has the highest median throughput in the field and the worst tail in it.
