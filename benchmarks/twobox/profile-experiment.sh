@@ -87,6 +87,18 @@ for k in ['orisha-cold','orisha-warm','nginx','h2o']:
     if k not in rows: continue
     m=st.median(rows[k])
     print(f"| {k} | {m:,.0f} | {m/base:.3f}x |")
+# The failure this catches: if every contestant lands within a couple of percent
+# of every other, the number is a property of the link, not of any server. A
+# whole-site workload did exactly that at ~21,000 req/s — mean payload 49 KB
+# against a 2 Gbit link — and would have been reported as "layout does nothing"
+# by a run that never tested layout.
+vals=[st.median(v) for v in rows.values() if v]
+if vals and (max(vals)-min(vals))/max(vals) < 0.05:
+    print("\n> **SUSPECT: every contestant landed within 5% of every other.**")
+    print("> That is the signature of a shared bottleneck — almost always the")
+    print("> network. Check mean payload against link capacity before reading")
+    print("> anything into these numbers.\n")
+
 print("\nnginx and h2o are controls — neither can read a profile, so any movement")
 print("between their rounds is the machine, not the experiment.\n")
 for k in rows: print(f"  {k}: {', '.join(f'{v:,.0f}' for v in rows[k])}")

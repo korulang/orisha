@@ -32,6 +32,13 @@ ap.add_argument("--zipf", type=float, default=1.1)
 ap.add_argument("--seed", type=int, default=7)
 ap.add_argument("--train-n", type=int, default=50_000)
 ap.add_argument("--test-n", type=int, default=20_000)
+# Keep the workload CPU-bound. Spread across the whole site sounds more honest
+# and is not: the mean on-wire payload there is ~49 KB, which at a 2 Gbit link
+# caps throughput near 5,000 req/s for every contestant equally. That measures
+# the cable, and it would have reported "layout does nothing" for a reason that
+# has nothing to do with layout — a false negative with a plausible face.
+ap.add_argument("--max-bytes", type=int, default=4096,
+                help="only include files at or under this size ON THE WIRE")
 a = ap.parse_args()
 
 paths = []
@@ -39,7 +46,12 @@ for root, _, files in os.walk(a.site):
     for f in files:
         if f.endswith(".gz"):
             continue
-        rel = os.path.relpath(os.path.join(root, f), a.site).replace(os.sep, "/")
+        full = os.path.join(root, f)
+        gz = full + ".gz"
+        on_wire = os.path.getsize(gz) if os.path.exists(gz) else os.path.getsize(full)
+        if a.max_bytes and on_wire > a.max_bytes:
+            continue
+        rel = os.path.relpath(full, a.site).replace(os.sep, "/")
         paths.append("/" + rel)
 paths.sort()
 if not paths:
@@ -77,7 +89,7 @@ end
 
 overlap = len(set(train[:1000]) & set(test[:1000]))
 top = sorted({p: train.count(p) for p in set(train[:2000])}.items(), key=lambda kv: -kv[1])[:3]
-print(f"routes={len(paths)} zipf={a.zipf} train={len(train)} test={len(test)}")
+print(f"routes={len(paths)} (<= {a.max_bytes} bytes on the wire) zipf={a.zipf} train={len(train)} test={len(test)}")
 print(f"top of the profile: {', '.join(f'{p} x{c}' for p, c in top)}")
 print(f"distinct in train={len(set(train))} distinct in test={len(set(test))}")
 print(f"(the two samples share a distribution, not a sequence)")
