@@ -988,7 +988,74 @@ fn appendFmt(allocator: std.mem.Allocator, list: *std.ArrayList(u8), comptime fm
     try list.appendSlice(allocator, std.fmt.bufPrint(&buf, fmt, args) catch return error.OutOfMemory);
 }
 
-fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes: []const ProcessedRoute, name: []const u8) !void {
+// Order the routes by how often they are actually requested.
+//
+// This is the compile-time half of what a C toolchain calls profile-guided
+// optimisation, and it is available here for a reason no other web server can
+// copy: at the moment this runs, the entire site is a value in memory. nginx
+// cannot reorder around your traffic because nginx has not met your site yet —
+// it discovers files at runtime, one open() at a time, which is the only moment
+// at which reordering is no longer free.
+//
+// What ordering buys is NOT lookup: the table is a comptime hash and a hash does
+// not care where an entry sits. What it buys is LAYOUT — the response bodies are
+// emitted in this order, so the pages that serve most of the traffic end up
+// adjacent in the binary instead of scattered across it by alphabetical
+// accident. Whether that is worth anything is an empirical question and it may
+// well be worth nothing; see benchmarks/twobox.
+//
+// The profile is `orisha.profile` in the working directory when it exists — a
+// plain access log. No profile, no reordering, and it says which it did.
+fn orderByProfile(allocator: std.mem.Allocator, routes: []ProcessedRoute) void {
+    const profile_text = std.fs.cwd().readFileAlloc(allocator, "orisha.profile", 64 * 1024 * 1024) catch {
+        std.debug.print("[STATIC_ROUTER] profile: none (orisha.profile absent) — routes keep directory order\n", .{});
+        return;
+    };
+    defer allocator.free(profile_text);
+
+    var hits = std.StringHashMap(u64).init(allocator);
+    defer hits.deinit();
+
+    // Common-log format: the path is the second field of the quoted request.
+    var lines = std.mem.splitScalar(u8, profile_text, '\n');
+    var counted: u64 = 0;
+    while (lines.next()) |line| {
+        const q = std.mem.indexOfScalar(u8, line, '"') orelse continue;
+        var parts = std.mem.tokenizeScalar(u8, line[q + 1 ..], ' ');
+        _ = parts.next() orelse continue; // method
+        const path = parts.next() orelse continue;
+        const gop = hits.getOrPut(path) catch continue;
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* += 1;
+        counted += 1;
+    }
+    if (counted == 0) {
+        std.debug.print("[STATIC_ROUTER] profile: orisha.profile parsed to 0 requests — routes keep directory order\n", .{});
+        return;
+    }
+
+    const Ctx = struct {
+        h: *std.StringHashMap(u64),
+        fn hotter(self: @This(), a: ProcessedRoute, b: ProcessedRoute) bool {
+            const ha = self.h.get(a.path) orelse 0;
+            const hb = self.h.get(b.path) orelse 0;
+            if (ha != hb) return ha > hb;
+            return std.mem.lessThan(u8, a.path, b.path); // stable for the cold tail
+        }
+    };
+    std.sort.block(ProcessedRoute, routes, Ctx{ .h = &hits }, Ctx.hotter);
+
+    var named: u64 = 0;
+    for (routes) |r| { if (hits.get(r.path)) |_| named += 1; }
+    std.debug.print("[STATIC_ROUTER] profile: {d} requests over {d} paths — hottest is {s}, {d}/{d} routes appear\n", .{ counted, hits.count(), routes[0].path, named, routes.len });
+}
+
+fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes_const: []const ProcessedRoute, name: []const u8) !void {
+    // Copied because ordering mutates, and the caller's slice is shared.
+    const routes = try allocator.dupe(ProcessedRoute, routes_const);
+    defer allocator.free(routes);
+    orderByProfile(allocator, routes);
+
     std.fs.cwd().makeDir("generated") catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
