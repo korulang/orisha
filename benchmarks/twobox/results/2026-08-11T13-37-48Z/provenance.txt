@@ -1,0 +1,5 @@
+region=ams3 size=c-4 image=debian-13-x64
+server=6.12.94+deb13-amd64 4  Intel(R) Xeon(R) Platinum 8280 CPU @ 2.70GHz 
+load=6.12.94+deb13-amd64 4 
+duration=15s rounds=3 workload=/index.html@200 /index.html@50 /200.html@200
+--- excluded contestants ---

@@ -68,7 +68,7 @@ $SSH "root@$SERVER_PUB" 'cd /root/bench && chmod +x setup.sh && ./setup.sh'
 STAMP="$(date -u +%Y-%m-%dT%H-%M-%SZ)"
 OUT="$HERE/results/$STAMP"; mkdir -p "$OUT"
 {
-	echo "region=$REGION size=$SIZE image=debian-12-x64"
+	echo "region=$REGION size=$SIZE image=debian-13-x64"
 	echo "server=$($SSH "root@$SERVER_PUB" 'uname -r; nproc; grep -m1 "model name" /proc/cpuinfo | cut -d: -f2-' | tr '\n' ' ')"
 	echo "load=$($SSH "root@$LOAD_PUB" 'uname -r; nproc' | tr '\n' ' ')"
 	echo "duration=$DUR rounds=$ROUNDS workload=${WORKLOAD[*]}"
@@ -83,7 +83,11 @@ cat "$OUT/provenance.txt"
 declare -A PORTMAP=( [ols]=8088 )   # OpenLiteSpeed does not listen on 3000
 ALL=(orisha-epoll orisha-uring nginx caddy sws h2o ols)
 
-up()   { $SSH "root@$SERVER_PUB" "docker rm -f live >/dev/null 2>&1; docker run -d --rm --name live --network host bench-$1 >/dev/null"; sleep 6; }
+# seccomp=unconfined because Docker's default profile blocks io_uring_setup, and
+# a blocked syscall is indistinguishable from a missing feature from inside. It
+# is applied to EVERY contestant, not just ours, so nobody is sandboxed
+# differently from anybody else.
+up()   { $SSH "root@$SERVER_PUB" "docker rm -f live >/dev/null 2>&1; docker run -d --rm --name live --network host --security-opt seccomp=unconfined bench-$1 >/dev/null"; sleep 6; }
 down() { $SSH "root@$SERVER_PUB" 'docker rm -f live >/dev/null 2>&1' || true; sleep 2; }
 steal() { $SSH "root@$SERVER_PUB" "awk '/^cpu /{print \$9}' /proc/stat"; }
 

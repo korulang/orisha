@@ -736,8 +736,23 @@ fn workerCount() usize {
     const server = $mod.openListener(port) orelse return .{ .failed = "Failed to listen" };
     const listen_fd = server.stream.handle;
 
-    var ring = linux.IoUring.init($mod.URING_ENTRIES, 0) catch
-        return .{ .failed = "io_uring unavailable — needs Linux 5.1 or later" };
+    // Say which io_uring is missing, because there are two very different
+    // reasons and they need opposite responses. A kernel older than 5.1 has no
+    // io_uring at all. A modern kernel inside a container usually HAS it and is
+    // being refused by the sandbox: Docker's default seccomp profile blocks
+    // io_uring_setup, so `uname -r` says 6.12 while the call still fails.
+    //
+    // Measured 2026-08-11: this reported "needs Linux 5.1 or later" on a 6.12
+    // kernel, which is a diagnostic pointing at the wrong cause — the fix was
+    // `--security-opt seccomp=unconfined`, not an upgrade.
+    var ring = linux.IoUring.init($mod.URING_ENTRIES, 0) catch |err| {
+        const why = switch (err) {
+            error.PermissionDenied, error.SystemOutdated => "io_uring refused: the kernel has it but something is blocking io_uring_setup — a container seccomp profile is the usual cause (try --security-opt seccomp=unconfined), or the kernel predates 5.1",
+            error.SystemResources => "io_uring unavailable: not enough locked memory for the ring — raise RLIMIT_MEMLOCK",
+            else => "io_uring unavailable — io_uring_setup failed",
+        };
+        return .{ .failed = why };
+    };
 
     _ = ring.accept($mod.URING_ACCEPT, listen_fd, null, null, 0) catch
         return .{ .failed = "io_uring accept" };

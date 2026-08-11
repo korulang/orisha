@@ -1,0 +1,69 @@
+WIRE|orisha-epoll|Content-Encoding: gzip Content-Length: 13340 
+VERIFY|orisha-epoll|1123|0|1123
+WIRE|orisha-uring|
+    MISMATCH .DS_Store (want 8196, got 0)
+./measure.sh: line 38: /tmp/tmp.i1FU5dPQFx/0: No such file or directory
+    MISMATCH 200.html (want 2543, got 0)
+./measure.sh: line 38: /tmp/tmp.i1FU5dPQFx/1: No such file or directory
+    MISMATCH KoruLogo.afphoto (want 1500722, got 0)
+./measure.sh: line 38: /tmp/tmp.i1FU5dPQFx/2: No such file or directory
+    MISMATCH KoruLogo.afphoto~lock~ (want 107, got 0)
+./measure.sh: line 38: /tmp/tmp.i1FU5dPQFx/3: No such file or directory
+    MISMATCH KoruLogo.png (want 223288, got 0)
+./measure.sh: line 38: /tmp/tmp.i1FU5dPQFx/4: No such file or directory
+VERIFY|orisha-uring|0|1123|1123
+WIRE|nginx|Content-Encoding: gzip Content-Length: 13312 
+    MISMATCH diagrams/event-flow.svg (want 19205, got 153)
+VERIFY|nginx|1122|1|1123
+WIRE|caddy|Content-Encoding: gzip Content-Length: 13312 
+VERIFY|caddy|1123|0|1123
+WIRE|sws|content-encoding: gzip 
+    MISMATCH .DS_Store (want 8196, got 312)
+    MISMATCH fonts/.DS_Store (want 6148, got 312)
+    MISMATCH images/.DS_Store (want 6148, got 312)
+    MISMATCH screenshots/.DS_Store (want 6148, got 312)
+    MISMATCH screenshots/studio/.DS_Store (want 6148, got 312)
+VERIFY|sws|1118|5|1123
+WIRE|h2o|
+    MISMATCH .DS_Store (want 8196, got 0)
+./measure.sh: line 38: /tmp/tmp.iMNVup2fLb/0: No such file or directory
+    MISMATCH 200.html (want 2543, got 0)
+./measure.sh: line 38: /tmp/tmp.iMNVup2fLb/1: No such file or directory
+    MISMATCH KoruLogo.afphoto (want 1500722, got 0)
+./measure.sh: line 38: /tmp/tmp.iMNVup2fLb/2: No such file or directory
+    MISMATCH KoruLogo.afphoto~lock~ (want 107, got 0)
+./measure.sh: line 38: /tmp/tmp.iMNVup2fLb/3: No such file or directory
+./measure.sh: line 38: /tmp/tmp.iMNVup2fLb/4: No such file or directory
+    MISMATCH KoruLogo.png (want 223288, got 0)
+VERIFY|h2o|0|1123|1123
+WIRE|ols|content-encoding: gzip content-length: 3281 
+    MISMATCH .DS_Store (want 8196, got 195)
+    MISMATCH 200.html (want 2543, got 195)
+    MISMATCH KoruLogo.afphoto (want 1500722, got 195)
+    MISMATCH KoruLogo.afphoto~lock~ (want 107, got 195)
+    MISMATCH KoruLogo.png (want 223288, got 195)
+VERIFY|ols|0|1123|1123
+RESULT|orisha-epoll|/index.html|200|18267.80|7.66ms|589.27ms|0
+RESULT|orisha-epoll|/index.html|50|18317.92|797.00us|256.00ms|0
+RESULT|orisha-epoll|/200.html|200|172687.72|769.00us|6.15ms|0
+STEAL|orisha-epoll|round1|41
+RESULT|caddy|/index.html|200|18193.01|6.57ms|586.83ms|0
+RESULT|caddy|/index.html|50|18145.25|1.47ms|214.79ms|0
+RESULT|caddy|/200.html|200|23922.72|7.72ms|34.53ms|0
+STEAL|caddy|round1|25
+RESULT|orisha-epoll|/index.html|200|18293.71|7.82ms|571.15ms|0
+RESULT|orisha-epoll|/index.html|50|18311.11|840.00us|216.09ms|0
+RESULT|orisha-epoll|/200.html|200|171818.35|740.00us|6.88ms|0
+STEAL|orisha-epoll|round2|47
+RESULT|caddy|/index.html|200|18164.43|6.30ms|605.99ms|0
+RESULT|caddy|/index.html|50|18152.80|1.40ms|239.19ms|0
+RESULT|caddy|/200.html|200|24378.25|7.59ms|32.42ms|0
+STEAL|caddy|round2|24
+RESULT|orisha-epoll|/index.html|200|18273.94|7.69ms|590.71ms|0
+RESULT|orisha-epoll|/index.html|50|18311.37|840.00us|216.35ms|0
+RESULT|orisha-epoll|/200.html|200|166878.00|830.00us|6.01ms|0
+STEAL|orisha-epoll|round3|48
+RESULT|caddy|/index.html|200|18119.57|6.37ms|610.97ms|0
+RESULT|caddy|/index.html|50|18150.40|1.43ms|217.16ms|0
+RESULT|caddy|/200.html|200|24167.49|7.64ms|32.89ms|0
+STEAL|caddy|round3|39

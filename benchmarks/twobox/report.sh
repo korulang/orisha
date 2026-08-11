@@ -32,8 +32,10 @@ print("| server | identical | wrong | of |"); print("|---|---|---|---|")
 for c,(ok,bad,tot) in sorted(verify.items()):
     print(f"| {c} | {ok} | {bad} | {tot} |")
 print("\n## CPU steal on the server during runs\n")
-print("Non-zero steal means the machine lost cycles to a neighbour and the run")
-print("is suspect, however good the number looks.\n")
+print("Steal is cycles the hypervisor gave to someone else. Reported as a share")
+print("of the run so it can be judged rather than just noted: under ~1% is")
+print("ordinary even on dedicated instances, and several percent means the")
+print("number above is not about the server.\n")
 print("| server | steal ticks (per round) |"); print("|---|---|")
 for c in sorted(steal): print(f"| {c} | {', '.join(map(str,steal[c]))} |")
 PY

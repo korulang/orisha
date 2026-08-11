@@ -10,7 +10,7 @@ set -euo pipefail
 
 REGION="${REGION:-ams3}"
 SIZE="${SIZE:-c-4}"
-IMAGE="${IMAGE:-debian-12-x64}"
+IMAGE="${IMAGE:-debian-13-x64}"
 KEY_NAME="${KEY_NAME:-koru-bench}"
 TAG="orisha-twobox"
 
