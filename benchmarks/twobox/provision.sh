@@ -25,6 +25,15 @@ fi
 
 VPC_ID="$(doctl vpcs list --format ID,Region,Default --no-header | awk -v r="$REGION" '$2==r {print $1; exit}')"
 
+# Refuse to add a second pair on top of a first. A stale pair does not announce
+# itself: the tag lookup happily returns four machines, the IPs come out of a
+# race, and the bill quietly doubles. Measured 2026-08-11, by doing it.
+EXISTING="$(doctl compute droplet list --tag-name "$TAG" --format Name --no-header | wc -l | tr -d ' ')"
+if [ "$EXISTING" != "0" ]; then
+	echo "$EXISTING droplet(s) already tagged $TAG. Run ./teardown.sh first, or REUSE=1 to use them." >&2
+	[ "${REUSE:-0}" = "1" ] || exit 1
+	echo "==> reusing the existing pair"
+else
 echo "==> creating 2x $SIZE in $REGION (vpc ${VPC_ID:-default})"
 for name in orisha-bench-server orisha-bench-load; do
 	doctl compute droplet create "$name" \
@@ -33,6 +42,7 @@ for name in orisha-bench-server orisha-bench-load; do
 		${VPC_ID:+--vpc-uuid "$VPC_ID"} \
 		--wait --format ID,Name,PublicIPv4 --no-header
 done
+fi
 
 # Public IP to reach them from here; private IP for the load itself.
 read_ip() { doctl compute droplet list --tag-name "$TAG" --format Name,PublicIPv4,PrivateIPv4 --no-header | awk -v n="$1" '$1==n {print $2, $3}'; }
