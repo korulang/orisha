@@ -135,6 +135,50 @@ pressure; this experiment had none.
 provenance for every run — including the runs where most contestants were
 excluded by our own misconfiguration, which are kept rather than deleted.
 
+## The tail: measured, and it is queueing rather than slow work
+
+Orisha has the highest median throughput in the field and an unstable tail. On
+the droplet, p99 has come in at 11.86, 21, 68 and 113 ms across runs while p50
+stays under 1 ms. H2O holds 3–7 ms and nginx 2.7–6.3 ms on the same workload.
+
+**Retracted:** an earlier version of this file reported a "240x median-to-tail
+ratio at twenty connections" from a laptop and concluded the tail was fixed
+rather than concurrency-driven. It does not reproduce — the same server and
+command later gave 324 µs and 256 µs, not 22.42 ms. The original was taken while
+other work ran on that machine. The conclusion drawn from it is withdrawn.
+
+**What replaced it is a measurement.** A build with per-exchange timing compiled
+into the worker was run on the droplet under the conditions that produce the
+tail:
+
+    client:  158,877 req/s,  p50 686 µs,  p99 11.86 ms
+    server:  6 exchanges over 5 ms, out of ~3.2 million requests
+
+A p99 of 11.86 ms at that rate means roughly 32,000 requests were slower than
+11.86 ms. The server believes it spent more than 5 ms on six of them. **The time
+is not being spent in request handling.**
+
+It is spent before the handler sees the bytes: queued in a worker's ready-list
+while that worker serves other connections. With 200 connections over 4 workers,
+a request can arrive and then wait behind dozens of others. A timer around the
+handler cannot see that by construction, which is why every hypothesis aimed at
+the handler was wrong.
+
+The six genuinely slow exchanges clustered inside a ~370 ms window rather than
+spreading evenly, so there is a transient in there as well as the queueing.
+
+**What would fix it** is not faster handling — handling is already fast. It is
+fairness: more workers than cores so a blocked one does not hold its queue, or
+work-stealing between workers, or bounding how many ready connections a worker
+drains before returning to its readiness call. nginx and H2O both spread
+connections more evenly than round-robin-at-accept does.
+
+## Results
+
+`results/<timestamp>/` holds the report, the raw per-round lines, and the machine
+provenance for every run — including the runs where most contestants were
+excluded by our own misconfiguration, which are kept rather than deleted.
+
 ## Open: the tail, and a retraction
 
 Orisha had the highest median throughput in the field and the worst tail in it.
