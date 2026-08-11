@@ -1,0 +1,22 @@
+# Local verification only. This file NEVER contacts a certificate authority.
+#
+# It exists because the production Caddyfile does the opposite: name a real
+# domain and Caddy immediately goes and asks a public authority for a real
+# certificate for it. Running that config on a laptop registers an account and
+# opens a validation attempt for a domain the laptop does not answer for — which
+# is a request made to the outside world as a side effect of a local test.
+#
+# `tls internal` is what keeps this honest: Caddy signs with its own authority
+# and talks to nobody. The TLS is real — real handshake, real ciphers, real
+# encrypted bytes — it is only the signature that is local.
+
+{
+	# No ACME, no account, no email. Nothing here reaches out.
+	local_certs
+	admin off
+}
+
+localhost, 127.0.0.1 {
+	tls internal
+	reverse_proxy orisha:3000
+}

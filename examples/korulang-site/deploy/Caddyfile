@@ -1,0 +1,35 @@
+# TLS for korulang.org, terminated in front of Orisha.
+#
+# Orisha speaks plain HTTP and has no HTTPS of its own. That is a real gap, not
+# a design choice, and this file is the shape that gap takes in production:
+# something in front holds the certificate and speaks TLS to the world, and
+# Orisha serves the site behind it. It is what sits in front of most servers on
+# the internet, including every one this site used to be served by.
+#
+# Caddy obtains and renews the certificate from Let's Encrypt by itself, on the
+# strength of the domain name below resolving to this machine. There is no
+# certificate step to run and nothing to remember to renew.
+#
+# ⚠ THIS FILE REACHES THE OUTSIDE WORLD ON STARTUP. Naming a real domain here is
+# not a description of where the site will live — Caddy immediately registers an
+# account with a public authority and opens a validation attempt for that name.
+# On a machine the domain does not resolve to, that is a failed attempt against
+# a rate limit, made as a side effect of starting a container. For anything local
+# use `Caddyfile.local`, which is what `compose.yaml` defaults to.
+
+{
+	# An operator address for the certificate authority to reach. Override at
+	# deploy time; a bad address here fails at issuance, loudly.
+	email admin@korulang.org
+}
+
+korulang.org, www.korulang.org {
+	encode gzip
+	reverse_proxy orisha:3000
+}
+
+# The same thing, for a local run. Caddy issues this one from its internal
+# authority, so a browser needs Caddy's root trusted — see the README.
+localhost {
+	reverse_proxy orisha:3000
+}

@@ -1,0 +1,46 @@
+# korulang.org: Orisha serving, Caddy holding the certificate.
+#
+# Orisha is NOT published to the host. It listens only on the private network
+# between these two containers, so the only way in from outside is through the
+# thing that speaks TLS. A plain-HTTP server on a public port would be the sort
+# of arrangement that works fine until someone notices.
+#
+# The config file is a VARIABLE, and it defaults to the local one on purpose.
+# Caddy treats a real domain name in its config as an instruction to go and get
+# a real certificate for it, immediately, from a public authority — so a config
+# naming korulang.org is not a description of intent, it is an outward action
+# that fires the moment the container starts. Defaulting to the local file means
+# `docker compose up` on a laptop cannot do that by accident.
+#
+#   local  (default):  docker compose up --build
+#   production:        CADDYFILE=./Caddyfile docker compose up -d --build
+
+services:
+  orisha:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: korulang-site
+    restart: unless-stopped
+    expose:
+      - "3000"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - ${CADDYFILE:-./Caddyfile.local}:/etc/caddy/Caddyfile:ro
+      # Certificates and account keys. Losing this volume means re-issuing on
+      # next boot, which public authorities rate-limit — so it outlives the
+      # container.
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - orisha
+
+volumes:
+  caddy_data:
+  caddy_config:
