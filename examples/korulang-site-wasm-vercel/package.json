@@ -1,0 +1,5 @@
+{
+  "name": "koru-site-wasm",
+  "private": true,
+  "type": "module"
+}

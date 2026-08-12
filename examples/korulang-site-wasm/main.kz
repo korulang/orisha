@@ -1,0 +1,78 @@
+// korulang.org, whole, compiled to WebAssembly.
+//
+// The same three lines the native build uses — embed the site, route it — minus
+// the one that owns a socket. `orisha:serve` runs a readiness loop; on a
+// serverless host the platform owns that loop and there is nothing left for a
+// pump to do.
+//
+// What makes this possible is that Orisha already split the two halves.
+// `orisha:answer` is declared platform-free by construction (lib/index.k:107):
+// it takes request bytes and returns response bytes and never names a file
+// descriptor. Every pump shares it. So the wasm build keeps that half and drops
+// the pump entirely.
+//
+// Zero-copy on the way out: a static route hands back a COMPLETE pre-rendered
+// HTTP response — headers, gzip, ETag and all — so the host is given a pointer
+// into the embedded data rather than a copy of it. Nothing is allocated per
+// request for the body, which matters when a body can be two megabytes.
+
+const std = @import("std");
+
+~import orisha
+~import std/build
+~import std/package
+
+~std/package:requires.npm { "@korulang/gzip": "^0.0.1" }
+
+~std/build:config {
+    "target": "wasm32-freestanding"
+}
+
+~std/build:requires {
+    exe.entry = .disabled;
+    exe.rdynamic = true;
+    exe.root_module.link_libc = false;
+    exe.root_module.optimize = .ReleaseSmall;
+}
+
+~orisha:static(name: "site", root: "../../../korulang_org/build", fallback: "200.html")
+
+~orisha:handler = orisha:static-router(name: "site")
+
+// ---------------------------------------------------------------------------
+// The host seam.
+// ---------------------------------------------------------------------------
+
+// Where the host writes the raw request line. A request head has a bound; a
+// response does not, which is why only this direction is a fixed buffer.
+var request_buf: [8192]u8 = undefined;
+
+var out_ptr: [*]const u8 = undefined;
+var out_len: usize = 0;
+
+export fn request_ptr() [*]u8 {
+    return &request_buf;
+}
+
+export fn request_cap() u32 {
+    return @intCast(request_buf.len);
+}
+
+export fn response_ptr() [*]const u8 {
+    return out_ptr;
+}
+
+// Answer the raw request sitting in `request_buf`; returns the response length.
+// `head` carries the whole thing for a static route and `body` is empty, which
+// is the case that lets this hand back a pointer instead of a copy.
+export fn handle(raw_len: u32) u32 {
+    const raw = request_buf[0..@min(raw_len, request_buf.len)];
+    const answer = koru_orisha.answer_event.handler(.{ .raw = raw });
+
+    if (answer.body.len == 0) {
+        out_ptr = answer.head.ptr;
+        out_len = answer.head.len;
+        return @intCast(out_len);
+    }
+    return 0;
+}

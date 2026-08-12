@@ -1,0 +1,13 @@
+# Build artifacts — the deployable inputs are the compiled module (wasm/) plus
+# the adapter in api/. Everything else stays out of the bundle.
+#
+# The local-proof harness is anchored with a leading slash on purpose: an
+# unanchored `serve.mjs` matches at ANY depth, which silently excluded
+# api/serve.mjs and failed the deploy with "doesn't match any Serverless
+# Functions inside the api directory".
+*.zig
+*.ast.json
+a.out
+zig-out/
+.zig-cache/
+/serve.mjs
