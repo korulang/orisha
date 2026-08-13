@@ -865,7 +865,9 @@ fn processDirectory(allocator: std.mem.Allocator, routes: *std.ArrayList(Process
         else
             std.fmt.allocPrint(allocator, "{s}/{s}", .{ base_path, entry.path }) catch continue;
         const content = std.fs.cwd().readFileAlloc(allocator, file_path, 10 * 1024 * 1024) catch continue;
-        const http_resp = buildHttpResponse(allocator, content, mimeTypeFromPath(file_path)) catch continue;
+        // SvelteKit's hashed assets all live under /_app/ — their URLs change
+        // when the content does, so they are safe to cache as immutable.
+        const http_resp = buildHttpResponse(allocator, content, mimeTypeFromPath(file_path), std.mem.startsWith(u8, route_path, "/_app/")) catch continue;
         routes.append(allocator, .{ .method = method, .path = route_path, .response = http_resp.response, .etag = http_resp.etag }) catch continue;
         if (std.mem.eql(u8, entry.path, "index.html") and std.mem.eql(u8, base_path, "/")) {
             routes.append(allocator, .{ .method = method, .path = "/", .response = http_resp.response, .etag = http_resp.etag }) catch continue;
@@ -898,7 +900,7 @@ fn processDirectory(allocator: std.mem.Allocator, routes: *std.ArrayList(Process
 fn processFile(allocator: std.mem.Allocator, routes: *std.ArrayList(ProcessedRoute), method: []const u8, path: []const u8, file_path: []const u8, content_type_override: ?[]const u8) void {
     const content = std.fs.cwd().readFileAlloc(allocator, file_path, 10 * 1024 * 1024) catch return;
     const content_type = content_type_override orelse mimeTypeFromPath(file_path);
-    const http_resp = buildHttpResponse(allocator, content, content_type) catch return;
+    const http_resp = buildHttpResponse(allocator, content, content_type, std.mem.startsWith(u8, path, "/_app/")) catch return;
     routes.append(allocator, .{ .method = method, .path = path, .response = http_resp.response, .etag = http_resp.etag }) catch return;
 }
 
@@ -945,7 +947,7 @@ fn gzipCompress(allocator: std.mem.Allocator, content: []const u8) ?[]const u8 {
     return allocator.realloc(output, compressed_size) catch output[0..compressed_size];
 }
 
-fn buildHttpResponse(allocator: std.mem.Allocator, content: []const u8, content_type: []const u8) !HttpResponse {
+fn buildHttpResponse(allocator: std.mem.Allocator, content: []const u8, content_type: []const u8, is_immutable: bool) !HttpResponse {
     var etag_buf: [64]u8 = undefined;
     computeEtag(content, &etag_buf);
     const etag = try allocator.dupe(u8, etag_buf[0..16]);
@@ -961,7 +963,22 @@ fn buildHttpResponse(allocator: std.mem.Allocator, content: []const u8, content_
     try response.appendSlice(allocator, std.fmt.bufPrint(&len_buf, "{}", .{body.len}) catch "0");
     try response.appendSlice(allocator, "\r\nETag: \"");
     try response.appendSlice(allocator, etag);
-    try response.appendSlice(allocator, "\"\r\nConnection: keep-alive\r\n\r\n");
+    // The baked content cannot change without a rebuild, so it is safe to
+    // cache: hashed asset URLs are immutable for a year; pages get a one-day
+    // shared-cache lifetime with stale-while-revalidate, and the client
+    // revalidates via the ETag above (max-age=0 on the client-facing header).
+    //
+    // This is what moves a Vercel deployment off the function-per-request
+    // meter: the edge caches a Function response that carries s-maxage, and
+    // without a Cache-Control of our own Vercel injects
+    // `public, max-age=0, must-revalidate` — every request, asset included,
+    // runs the serverless function.
+    try response.appendSlice(allocator, "\"\r\nConnection: keep-alive\r\nCache-Control: ");
+    try response.appendSlice(allocator, if (is_immutable)
+        "public, max-age=31536000, s-maxage=31536000, immutable"
+    else
+        "public, max-age=0, s-maxage=86400, stale-while-revalidate=86400");
+    try response.appendSlice(allocator, "\r\n\r\n");
     try response.appendSlice(allocator, body);
     return .{ .response = response.items, .etag = etag };
 }
