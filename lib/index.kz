@@ -212,6 +212,12 @@ pub const ConnHandle = struct {
 // mechanism `*Request` uses.
 pub const ContentType = []const u8;
 
+// The response shape every handler/tor produces. A NAMED type so a user tor
+// chained from a router branch (`-> my-handler(req)`) returns the SAME Zig type
+// as the abstract handler — anonymous struct outputs are nominally distinct in
+// Zig and a `return` would fail to unify despite identical fields.
+pub const Response = struct { status: u16, body: []const u8, content_type: ?ContentType };
+
 // The header is built into a buffer that outlives the frame, because `answer`
 // returns a SLICE of it and a slice of a dead frame is a bug this file has
 // shipped before.
@@ -325,15 +331,23 @@ fn requestPathKey(allocator: std.mem.Allocator, target: []const u8) []const u8 {
     }
 
     var client_etag: ?[]const u8 = null;
-    if (std.mem.indexOf(u8, raw, "If-None-Match: ")) |etag_start| {
-        const etag_val_start = etag_start + 15;
-        if (std.mem.indexOf(u8, raw[etag_val_start..], "\r\n")) |etag_end| {
-            var etag_raw = raw[etag_val_start .. etag_val_start + etag_end];
-            if (etag_raw.len >= 2 and etag_raw[0] == '"' and etag_raw[etag_raw.len - 1] == '"') {
-                etag_raw = etag_raw[1 .. etag_raw.len - 1];
-            }
-            client_etag = etag_raw;
+    // Header names are case-insensitive. The Vercel adapter used to omit this
+    // header entirely; once it forwards it, browsers send `If-None-Match` in
+    // whatever casing their stack picked, and a literal search would miss.
+    var scan: usize = 0;
+    while (scan < raw.len) {
+        const nl = std.mem.indexOfPos(u8, raw, scan, "\r\n") orelse break;
+        const line = raw[scan..nl];
+        scan = nl + 2;
+        if (line.len < 15) continue;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (!std.ascii.eqlIgnoreCase(line[0..colon], "if-none-match")) continue;
+        var etag_raw = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        if (etag_raw.len >= 2 and etag_raw[0] == '"' and etag_raw[etag_raw.len - 1] == '"') {
+            etag_raw = etag_raw[1 .. etag_raw.len - 1];
         }
+        client_etag = etag_raw;
+        break;
     }
 
     var body: ?[]const u8 = null;
@@ -968,17 +982,23 @@ fn buildHttpResponse(allocator: std.mem.Allocator, content: []const u8, content_
     // shared-cache lifetime with stale-while-revalidate, and the client
     // revalidates via the ETag above (max-age=0 on the client-facing header).
     //
-    // This is what moves a Vercel deployment off the function-per-request
-    // meter: the edge caches a Function response that carries s-maxage, and
-    // without a Cache-Control of our own Vercel injects
-    // `public, max-age=0, must-revalidate` — every request, asset included,
-    // runs the serverless function.
-    try response.appendSlice(allocator, "\"\r\nConnection: keep-alive\r\nCache-Control: ");
-    try response.appendSlice(allocator, if (is_immutable)
-        "public, max-age=31536000, s-maxage=31536000, immutable"
-    else
-        "public, max-age=0, s-maxage=86400, stale-while-revalidate=86400");
-    try response.appendSlice(allocator, "\r\n\r\n");
+    // Vercel will cache a Function response that carries s-maxage — but only
+    // if that directive sits on `Vercel-CDN-Cache-Control` (or
+    // `CDN-Cache-Control`). Putting s-maxage on `Cache-Control` alone is what
+    // we did first: Vercel strips it before the browser sees the response
+    // (`cache-control: public, max-age=0`) and still runs the function every
+    // time (`x-vercel-cache: MISS`). The two CDN headers are the ones that
+    // actually move a deployment off the function-per-request meter.
+    try response.appendSlice(allocator, "\"\r\nConnection: keep-alive\r\n");
+    if (is_immutable) {
+        try response.appendSlice(allocator, "Cache-Control: public, max-age=31536000, immutable\r\n" ++
+            "CDN-Cache-Control: public, s-maxage=31536000, immutable\r\n" ++
+            "Vercel-CDN-Cache-Control: public, s-maxage=31536000, immutable\r\n\r\n");
+    } else {
+        try response.appendSlice(allocator, "Cache-Control: public, max-age=0\r\n" ++
+            "CDN-Cache-Control: public, s-maxage=86400, stale-while-revalidate=86400\r\n" ++
+            "Vercel-CDN-Cache-Control: public, s-maxage=86400, stale-while-revalidate=86400\r\n\r\n");
+    }
     try response.appendSlice(allocator, body);
     return .{ .response = response.items, .etag = etag };
 }

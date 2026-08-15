@@ -73,7 +73,7 @@ pub tor send { conn: *ConnHandle, status: u16, body: string, content_type: ?stri
 // @retain: handler_event is referenced from the serve proc's raw Zig via
 // $mod.handler_event.handler(...) — invisible to the dead-stripper.
 
-[abstract|retain]pub tor handler { req: *Request } -> { status: u16, body: string, content_type: ?ContentType }
+[abstract|retain]pub tor handler { req: *Request } -> Response
 
 // Default implementation - 404 for everything
 handler -> { status: 404, body: "Not Found", content_type: null }
