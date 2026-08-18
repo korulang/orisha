@@ -463,12 +463,12 @@ fn workerCount() usize {
     // each seeing only the descriptors handed to it.
     const Worker = struct {
         fn loop(kq: i32) void {
-            var changes: [1]$mod.c.Kevent = undefined;
-            var no_changes: [0]$mod.c.Kevent = undefined;
-            var events: [$mod.MAX_EVENTS]$mod.c.Kevent = undefined;
+            var changes: [1]$mod.libc.Kevent = undefined;
+            var no_changes: [0]$mod.libc.Kevent = undefined;
+            var events: [$mod.MAX_EVENTS]$mod.libc.Kevent = undefined;
 
             while (true) {
-                const n = $mod.c.kevent(kq, &no_changes, 0, &events, $mod.MAX_EVENTS, null);
+                const n = $mod.libc.kevent(kq, &no_changes, 0, &events, $mod.MAX_EVENTS, null);
                 if (n <= 0) continue;
 
                 for (events[0..@intCast(n)]) |event| {
@@ -486,13 +486,13 @@ fn workerCount() usize {
                         .idle => {
                             changes[0] = .{
                                 .ident = @intCast(fd),
-                                .filter = $mod.c.EVFILT.READ,
-                                .flags = $mod.c.EV.ADD | $mod.c.EV.ONESHOT,
+                                .filter = $mod.libc.EVFILT.READ,
+                                .flags = $mod.libc.EV.ADD | $mod.libc.EV.ONESHOT,
                                 .fflags = 0,
                                 .data = 0,
                                 .udata = undefined,
                             };
-                            _ = $mod.c.kevent(kq, &changes, 1, &no_changes, 0, null);
+                            _ = $mod.libc.kevent(kq, &changes, 1, &no_changes, 0, null);
                             continue;
                         },
                         .gone => {
@@ -530,13 +530,13 @@ fn workerCount() usize {
                     // ONESHOT disarms on delivery — re-arm for the next request.
                     changes[0] = .{
                         .ident = @intCast(fd),
-                        .filter = $mod.c.EVFILT.READ,
-                        .flags = $mod.c.EV.ADD | $mod.c.EV.ONESHOT,
+                        .filter = $mod.libc.EVFILT.READ,
+                        .flags = $mod.libc.EV.ADD | $mod.libc.EV.ONESHOT,
                         .fflags = 0,
                         .data = 0,
                         .udata = undefined,
                     };
-                    _ = $mod.c.kevent(kq, &changes, 1, &no_changes, 0, null);
+                    _ = $mod.libc.kevent(kq, &changes, 1, &no_changes, 0, null);
                 }
             }
         }
@@ -555,8 +555,8 @@ fn workerCount() usize {
     // to that worker for the rest of its life, which is what makes the shared
     // connection table safe without a lock: no index is ever touched twice.
     var next: usize = 0;
-    var arm: [1]$mod.c.Kevent = undefined;
-    var none: [0]$mod.c.Kevent = undefined;
+    var arm: [1]$mod.libc.Kevent = undefined;
+    var none: [0]$mod.libc.Kevent = undefined;
     while (true) {
         const conn = server.accept() catch continue;
         const client_fd = conn.stream.handle;
@@ -565,13 +565,13 @@ fn workerCount() usize {
 
         arm[0] = .{
             .ident = @intCast(client_fd),
-            .filter = $mod.c.EVFILT.READ,
-            .flags = $mod.c.EV.ADD | $mod.c.EV.ONESHOT,
+            .filter = $mod.libc.EVFILT.READ,
+            .flags = $mod.libc.EV.ADD | $mod.libc.EV.ONESHOT,
             .fflags = 0,
             .data = 0,
             .udata = undefined,
         };
-        _ = $mod.c.kevent(kqs[next], &arm, 1, &none, 0, null);
+        _ = $mod.libc.kevent(kqs[next], &arm, 1, &none, 0, null);
         next = (next + 1) % n_workers;
     }
 

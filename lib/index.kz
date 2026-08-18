@@ -19,7 +19,7 @@ const std = @import("std");
 const ast = @import("ast");
 const Program = ast.Program;
 const posix = std.posix;
-const c = std.c;
+const libc = std.c;
 // The ONE clock symbol Orisha needs, declared rather than @cImport-ed.
 //
 // `@cImport(@cInclude("time.h"))` needs libc HEADERS at compile time, and a
@@ -216,7 +216,16 @@ pub const ContentType = []const u8;
 // chained from a router branch (`-> my-handler(req)`) returns the SAME Zig type
 // as the abstract handler — anonymous struct outputs are nominally distinct in
 // Zig and a `return` would fail to unify despite identical fields.
-pub const Response = struct { status: u16, body: []const u8, content_type: ?ContentType };
+pub const Response = struct {
+    status: u16,
+    body: []const u8,
+    content_type: ?ContentType,
+    // fmt.blk HTML is `allocPrint`; JSON `fmt:ln` is a TLS buffer; static
+    // routes are comptime slices. Only the first must be freed after send.
+    // Default false so existing `{ status, body, content_type }` produces stay
+    // honest — they do not own the bytes.
+    body_allocated: bool = false,
+};
 
 // The header is built into a buffer that outlives the frame, because `answer`
 // returns a SLICE of it and a slice of a dead frame is a bug this file has
@@ -371,7 +380,10 @@ fn requestPathKey(allocator: std.mem.Allocator, target: []const u8) []const u8 {
     // A handler that already rendered a whole response (a static route) hands
     // it back verbatim; it goes out as the head with no separate body.
     if (std.mem.startsWith(u8, res.body, "HTTP/1.")) {
-        return .{ .head = res.body, .body = "" };
+        // Pre-rendered static routes: the whole message is `head`. `body`
+        // is empty, so it must not carry the allocated flag — freeing ""
+        // would be a phantom free of a literal.
+        return .{ .head = res.body, .body = "", .body_allocated = false };
     }
 
     const res_ct = if (res.content_type) |ct_str| ct_str else "text/plain";
@@ -388,7 +400,13 @@ fn requestPathKey(allocator: std.mem.Allocator, target: []const u8) []const u8 {
             .{ res.status, statusText(res.status), res_ct, res.body.len, &date_buf },
         ) catch "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
-    return .{ .head = head, .body = res.body };
+    return .{ .head = head, .body = res.body, .body_allocated = res.body_allocated };
+}
+
+~proc release-body|zig {
+    if (allocated) {
+        koru_allocator().free(body);
+    }
 }
 
 fn statusText(status: u16) []const u8 {

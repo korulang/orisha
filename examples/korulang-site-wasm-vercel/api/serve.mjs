@@ -26,6 +26,7 @@ const BACKEND = process.env.ORISHA_BACKEND ?? "https://korulang-org.vercel.app";
 // Anything else (a real static file OR the SPA fallback) stays on Orisha.
 const DYNAMIC_PREFIXES = [
   "/api/",
+  "/blog/drafts",
   "/learn",
   "/admin",
   "/feedback",
