@@ -391,12 +391,12 @@ fn requestPathKey(allocator: std.mem.Allocator, target: []const u8) []const u8 {
     formatHttpDate(&date_buf);
 
     const head = if (headerPrefixKeepAlive(res.status)) |prefix|
-        std.fmt.bufPrint(&header_buf, "{s}{d}\r\nContent-Type: {s}\r\nDate: {s}\r\nConnection: keep-alive\r\n\r\n", .{ prefix, res.body.len, res_ct, &date_buf }) catch
+        std.fmt.bufPrint(&header_buf, "{s}{d}\r\nContent-Type: {s}\r\nDate: {s}\r\nX-Powered-By: koru/orisha\r\nConnection: keep-alive\r\n\r\n", .{ prefix, res.body.len, res_ct, &date_buf }) catch
             "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     else
         std.fmt.bufPrint(
             &header_buf,
-            "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nDate: {s}\r\nConnection: keep-alive\r\n\r\n",
+            "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nDate: {s}\r\nX-Powered-By: koru/orisha\r\nConnection: keep-alive\r\n\r\n",
             .{ res.status, statusText(res.status), res_ct, res.body.len, &date_buf },
         ) catch "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
@@ -1007,7 +1007,12 @@ fn buildHttpResponse(allocator: std.mem.Allocator, content: []const u8, content_
     // (`cache-control: public, max-age=0`) and still runs the function every
     // time (`x-vercel-cache: MISS`). The two CDN headers are the ones that
     // actually move a deployment off the function-per-request meter.
-    try response.appendSlice(allocator, "\"\r\nConnection: keep-alive\r\n");
+    // A Koru/Orisha response is baked by the runtime that answers it. This
+    // header is the self-identification — the crown, not a host label — so
+    // any caller can verify the page was served by Orisha (never a SvelteKit
+    // hydration shell) straight off the wire.
+    try response.appendSlice(allocator, "\r\nX-Powered-By: koru/orisha\r\n");
+    try response.appendSlice(allocator, "\r\nConnection: keep-alive\r\n");
     if (is_immutable) {
         try response.appendSlice(allocator, "Cache-Control: public, max-age=31536000, immutable\r\n" ++
             "CDN-Cache-Control: public, s-maxage=31536000, immutable\r\n" ++
