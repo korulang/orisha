@@ -1007,18 +1007,20 @@ fn buildHttpResponse(allocator: std.mem.Allocator, content: []const u8, content_
     // (`cache-control: public, max-age=0`) and still runs the function every
     // time (`x-vercel-cache: MISS`). The two CDN headers are the ones that
     // actually move a deployment off the function-per-request meter.
+    //
     // A Koru/Orisha response is baked by the runtime that answers it. This
     // header is the self-identification — the crown, not a host label — so
     // any caller can verify the page was served by Orisha (never a SvelteKit
-    // hydration shell) straight off the wire.
-    try response.appendSlice(allocator, "\r\nX-Powered-By: koru/orisha\r\n");
-    try response.appendSlice(allocator, "\r\nConnection: keep-alive\r\n");
+    // hydration shell) straight off the wire. It sits BEFORE `Connection:` and
+    // the `\r\n\r\n` that terminates the head; putting it after the head
+    // terminator would push it into the BODY and corrupt every baked response.
+    try response.appendSlice(allocator, "\"\r\nX-Powered-By: koru/orisha\r\nConnection: keep-alive\r\n");
     if (is_immutable) {
-        try response.appendSlice(allocator, "Cache-Control: public, max-age=31536000, immutable\r\n" ++
+        try response.appendSlice(allocator, "Cache-Control: public, max-age=31536000, s-maxage=31536000, immutable\r\n" ++
             "CDN-Cache-Control: public, s-maxage=31536000, immutable\r\n" ++
             "Vercel-CDN-Cache-Control: public, s-maxage=31536000, immutable\r\n\r\n");
     } else {
-        try response.appendSlice(allocator, "Cache-Control: public, max-age=0\r\n" ++
+        try response.appendSlice(allocator, "Cache-Control: public, max-age=0, s-maxage=86400, stale-while-revalidate=86400\r\n" ++
             "CDN-Cache-Control: public, s-maxage=86400, stale-while-revalidate=86400\r\n" ++
             "Vercel-CDN-Cache-Control: public, s-maxage=86400, stale-while-revalidate=86400\r\n\r\n");
     }
