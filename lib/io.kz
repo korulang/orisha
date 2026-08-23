@@ -1,0 +1,85 @@
+// Orisha — the io bodies.
+//
+// One body per platform, selected the same way the pump's are:
+//
+//   ~[build(linux)]std/build:variants { "orisha/io:load": "..." }
+//
+// Hosted targets (macOS, Linux) read through std.fs. A freestanding target has
+// no filesystem to open and no heap allocator worth naming, so its variant is
+// a compile error rather than a stub that returns `refused` for everything —
+// a program built on it would run forever, refusing every path, and look
+// exactly like a misconfigured deployment while doing so. The refusal has to
+// cost a build, because that is the only place it can be seen.
+
+const std = @import("std");
+
+// The allocator every hosted body serves from. c_allocator, not an arena and
+// not page_allocator: `load` returns slices whose lifetime the CALLER decides,
+// so each answer needs to be freeable on its own, in any order, possibly much
+// later than the request that asked for it. That rules out arenas; malloc's
+// size bookkeeping is what makes per-answer free correct.
+const alloc = std.heap.c_allocator;
+
+// ---------------------------------------------------------------------------
+// LOAD — whole file into caller-owned memory.
+// ---------------------------------------------------------------------------
+
+~proc load|zig {
+    var file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return .gone,
+        error.IsDir => return .refused,
+        else => return .refused,
+    };
+    defer file.close();
+
+    // Size first, then one exact allocation: the response is handed out whole,
+    // so there is no reason to pay realloc copying on the way.
+    const size = file.getEndPos() catch return .refused;
+    const buf = alloc.alloc(u8, @intCast(size)) catch return .refused;
+
+    // Two facts can move between stat and read — truncation and growth. Read
+    // is therefore capped at what we allocated and asked for by length; short
+    // reads shrink the answer honestly instead of handing out zero padding.
+    const got = file.readAll(buf) catch {
+        alloc.free(buf);
+        return .refused;
+    };
+
+    if (got == 0) {
+        // An empty file is still a file with content: hand back the empty
+        // slice rather than pretending nothing was there (`gone`).
+        return .{ .ready = buf[0..0] };
+    }
+    if (got < buf.len) {
+        // Shrank between stat and read. The only honest answers are the exact
+        // bytes at their exact allocation. Realloc down so `release` later
+        // sees a slice that still matches its allocation; if even THAT fails,
+        // refuse rather than hand out a slice whose stored length disagrees
+        // with its allocation — freeing it would be corruption.
+        const shrunk = alloc.realloc(buf, got) catch {
+            alloc.free(buf);
+            return .refused;
+        };
+        return .{ .ready = shrunk };
+    }
+    return .{ .ready = buf };
+}
+// Freestanding: no filesystem, no libc heap. Refuse the build.
+~proc load|unikraft {
+    @compileError("orisha/io:load has no filesystem on freestanding targets. Bake the content with ~orisha:static (comptime embedding), or serve it from a hosted target.");
+}
+
+// ---------------------------------------------------------------------------
+// RELEASE — hand back what load handed out.
+// ---------------------------------------------------------------------------
+
+~proc release|zig {
+    // The slice came from alloc.alloc(u8, n); free takes the same bytes.
+    // A caller passing a slice that did not come from `load` gets the
+    // allocator's own judgement, which is the honest outcome of misuse.
+    alloc.free(data);
+}
+
+~proc release|unikraft {
+    @compileError("orisha/io:release pairs with orisha/io:load, which does not exist on freestanding targets.");
+}
