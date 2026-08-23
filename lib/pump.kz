@@ -1027,3 +1027,15 @@ fn workerCount() usize {
 }
 
 // The raw request bytes, for the parsing layer.
+
+
+// The descriptor, for arms that hand ownership to something that outlives
+// them. Hosted targets and the unikernel read the same integer — both socket
+// layers take a descriptor, so there is nothing platform-shaped to vary.
+~proc fileno|zig {
+    return @intCast(x.fd);
+}
+
+~proc fileno|unikraft {
+    return @intCast(x.fd);
+}

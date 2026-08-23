@@ -64,6 +64,18 @@ pub tor reply { x: *Exchange, head: string, body: string }
 pub tor hang-up { x: *Exchange }
 
 // ============================================================================
+// FILENO — the connection's descriptor, for ownership handoff
+// ============================================================================
+// The one bridge a long-lived connection needs: an arm that wants work to
+// OUTLIVE itself (a pusher thread, a background writer) cannot hand over the
+// exchange — the pump owns it and closes it when the arm returns. It hands
+// over a DUPLICATED descriptor instead, and `fileno` is how the flow reaches
+// it. The caller dups before spawning; from that moment the pump closing its
+// copy is irrelevant to the thread's copy. Ownership moves; nothing is shared.
+
+pub tor fileno { x: *Exchange } -> usize
+
+// ============================================================================
 // RAW — the request bytes, for the parsing layer
 // ============================================================================
 // Implemented right here, in Koru, because there is nothing host-shaped about
