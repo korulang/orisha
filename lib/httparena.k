@@ -9,4 +9,7 @@
 
 import orisha
 
+pub tor pipeline { req: *Request } -> Response
+pub tor baseline { req: *Request } -> Response
+pub tor json { req: *Request, count: string } -> Response
 pub tor dispatch { req: *Request } -> Response

@@ -8,7 +8,7 @@ Orisha has **compile-time PGO** — not LLVM `-fprofile-instr-generate`, but the
 |---------|--------|
 | **`orisha:static-router`** | Reorders embedded response bodies in the binary (hot pages adjacent) |
 | **`orisha:router`** | Reorders the generated if-chain — hot patterns compared first |
-| **`orisha/httparena:dispatch`** | **No automatic reorder yet** — hand-written Zig if-chain |
+| **`orisha/httparena:dispatch`** | Legacy monolithic proc — kept for direct calls; board uses router |
 
 Static layout PGO is measured in `benchmarks/twobox/profile-experiment.sh`. Router branch PGO is demonstrated in `examples/pgo-router-case/` — constructed
 31-route table, `/baseline11` declared last, baseline profile at compile time.
@@ -17,6 +17,9 @@ See that README for emission diffs and honest limits.
 
 Until `httparena/main.k` uses `orisha:router`, the HttpArena entry does not get
 branch PGO (`./suite.sh pgo` reports identical binaries today).
+
+**Update (2026-09-01):** `httparena/main.k` now uses `orisha:router` with per-route
+tors. `./suite.sh pgo` reports cold vs warm binaries differ.
 
 ## HttpArena workflow
 

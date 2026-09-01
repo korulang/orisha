@@ -76,8 +76,10 @@ run_pgo_showcase() {
     ./build.sh warm board-mix
     cp a.out results/orisha-warm-a.out
     if cmp -s results/orisha-cold-a.out results/orisha-warm-a.out; then
-        echo "  note: binaries identical — httparena uses dispatch proc today;" >&2
-        echo "  router PGO applies when handler uses orisha:router (see PGO.md)" >&2
+        echo "  fail: cold and warm binaries identical — router PGO should reorder branches" >&2
+        return 1
+    fi
+    echo "  warm and cold binaries differ (profile-guided branch order)"
     else
         echo "  warm and cold binaries differ (profile-guided layout/order)" >&2
     fi

@@ -27,9 +27,8 @@ fn gzipBody(allocator: std.mem.Allocator, content: []const u8) ?[]u8 {
     return allocator.realloc(output, compressed_size) catch output[0..compressed_size];
 }
 
-~proc dispatch|zig {
-    const orisha = @import("root").koru_orisha;
-    const Impl = struct {
+const orisha = @import("root").koru_orisha;
+const Impl = struct {
         const alloc = @import("root").koru_allocator();
         const Rating = struct { score: i64, count: i64 };
         const DatasetItem = struct {
@@ -211,90 +210,112 @@ fn gzipBody(allocator: std.mem.Allocator, content: []const u8) ?[]u8 {
             return std.mem.indexOf(u8, lower, "gzip") != null;
         }
 
-        fn handle(r: *orisha.Request) orisha.Response {
-            if (std.mem.eql(u8, r.path, "/pipeline")) {
-                return .{ .status = 200, .body = pipeline_response, .content_type = "text/plain", .body_allocated = false };
+        fn handlePipeline(r: *orisha.Request) orisha.Response {
+            _ = r;
+            return .{ .status = 200, .body = pipeline_response, .content_type = "text/plain", .body_allocated = false };
+        }
+
+        fn handleBaseline(r: *orisha.Request) orisha.Response {
+            var total = sumQueryValues(r.query);
+            if (std.mem.eql(u8, r.method, "POST")) total += bodyAsInt(r.body);
+            if (plainIntResponse(total)) |msg| {
+                return .{ .status = 200, .body = msg, .content_type = "text/plain", .body_allocated = false };
+            }
+            const body = std.fmt.allocPrint(alloc, "{d}", .{total}) catch {
+                return .{ .status = 500, .body = "out of memory", .content_type = "text/plain", .body_allocated = false };
+            };
+            return .{ .status = 200, .body = body, .content_type = "text/plain", .body_allocated = true };
+        }
+
+        fn handleJson(r: *orisha.Request, count_str: []const u8) orisha.Response {
+            const want_count = std.fmt.parseInt(usize, count_str, 10) catch 0;
+            const m = queryParamInt(r.query, "m", 1);
+            const source = datasetItems() catch {
+                return .{ .status = 500, .body = "No dataset", .content_type = "text/plain", .body_allocated = false };
+            };
+            const count = @min(want_count, source.len);
+            const cache = ensureCache(source) catch {
+                return .{ .status = 500, .body = "cache failed", .content_type = "text/plain", .body_allocated = false };
+            };
+
+            if (!wantsGzip(r.accept_encoding)) {
+                if (jsonResponse(cache, count, m)) |msg| {
+                    return .{ .status = 200, .body = msg, .content_type = "application/json", .body_allocated = false };
+                }
             }
 
-            if (std.mem.eql(u8, r.path, "/baseline11")) {
-                var total = sumQueryValues(r.query);
-                if (std.mem.eql(u8, r.method, "POST")) total += bodyAsInt(r.body);
-                if (plainIntResponse(total)) |msg| {
-                    return .{ .status = 200, .body = msg, .content_type = "text/plain", .body_allocated = false };
-                }
-                const body = std.fmt.allocPrint(alloc, "{d}", .{total}) catch {
-                    return .{ .status = 500, .body = "out of memory", .content_type = "text/plain", .body_allocated = false };
+            // Gzip / fallback: build JSON in the heap (validate json-comp path).
+            const JsonOutItem = struct {
+                id: i64,
+                name: []const u8,
+                category: []const u8,
+                price: i64,
+                quantity: i64,
+                active: bool,
+                tags: []const []const u8,
+                rating: Rating,
+                total: i64,
+            };
+            var out_items = alloc.alloc(JsonOutItem, count) catch {
+                return .{ .status = 500, .body = "out of memory", .content_type = "text/plain", .body_allocated = false };
+            };
+            defer alloc.free(out_items);
+            for (0..count) |i| {
+                const src = source[i];
+                out_items[i] = .{
+                    .id = src.id,
+                    .name = src.name,
+                    .category = src.category,
+                    .price = src.price,
+                    .quantity = src.quantity,
+                    .active = src.active,
+                    .tags = src.tags,
+                    .rating = src.rating,
+                    .total = src.price * src.quantity * m,
                 };
-                return .{ .status = 200, .body = body, .content_type = "text/plain", .body_allocated = true };
             }
+            const json_body = std.json.Stringify.valueAlloc(alloc, .{ .items = out_items, .count = count }, .{}) catch {
+                return .{ .status = 500, .body = "json encode failed", .content_type = "text/plain", .body_allocated = false };
+            };
+            if (wantsGzip(r.accept_encoding)) {
+                if (gzipBody(alloc, json_body)) |gz| {
+                    alloc.free(json_body);
+                    return .{ .status = 200, .body = gz, .content_type = "application/json", .content_encoding = "gzip", .body_allocated = true };
+                }
+            }
+            if (finishHttp("application/json", json_body)) |msg| {
+                alloc.free(json_body);
+                return .{ .status = 200, .body = msg, .content_type = "application/json", .body_allocated = false };
+            }
+            return .{ .status = 200, .body = json_body, .content_type = "application/json", .body_allocated = true };
+        }
+
+        fn handle(r: *orisha.Request) orisha.Response {
+            if (std.mem.eql(u8, r.path, "/pipeline")) return handlePipeline(r);
+
+            if (std.mem.eql(u8, r.path, "/baseline11")) return handleBaseline(r);
 
             if (std.mem.startsWith(u8, r.path, "/json/")) {
                 const count_str = r.path["/json/".len..];
-                const want_count = std.fmt.parseInt(usize, count_str, 10) catch 0;
-                const m = queryParamInt(r.query, "m", 1);
-                const source = datasetItems() catch {
-                    return .{ .status = 500, .body = "No dataset", .content_type = "text/plain", .body_allocated = false };
-                };
-                const count = @min(want_count, source.len);
-                const cache = ensureCache(source) catch {
-                    return .{ .status = 500, .body = "cache failed", .content_type = "text/plain", .body_allocated = false };
-                };
-
-                if (!wantsGzip(r.accept_encoding)) {
-                    if (jsonResponse(cache, count, m)) |msg| {
-                        return .{ .status = 200, .body = msg, .content_type = "application/json", .body_allocated = false };
-                    }
-                }
-
-                // Gzip / fallback: build JSON in the heap (validate json-comp path).
-                const JsonOutItem = struct {
-                    id: i64,
-                    name: []const u8,
-                    category: []const u8,
-                    price: i64,
-                    quantity: i64,
-                    active: bool,
-                    tags: []const []const u8,
-                    rating: Rating,
-                    total: i64,
-                };
-                var out_items = alloc.alloc(JsonOutItem, count) catch {
-                    return .{ .status = 500, .body = "out of memory", .content_type = "text/plain", .body_allocated = false };
-                };
-                defer alloc.free(out_items);
-                for (0..count) |i| {
-                    const src = source[i];
-                    out_items[i] = .{
-                        .id = src.id,
-                        .name = src.name,
-                        .category = src.category,
-                        .price = src.price,
-                        .quantity = src.quantity,
-                        .active = src.active,
-                        .tags = src.tags,
-                        .rating = src.rating,
-                        .total = src.price * src.quantity * m,
-                    };
-                }
-                const json_body = std.json.Stringify.valueAlloc(alloc, .{ .items = out_items, .count = count }, .{}) catch {
-                    return .{ .status = 500, .body = "json encode failed", .content_type = "text/plain", .body_allocated = false };
-                };
-                if (wantsGzip(r.accept_encoding)) {
-                    if (gzipBody(alloc, json_body)) |gz| {
-                        alloc.free(json_body);
-                        return .{ .status = 200, .body = gz, .content_type = "application/json", .content_encoding = "gzip", .body_allocated = true };
-                    }
-                }
-                if (finishHttp("application/json", json_body)) |msg| {
-                    alloc.free(json_body);
-                    return .{ .status = 200, .body = msg, .content_type = "application/json", .body_allocated = false };
-                }
-                return .{ .status = 200, .body = json_body, .content_type = "application/json", .body_allocated = true };
+                return handleJson(r, count_str);
             }
 
             return .{ .status = 404, .body = "not found", .content_type = "text/plain", .body_allocated = false };
         }
-    };
+};
 
+~proc dispatch|zig {
     return Impl.handle(req);
+}
+
+~proc pipeline|zig {
+    return Impl.handlePipeline(req);
+}
+
+~proc baseline|zig {
+    return Impl.handleBaseline(req);
+}
+
+~proc json|zig {
+    return Impl.handleJson(req, count);
 }

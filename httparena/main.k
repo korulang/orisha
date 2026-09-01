@@ -12,7 +12,12 @@ std/build:requires {
     exe.linkSystemLibrary("z");
 }
 
-orisha:handler = orisha/httparena:dispatch(req)
+orisha:handler = orisha:router(req)
+! [GET /pipeline] |> orisha/httparena:pipeline(req)
+! [GET /baseline11] |> orisha/httparena:baseline(req)
+! [POST /baseline11] |> orisha/httparena:baseline(req)
+! [GET /json/:count] p |> orisha/httparena:json(req, p.count)
+! [*] -> { status: 404, body: "not found", content_type: "text/plain" }
 
 // Cleartext for local wrk / baseline+pipeline+json-comp. Board Dockerfile sed-adds TLS for json-tls.
 orisha:serve(port: 8080)
