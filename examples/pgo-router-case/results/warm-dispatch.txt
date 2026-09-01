@@ -1,0 +1,1 @@
+baseline11-dispatch: 2.7 ns/op  (377.16 Mop/s)

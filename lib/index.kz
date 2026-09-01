@@ -743,6 +743,7 @@ fn headerPrefixKeepAlive(status: u16) ?[]const u8 {
     // routes. Reorders the if-chain so hot HttpArena paths (baseline, json, …)
     // are compared first. See orisha/httparena/profiles/ and workload.py.
     if (loadProfileHits(allocator)) |loaded| {
+        defer allocator.free(loaded.storage);
         var hits = loaded.hits;
         defer hits.deinit();
 
@@ -760,13 +761,15 @@ fn headerPrefixKeepAlive(status: u16) ?[]const u8 {
             }
             fn routeScore(self: @This(), pp: @TypeOf(parsed_patterns.items[0])) u64 {
                 if (pp.is_catchall) return 0;
-                const prefix = patternPrefix(pp);
-                var sum: u64 = 0;
-                var it = self.h.iterator();
-                while (it.next()) |entry| {
-                    const key = entry.key_ptr.*;
-                    if (std.mem.eql(u8, key, pp.path) or std.mem.startsWith(u8, key, prefix)) {
-                        sum += entry.value_ptr.*;
+                var sum: u64 = self.h.get(pp.path) orelse 0;
+                if (pp.params.len > 0) {
+                    const prefix = patternPrefix(pp);
+                    var it = self.h.iterator();
+                    while (it.next()) |entry| {
+                        const key = entry.key_ptr.*;
+                        if (!std.mem.eql(u8, key, pp.path) and std.mem.startsWith(u8, key, prefix)) {
+                            sum += entry.value_ptr.*;
+                        }
                     }
                 }
                 return sum;
@@ -779,7 +782,13 @@ fn headerPrefixKeepAlive(status: u16) ?[]const u8 {
             }
         };
         std.sort.block(@TypeOf(parsed_patterns.items[0]), parsed_patterns.items, ScoreCtx{ .h = &hits }, ScoreCtx.hotter);
-        std.debug.print("[ROUTER TRANSFORM] profile: {d} requests — hottest pattern is {s}\n", .{ loaded.counted, parsed_patterns.items[0].raw });
+        const hottest_label = blk: {
+            for (parsed_patterns.items) |pp| {
+                if (!pp.is_catchall) break :blk pp.raw;
+            }
+            break :blk parsed_patterns.items[0].raw;
+        };
+        std.debug.print("[ROUTER TRANSFORM] profile: {d} requests — hottest pattern is {s}\n", .{ loaded.counted, hottest_label });
     } else {
         std.debug.print("[ROUTER TRANSFORM] profile: none (orisha.profile absent) — pattern order unchanged\n", .{});
     }
@@ -1211,9 +1220,8 @@ fn appendFmt(allocator: std.mem.Allocator, list: *std.ArrayList(u8), comptime fm
 //
 // The profile is `orisha.profile` in the working directory when it exists — a
 // plain access log. No profile, no reordering, and it says which it did.
-fn loadProfileHits(allocator: std.mem.Allocator) ?struct { hits: std.StringHashMap(u64), counted: u64 } {
+fn loadProfileHits(allocator: std.mem.Allocator) ?struct { hits: std.StringHashMap(u64), counted: u64, storage: []u8 } {
     const profile_text = std.fs.cwd().readFileAlloc(allocator, "orisha.profile", 64 * 1024 * 1024) catch return null;
-    defer allocator.free(profile_text);
 
     var hits = std.StringHashMap(u64).init(allocator);
     var lines = std.mem.splitScalar(u8, profile_text, '\n');
@@ -1231,9 +1239,10 @@ fn loadProfileHits(allocator: std.mem.Allocator) ?struct { hits: std.StringHashM
     }
     if (counted == 0) {
         hits.deinit();
+        allocator.free(profile_text);
         return null;
     }
-    return .{ .hits = hits, .counted = counted };
+    return .{ .hits = hits, .counted = counted, .storage = profile_text };
 }
 
 fn orderByProfile(allocator: std.mem.Allocator, routes: []ProcessedRoute) void {
@@ -1241,6 +1250,7 @@ fn orderByProfile(allocator: std.mem.Allocator, routes: []ProcessedRoute) void {
         std.debug.print("[STATIC_ROUTER] profile: none (orisha.profile absent) — routes keep directory order\n", .{});
         return;
     };
+    defer allocator.free(loaded.storage);
     var hits = loaded.hits;
     defer hits.deinit();
 

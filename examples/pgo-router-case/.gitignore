@@ -1,0 +1,8 @@
+output_emitted.zig
+a.out
+orisha.profile
+.zig-cache/
+program.ast.json
+backend*.zig
+build*.zig
+compiler_env.zig

@@ -1,0 +1,4 @@
+GET /baseline11 dispatch microbench (500000 iters)
+cold: baseline11-dispatch: 39.1 ns/op  (25.60 Mop/s)
+warm: baseline11-dispatch: 2.7 ns/op  (377.16 Mop/s)
+speedup: 14.48x (cold ns/op / warm ns/op)
