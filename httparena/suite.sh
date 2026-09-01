@@ -80,9 +80,6 @@ run_pgo_showcase() {
         return 1
     fi
     echo "  warm and cold binaries differ (profile-guided branch order)"
-    else
-        echo "  warm and cold binaries differ (profile-guided layout/order)" >&2
-    fi
     ls -la results/orisha-*-a.out
 }
 
