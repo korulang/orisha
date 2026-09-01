@@ -1,0 +1,166 @@
+// HttpArena HTTP/1.1 endpoints — validate.sh is the spec.
+
+const std = @import("std");
+const ha_zlib = @cImport({
+    @cInclude("zlib.h");
+});
+
+fn gzipBody(allocator: std.mem.Allocator, content: []const u8) ?[]u8 {
+    const max_output = ha_zlib.compressBound(@intCast(content.len));
+    const output = allocator.alloc(u8, max_output) catch return null;
+    var strm: ha_zlib.z_stream = std.mem.zeroes(ha_zlib.z_stream);
+    strm.next_in = @constCast(content.ptr);
+    strm.avail_in = @intCast(content.len);
+    strm.next_out = output.ptr;
+    strm.avail_out = @intCast(output.len);
+    if (ha_zlib.deflateInit2(&strm, ha_zlib.Z_DEFAULT_COMPRESSION, ha_zlib.Z_DEFLATED, 15 + 16, 8, ha_zlib.Z_DEFAULT_STRATEGY) != ha_zlib.Z_OK) {
+        allocator.free(output);
+        return null;
+    }
+    const result = ha_zlib.deflate(&strm, ha_zlib.Z_FINISH);
+    const compressed_size = output.len - strm.avail_out;
+    _ = ha_zlib.deflateEnd(&strm);
+    if (result != ha_zlib.Z_STREAM_END) {
+        allocator.free(output);
+        return null;
+    }
+    return allocator.realloc(output, compressed_size) catch output[0..compressed_size];
+}
+
+~proc dispatch|zig {
+    const orisha = @import("root").koru_orisha;
+    const Impl = struct {
+        const alloc = @import("root").koru_allocator();
+        const Rating = struct { score: i64, count: i64 };
+        const DatasetItem = struct {
+            id: i64,
+            name: []const u8,
+            category: []const u8,
+            price: i64,
+            quantity: i64,
+            active: bool,
+            tags: []const []const u8,
+            rating: Rating,
+        };
+        const JsonOutItem = struct {
+            id: i64,
+            name: []const u8,
+            category: []const u8,
+            price: i64,
+            quantity: i64,
+            active: bool,
+            tags: []const []const u8,
+            rating: Rating,
+            total: i64,
+        };
+
+        var dataset_parsed: ?std.json.Parsed([]DatasetItem) = null;
+        var dataset_bytes: ?[]u8 = null;
+
+        fn datasetItems() ![]const DatasetItem {
+            if (dataset_parsed) |parsed| return parsed.value;
+            const path = std.posix.getenv("DATASET_PATH") orelse "/data/dataset.json";
+            dataset_bytes = try std.fs.cwd().readFileAlloc(alloc, path, 16 * 1024 * 1024);
+            dataset_parsed = try std.json.parseFromSlice([]DatasetItem, alloc, dataset_bytes.?, .{ .allocate = .alloc_always });
+            return dataset_parsed.?.value;
+        }
+
+        fn sumQueryValues(query: ?[]const u8) i64 {
+            var sum: i64 = 0;
+            const q = query orelse return 0;
+            var parts = std.mem.splitScalar(u8, q, '&');
+            while (parts.next()) |pair| {
+                const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+                sum += std.fmt.parseInt(i64, pair[eq + 1 ..], 10) catch 0;
+            }
+            return sum;
+        }
+
+        fn queryParamInt(query: ?[]const u8, key: []const u8, fallback: i64) i64 {
+            const q = query orelse return fallback;
+            var parts = std.mem.splitScalar(u8, q, '&');
+            while (parts.next()) |pair| {
+                const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+                if (!std.mem.eql(u8, pair[0..eq], key)) continue;
+                return std.fmt.parseInt(i64, pair[eq + 1 ..], 10) catch fallback;
+            }
+            return fallback;
+        }
+
+        fn bodyAsInt(body: ?[]const u8) i64 {
+            const b = body orelse return 0;
+            const trimmed = std.mem.trim(u8, b, " \t\r\n");
+            if (trimmed.len == 0) return 0;
+            return std.fmt.parseInt(i64, trimmed, 10) catch 0;
+        }
+
+        fn wantsGzip(accept_encoding: ?[]const u8) bool {
+            const ae = accept_encoding orelse return false;
+            var lower_buf: [256]u8 = undefined;
+            if (ae.len > lower_buf.len) return false;
+            const lower = std.ascii.lowerString(&lower_buf, ae);
+            return std.mem.indexOf(u8, lower, "gzip") != null;
+        }
+
+        // Pre-rendered: answer() emits `head` verbatim and skips per-request header formatting.
+        const pipeline_response =
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok";
+
+        fn handle(r: *orisha.Request) orisha.Response {
+            if (std.mem.eql(u8, r.path, "/pipeline")) {
+                return .{ .status = 200, .body = pipeline_response, .content_type = "text/plain", .body_allocated = false };
+            }
+
+            if (std.mem.eql(u8, r.path, "/baseline11")) {
+                var total = sumQueryValues(r.query);
+                if (std.mem.eql(u8, r.method, "POST")) total += bodyAsInt(r.body);
+                const body = std.fmt.allocPrint(alloc, "{d}", .{total}) catch {
+                    return .{ .status = 500, .body = "out of memory", .content_type = "text/plain", .body_allocated = false };
+                };
+                return .{ .status = 200, .body = body, .content_type = "text/plain", .body_allocated = true };
+            }
+
+            if (std.mem.startsWith(u8, r.path, "/json/")) {
+                const count_str = r.path["/json/".len..];
+                const want_count = std.fmt.parseInt(usize, count_str, 10) catch 0;
+                const m = queryParamInt(r.query, "m", 1);
+                const source = datasetItems() catch {
+                    return .{ .status = 500, .body = "No dataset", .content_type = "text/plain", .body_allocated = false };
+                };
+                const count = @min(want_count, source.len);
+                var out_items = alloc.alloc(JsonOutItem, count) catch {
+                    return .{ .status = 500, .body = "out of memory", .content_type = "text/plain", .body_allocated = false };
+                };
+                defer alloc.free(out_items);
+                for (0..count) |i| {
+                    const src = source[i];
+                    out_items[i] = .{
+                        .id = src.id,
+                        .name = src.name,
+                        .category = src.category,
+                        .price = src.price,
+                        .quantity = src.quantity,
+                        .active = src.active,
+                        .tags = src.tags,
+                        .rating = src.rating,
+                        .total = src.price * src.quantity * m,
+                    };
+                }
+                const json_body = std.json.Stringify.valueAlloc(alloc, .{ .items = out_items, .count = count }, .{}) catch {
+                    return .{ .status = 500, .body = "json encode failed", .content_type = "text/plain", .body_allocated = false };
+                };
+                if (wantsGzip(r.accept_encoding)) {
+                    if (gzipBody(alloc, json_body)) |gz| {
+                        alloc.free(json_body);
+                        return .{ .status = 200, .body = gz, .content_type = "application/json", .content_encoding = "gzip", .body_allocated = true };
+                    }
+                }
+                return .{ .status = 200, .body = json_body, .content_type = "application/json", .body_allocated = true };
+            }
+
+            return .{ .status = 404, .body = "not found", .content_type = "text/plain", .body_allocated = false };
+        }
+    };
+
+    return Impl.handle(req);
+}

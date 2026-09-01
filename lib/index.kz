@@ -42,7 +42,9 @@ extern fn time(t: ?*i64) i64;
 pub const Request = struct {
     method: []const u8,
     path: []const u8,
+    query: ?[]const u8 = null,
     body: ?[]const u8,
+    accept_encoding: ?[]const u8 = null,
     if_none_match: ?[]const u8 = null,
 
     // For param extraction by router
@@ -220,6 +222,7 @@ pub const Response = struct {
     status: u16,
     body: []const u8,
     content_type: ?ContentType,
+    content_encoding: ?ContentType = null,
     // fmt.blk HTML is `allocPrint`; JSON `fmt:ln` is a TLS buffer; static
     // routes are comptime slices. Only the first must be freed after send.
     // Default false so existing `{ status, body, content_type }` produces stay
@@ -266,11 +269,8 @@ var request_arena_buf: [64 * 1024]u8 = undefined;
 var request_arena = std.heap.FixedBufferAllocator.init(&request_arena_buf);
 
 fn requestAllocator() std.mem.Allocator {
-    if (orisha_freestanding) {
-        request_arena.reset();
-        return request_arena.allocator();
-    }
-    return std.heap.page_allocator;
+    request_arena.reset();
+    return request_arena.allocator();
 }
 
 // The request target is not the lookup key, and the difference is invisible
@@ -322,10 +322,51 @@ fn requestPathKey(allocator: std.mem.Allocator, target: []const u8) []const u8 {
     return out[0..w];
 }
 
+fn headerValue(raw: []const u8, name: []const u8) ?[]const u8 {
+    const first_line = std.mem.indexOf(u8, raw, "\r\n") orelse return null;
+    var scan: usize = first_line + 2;
+    while (scan < raw.len) {
+        const nl = std.mem.indexOfPos(u8, raw, scan, "\r\n") orelse break;
+        const line = raw[scan..nl];
+        scan = nl + 2;
+        if (line.len == 0) break;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (!std.ascii.eqlIgnoreCase(line[0..colon], name)) continue;
+        return std.mem.trim(u8, line[colon + 1 ..], " \t");
+    }
+    return null;
+}
+
+fn transferEncodingChunkedHead(head: []const u8) bool {
+    const value = headerValue(head, "transfer-encoding") orelse return false;
+    var lower_buf: [128]u8 = undefined;
+    if (value.len > lower_buf.len) return false;
+    const lower = std.ascii.lowerString(&lower_buf, value);
+    return std.mem.indexOf(u8, lower, "chunked") != null;
+}
+
+fn decodeChunkedPayload(body: []const u8, out: []u8) ?[]const u8 {
+    var pos: usize = 0;
+    var w: usize = 0;
+    while (true) {
+        const line_end = std.mem.indexOfPos(u8, body, pos, "\r\n") orelse return null;
+        const chunk_size = std.fmt.parseInt(usize, body[pos..line_end], 16) catch return null;
+        pos = line_end + 2;
+        if (chunk_size == 0) return out[0..w];
+        if (w + chunk_size > out.len) return null;
+        @memcpy(out[w .. w + chunk_size], body[pos .. pos + chunk_size]);
+        w += chunk_size;
+        pos += chunk_size;
+        if (pos + 2 > body.len or body[pos] != '\r' or body[pos + 1] != '\n') return null;
+        pos += 2;
+    }
+}
+
 ~proc answer|zig {
     const req_allocator = $mod.requestAllocator();
     var method: []const u8 = "GET";
     var path: []const u8 = "/";
+    var query: ?[]const u8 = null;
 
     var i: usize = 0;
     while (i < raw.len and raw[i] != ' ') : (i += 1) {}
@@ -335,7 +376,11 @@ fn requestPathKey(allocator: std.mem.Allocator, target: []const u8) []const u8 {
         var j: usize = i;
         while (j < raw.len and raw[j] != ' ') : (j += 1) {}
         if (j > i) {
-            path = $mod.requestPathKey(req_allocator, raw[i..j]);
+            const target = raw[i..j];
+            if (std.mem.indexOfScalar(u8, target, '?')) |q| {
+                query = target[q + 1 ..];
+            }
+            path = $mod.requestPathKey(req_allocator, target);
         }
     }
 
@@ -343,34 +388,51 @@ fn requestPathKey(allocator: std.mem.Allocator, target: []const u8) []const u8 {
     // Header names are case-insensitive. The Vercel adapter used to omit this
     // header entirely; once it forwards it, browsers send `If-None-Match` in
     // whatever casing their stack picked, and a literal search would miss.
-    var scan: usize = 0;
-    while (scan < raw.len) {
-        const nl = std.mem.indexOfPos(u8, raw, scan, "\r\n") orelse break;
-        const line = raw[scan..nl];
-        scan = nl + 2;
-        if (line.len < 15) continue;
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-        if (!std.ascii.eqlIgnoreCase(line[0..colon], "if-none-match")) continue;
-        var etag_raw = std.mem.trim(u8, line[colon + 1 ..], " \t");
-        if (etag_raw.len >= 2 and etag_raw[0] == '"' and etag_raw[etag_raw.len - 1] == '"') {
-            etag_raw = etag_raw[1 .. etag_raw.len - 1];
+    if (rawHasHeaderName(raw, "if-none-match")) {
+        var scan: usize = 0;
+        while (scan < raw.len) {
+            const nl = std.mem.indexOfPos(u8, raw, scan, "\r\n") orelse break;
+            const line = raw[scan..nl];
+            scan = nl + 2;
+            if (line.len < 15) continue;
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            if (!std.ascii.eqlIgnoreCase(line[0..colon], "if-none-match")) continue;
+            var etag_raw = std.mem.trim(u8, line[colon + 1 ..], " \t");
+            if (etag_raw.len >= 2 and etag_raw[0] == '"' and etag_raw[etag_raw.len - 1] == '"') {
+                etag_raw = etag_raw[1 .. etag_raw.len - 1];
+            }
+            client_etag = etag_raw;
+            break;
         }
-        client_etag = etag_raw;
-        break;
     }
 
+    const accept_encoding = if (rawHasHeaderName(raw, "accept-encoding"))
+        headerValue(raw, "accept-encoding")
+    else
+        null;
+
     var body: ?[]const u8 = null;
+
     if (std.mem.indexOf(u8, raw, "\r\n\r\n")) |header_end| {
-        const body_start = header_end + 4;
-        if (body_start < raw.len) {
-            body = raw[body_start..];
+        const headers_end = header_end + 4;
+        const head = raw[0..headers_end];
+        const body_raw = if (headers_end < raw.len) raw[headers_end..] else "";
+        if (transferEncodingChunkedHead(head)) {
+            var decoded_buf: [4096]u8 = undefined;
+            if (decodeChunkedPayload(body_raw, &decoded_buf)) |decoded| {
+                body = decoded;
+            }
+        } else if (body_raw.len > 0) {
+            body = body_raw;
         }
     }
 
     var req = Request{
         .method = method,
         .path = path,
+        .query = query,
         .body = body,
+        .accept_encoding = accept_encoding,
         .if_none_match = client_etag,
         .allocator = req_allocator,
     };
@@ -390,13 +452,26 @@ fn requestPathKey(allocator: std.mem.Allocator, target: []const u8) []const u8 {
     var date_buf: [29]u8 = undefined;
     formatHttpDate(&date_buf);
 
-    const head = if (headerPrefixKeepAlive(res.status)) |prefix|
-        std.fmt.bufPrint(&header_buf, "{s}{d}\r\nContent-Type: {s}\r\nDate: {s}\r\nX-Powered-By: koru/orisha\r\nConnection: keep-alive\r\n\r\n", .{ prefix, res.body.len, res_ct, &date_buf }) catch
+    const head = if (res.content_encoding) |enc| blk: {
+        if (headerPrefixKeepAlive(res.status)) |prefix| {
+            break :blk std.fmt.bufPrint(
+                &header_buf,
+                "{s}{d}\r\nContent-Type: {s}\r\nContent-Encoding: {s}\r\nDate: {s}\r\nX-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\nConnection: keep-alive\r\n\r\n",
+                .{ prefix, res.body.len, res_ct, enc, &date_buf },
+            ) catch "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        }
+        break :blk std.fmt.bufPrint(
+            &header_buf,
+            "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Encoding: {s}\r\nContent-Length: {d}\r\nDate: {s}\r\nX-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\nConnection: keep-alive\r\n\r\n",
+            .{ res.status, statusText(res.status), res_ct, enc, res.body.len, &date_buf },
+        ) catch "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    } else if (headerPrefixKeepAlive(res.status)) |prefix|
+        std.fmt.bufPrint(&header_buf, "{s}{d}\r\nContent-Type: {s}\r\nDate: {s}\r\nX-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\nConnection: keep-alive\r\n\r\n", .{ prefix, res.body.len, res_ct, &date_buf }) catch
             "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     else
         std.fmt.bufPrint(
             &header_buf,
-            "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nDate: {s}\r\nX-Powered-By: koru/orisha\r\nConnection: keep-alive\r\n\r\n",
+            "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nDate: {s}\r\nX-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\nConnection: keep-alive\r\n\r\n",
             .{ res.status, statusText(res.status), res_ct, res.body.len, &date_buf },
         ) catch "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
@@ -427,8 +502,19 @@ fn statusText(status: u16) []const u8 {
 /// allows in a Date header. Calendar arithmetic rather than strftime, so this
 /// needs one C symbol (`time`) instead of three, and works on a target whose
 /// libc has a clock and nothing else.
+threadlocal var cached_date_epoch: i64 = -1;
+threadlocal var cached_date_buf: [29]u8 = undefined;
+
 fn formatHttpDate(buf: *[29]u8) void {
     const epoch = time(null);
+    if (epoch != cached_date_epoch) {
+        cached_date_epoch = epoch;
+        formatHttpDateFromEpoch(&cached_date_buf, epoch);
+    }
+    @memcpy(buf[0..29], cached_date_buf[0..29]);
+}
+
+fn formatHttpDateFromEpoch(buf: *[29]u8, epoch: i64) void {
     const days = @divFloor(epoch, 86400);
     const secs = @as(u32, @intCast(epoch - days * 86400));
 
@@ -464,6 +550,18 @@ fn formatHttpDate(buf: *[29]u8) void {
     buf[22] = ':';
     two(buf[23..25], secs % 60);
     @memcpy(buf[25..29], " GMT");
+}
+
+fn rawHasHeaderName(raw: []const u8, comptime name: []const u8) bool {
+    if (raw.len < name.len + 2) return false;
+    var i: usize = 0;
+    while (i + name.len + 1 < raw.len) : (i += 1) {
+        if (raw[i] == '\r' and raw[i + 1] == '\n') {
+            if (i + 3 < raw.len and raw[i + 2] == '\r' and raw[i + 3] == '\n') return false;
+        }
+        if (std.ascii.eqlIgnoreCase(raw[i .. i + name.len], name) and raw[i + name.len] == ':') return true;
+    }
+    return false;
 }
 
 fn two(dst: *[2]u8, v: u32) void {
@@ -639,6 +737,51 @@ fn headerPrefixKeepAlive(status: u16) ?[]const u8 {
             .params = params_list.toOwnedSlice(allocator) catch unreachable,
             .is_catchall = false,
         }) catch unreachable;
+    }
+
+    // Profile-guided branch order — same `orisha.profile` access log as static
+    // routes. Reorders the if-chain so hot HttpArena paths (baseline, json, …)
+    // are compared first. See orisha/httparena/profiles/ and workload.py.
+    if (loadProfileHits(allocator)) |loaded| {
+        var hits = loaded.hits;
+        defer hits.deinit();
+
+        const ScoreCtx = struct {
+            h: *std.StringHashMap(u64),
+            fn patternPrefix(pp: @TypeOf(parsed_patterns.items[0])) []const u8 {
+                if (pp.params.len == 0) return pp.path;
+                var end: usize = 0;
+                var it = std.mem.splitScalar(u8, pp.path, '/');
+                while (it.next()) |seg| {
+                    if (seg.len > 0 and seg[0] == ':') break;
+                    end += seg.len + 1;
+                }
+                return if (end > 0) pp.path[0..end] else pp.path;
+            }
+            fn routeScore(self: @This(), pp: @TypeOf(parsed_patterns.items[0])) u64 {
+                if (pp.is_catchall) return 0;
+                const prefix = patternPrefix(pp);
+                var sum: u64 = 0;
+                var it = self.h.iterator();
+                while (it.next()) |entry| {
+                    const key = entry.key_ptr.*;
+                    if (std.mem.eql(u8, key, pp.path) or std.mem.startsWith(u8, key, prefix)) {
+                        sum += entry.value_ptr.*;
+                    }
+                }
+                return sum;
+            }
+            fn hotter(self: @This(), a: @TypeOf(parsed_patterns.items[0]), b: @TypeOf(parsed_patterns.items[0])) bool {
+                const ha = self.routeScore(a);
+                const hb = self.routeScore(b);
+                if (ha != hb) return ha > hb;
+                return std.mem.lessThan(u8, a.raw, b.raw);
+            }
+        };
+        std.sort.block(@TypeOf(parsed_patterns.items[0]), parsed_patterns.items, ScoreCtx{ .h = &hits }, ScoreCtx.hotter);
+        std.debug.print("[ROUTER TRANSFORM] profile: {d} requests — hottest pattern is {s}\n", .{ loaded.counted, parsed_patterns.items[0].raw });
+    } else {
+        std.debug.print("[ROUTER TRANSFORM] profile: none (orisha.profile absent) — pattern order unchanged\n", .{});
     }
 
     // Build inline_body: flat if-else-if-else chain with branch bodies inlined.
@@ -1014,7 +1157,7 @@ fn buildHttpResponse(allocator: std.mem.Allocator, content: []const u8, content_
     // hydration shell) straight off the wire. It sits BEFORE `Connection:` and
     // the `\r\n\r\n` that terminates the head; putting it after the head
     // terminator would push it into the BODY and corrupt every baked response.
-    try response.appendSlice(allocator, "\"\r\nX-Powered-By: koru/orisha\r\nConnection: keep-alive\r\n");
+    try response.appendSlice(allocator, "\"\r\nX-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\nConnection: keep-alive\r\n");
     if (is_immutable) {
         try response.appendSlice(allocator, "Cache-Control: public, max-age=31536000, s-maxage=31536000, immutable\r\n" ++
             "CDN-Cache-Control: public, s-maxage=31536000, immutable\r\n" ++
@@ -1068,33 +1211,38 @@ fn appendFmt(allocator: std.mem.Allocator, list: *std.ArrayList(u8), comptime fm
 //
 // The profile is `orisha.profile` in the working directory when it exists — a
 // plain access log. No profile, no reordering, and it says which it did.
-fn orderByProfile(allocator: std.mem.Allocator, routes: []ProcessedRoute) void {
-    const profile_text = std.fs.cwd().readFileAlloc(allocator, "orisha.profile", 64 * 1024 * 1024) catch {
-        std.debug.print("[STATIC_ROUTER] profile: none (orisha.profile absent) — routes keep directory order\n", .{});
-        return;
-    };
+fn loadProfileHits(allocator: std.mem.Allocator) ?struct { hits: std.StringHashMap(u64), counted: u64 } {
+    const profile_text = std.fs.cwd().readFileAlloc(allocator, "orisha.profile", 64 * 1024 * 1024) catch return null;
     defer allocator.free(profile_text);
 
     var hits = std.StringHashMap(u64).init(allocator);
-    defer hits.deinit();
-
-    // Common-log format: the path is the second field of the quoted request.
     var lines = std.mem.splitScalar(u8, profile_text, '\n');
     var counted: u64 = 0;
     while (lines.next()) |line| {
         const q = std.mem.indexOfScalar(u8, line, '"') orelse continue;
         var parts = std.mem.tokenizeScalar(u8, line[q + 1 ..], ' ');
         _ = parts.next() orelse continue; // method
-        const path = parts.next() orelse continue;
+        const target = parts.next() orelse continue;
+        const path = if (std.mem.indexOfScalar(u8, target, '?')) |qi| target[0..qi] else target;
         const gop = hits.getOrPut(path) catch continue;
         if (!gop.found_existing) gop.value_ptr.* = 0;
         gop.value_ptr.* += 1;
         counted += 1;
     }
     if (counted == 0) {
-        std.debug.print("[STATIC_ROUTER] profile: orisha.profile parsed to 0 requests — routes keep directory order\n", .{});
-        return;
+        hits.deinit();
+        return null;
     }
+    return .{ .hits = hits, .counted = counted };
+}
+
+fn orderByProfile(allocator: std.mem.Allocator, routes: []ProcessedRoute) void {
+    const loaded = loadProfileHits(allocator) orelse {
+        std.debug.print("[STATIC_ROUTER] profile: none (orisha.profile absent) — routes keep directory order\n", .{});
+        return;
+    };
+    var hits = loaded.hits;
+    defer hits.deinit();
 
     const Ctx = struct {
         h: *std.StringHashMap(u64),
@@ -1109,7 +1257,7 @@ fn orderByProfile(allocator: std.mem.Allocator, routes: []ProcessedRoute) void {
 
     var named: u64 = 0;
     for (routes) |r| { if (hits.get(r.path)) |_| named += 1; }
-    std.debug.print("[STATIC_ROUTER] profile: {d} requests over {d} paths — hottest is {s}, {d}/{d} routes appear\n", .{ counted, hits.count(), routes[0].path, named, routes.len });
+    std.debug.print("[STATIC_ROUTER] profile: {d} requests over {d} paths — hottest is {s}, {d}/{d} routes appear\n", .{ loaded.counted, hits.count(), routes[0].path, named, routes.len });
 }
 
 fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes_const: []const ProcessedRoute, name: []const u8) !void {

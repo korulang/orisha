@@ -19,6 +19,8 @@
 // carries effect branches splices into its CALLER, where this module's scope
 // does not exist. The compiler refuses the bare names and says so.
 
+~import koru/openssl
+
 const std = @import("std");
 const posix = std.posix;
 const c = std.c;
@@ -33,6 +35,7 @@ const c = std.c;
 // Linux and macOS, so the hosted pumps are unaffected.
 pub const Exchange = struct {
     fd: c_int,
+    st: ?*ConnState = null,
     raw: []const u8,
     keep_alive: bool = true,
 };
@@ -68,12 +71,56 @@ const URING_ACCEPT: u64 = std.math.maxInt(u64);
 // This function answers the one question the three pumps share: where does the
 // first request in this buffer end? The loops that use it are mechanical; this
 // is the part that must not be written three times.
+fn transferEncodingChunked(head: []const u8) bool {
+    var line_start: usize = 0;
+    while (line_start < head.len) {
+        const line_end = std.mem.indexOfPos(u8, head, line_start, "\r\n") orelse break;
+        const line = head[line_start..line_end];
+        if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
+            if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " \t"), "transfer-encoding")) {
+                const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+                var lower_buf: [128]u8 = undefined;
+                if (value.len > lower_buf.len) return false;
+                const lower = std.ascii.lowerString(&lower_buf, value);
+                return std.mem.indexOf(u8, lower, "chunked") != null;
+            }
+        }
+        line_start = line_end + 2;
+    }
+    return false;
+}
+
+fn chunkedMessageLen(body: []const u8) ?usize {
+    var pos: usize = 0;
+    while (true) {
+        const line_end = std.mem.indexOfPos(u8, body, pos, "\r\n") orelse return null;
+        const chunk_size = std.fmt.parseInt(usize, body[pos..line_end], 16) catch return null;
+        pos = line_end + 2;
+        if (chunk_size == 0) {
+            if (pos + 2 <= body.len and body[pos] == '\r' and body[pos + 1] == '\n') return pos + 2;
+            return null;
+        }
+        pos += chunk_size;
+        if (pos + 2 > body.len or body[pos] != '\r' or body[pos + 1] != '\n') return null;
+        pos += 2;
+    }
+}
+
 fn requestLen(buf: []const u8) ?usize {
     const head_end = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse return null;
-    var total = head_end + 4;
-    if (contentLength(buf[0..total])) |body_len| total += body_len;
-    if (total > buf.len) return null; // body still in flight
-    return total;
+    const headers_end = head_end + 4;
+    if (contentLength(buf[0..headers_end])) |body_len| {
+        const total = headers_end + body_len;
+        if (total > buf.len) return null;
+        return total;
+    }
+    if (transferEncodingChunked(buf[0..headers_end])) {
+        const chunk_len = chunkedMessageLen(buf[headers_end..]) orelse return null;
+        const total = headers_end + chunk_len;
+        if (total > buf.len) return null;
+        return total;
+    }
+    return headers_end;
 }
 
 // A request can arrive in pieces, so a connection needs somewhere to keep the
@@ -102,6 +149,7 @@ const MAX_TRACKED_FD = 4096;
 // already IS `c_int`, so the hosted pumps hand theirs over unchanged.
 pub const ConnState = struct {
     fd: c_int = -1,
+    ssl: ?*anyopaque = null,
     buf: [REQUEST_BUFFER]u8 = undefined,
     len: usize = 0,
 };
@@ -122,10 +170,62 @@ fn releaseConn(fd: posix.fd_t) void {
     const idx: usize = @intCast(fd);
     if (idx >= MAX_TRACKED_FD) return;
     if (conn_states[idx]) |s| {
+        closeConn(s);
         std.heap.c_allocator.destroy(s);
         conn_states[idx] = null;
+    } else {
+        posix.close(@intCast(fd));
     }
 }
+
+fn closeConn(st: *ConnState) void {
+    if (st.ssl) |ssl| {
+        @import("root").koru_koru.koru_openssl.releaseServerSsl(@ptrCast(@alignCast(ssl)));
+        st.ssl = null;
+    }
+    if (st.fd >= 0) {
+        posix.shutdown(@intCast(st.fd), .both) catch {};
+        posix.close(@intCast(st.fd));
+        st.fd = -1;
+    }
+    st.len = 0;
+}
+
+fn shutdownConn(st: *ConnState) void {
+    if (st.fd >= 0) {
+        posix.shutdown(@intCast(st.fd), .both) catch {};
+    }
+}
+
+fn writeAllConn(st: *ConnState, data: []const u8) bool {
+    if (st.ssl) |ssl_opaque| {
+        const ssl: *@import("root").koru_koru.koru_openssl.c.SSL = @ptrCast(@alignCast(ssl_opaque));
+        return @import("root").koru_koru.koru_openssl.sslWriteAll(ssl, st.fd, data, std.heap.page_allocator);
+    }
+    return writeAll(@intCast(st.fd), data);
+}
+
+fn maybeStartTls(
+    tls_port: ?u16,
+    cert_path: ?[]const u8,
+    key_path: ?[]const u8,
+) ?[]const u8 {
+    const tp = tls_port orelse return null;
+    const cert = cert_path orelse "/certs/server.crt";
+    const key = key_path orelse "/certs/server.key";
+    const loaded = @import("root").koru_koru.koru_openssl.loadServerCtx(std.heap.page_allocator, cert, key);
+    switch (loaded) {
+        .ok => |ctx| {
+            tls_server_ctx = ctx;
+            tls_listen_port = tp;
+            return null;
+        },
+        .err => |e| return e.msg,
+    }
+}
+
+var tls_server_ctx: ?*anyopaque = null;
+var tls_listen_port: u16 = 0;
 
 // Drop the requests already answered and slide the unfinished tail to the
 // front, so the next read continues it instead of mistaking it for a new one.
@@ -150,6 +250,29 @@ fn contentLength(head: []const u8) ?usize {
         line_start = line_end + 2;
     }
     return null;
+}
+
+fn pumpHeaderValue(raw: []const u8, comptime name: []const u8) ?[]const u8 {
+    const first_line = std.mem.indexOf(u8, raw, "\r\n") orelse return null;
+    var scan: usize = first_line + 2;
+    while (scan < raw.len) {
+        const nl = std.mem.indexOfPos(u8, raw, scan, "\r\n") orelse break;
+        const line = raw[scan..nl];
+        scan = nl + 2;
+        if (line.len == 0) break;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (!std.ascii.eqlIgnoreCase(line[0..colon], name)) continue;
+        return std.mem.trim(u8, line[colon + 1 ..], " \t");
+    }
+    return null;
+}
+
+fn requestWantsClose(raw: []const u8) bool {
+    const value = pumpHeaderValue(raw, "connection") orelse return false;
+    var lower_buf: [64]u8 = undefined;
+    if (value.len > lower_buf.len) return false;
+    const lower = std.ascii.lowerString(&lower_buf, value);
+    return std.mem.indexOf(u8, lower, "close") != null;
 }
 
 // ---------------------------------------------------------------------------
@@ -301,9 +424,65 @@ fn ukAdmit(incoming: c_int) void {
     oldest.last_seen = wallClockSeconds(null);
 }
 
-// ============================================================================
+fn armKqueueRead(kq: i32, fd: posix.fd_t) void {
+    var changes: [1]libc.Kevent = undefined;
+    var none: [0]libc.Kevent = undefined;
+    changes[0] = .{
+        .ident = @intCast(fd),
+        .filter = libc.EVFILT.READ,
+        .flags = libc.EV.ADD | libc.EV.ONESHOT,
+        .fflags = 0,
+        .data = 0,
+        .udata = undefined,
+    };
+    _ = libc.kevent(kq, &changes, 1, &none, 0, null);
+}
+
+fn acceptTlsHandshake(client_fd: c_int) ?*anyopaque {
+    const ctx_ptr = tls_server_ctx orelse return null;
+    const ctx: *@import("root").koru_koru.koru_openssl.ServerCtx = @ptrCast(@alignCast(ctx_ptr));
+    const accepted = @import("root").koru_koru.koru_openssl.acceptServerSsl(ctx, client_fd, std.heap.page_allocator);
+    return switch (accepted) {
+        .ok => |ssl| ssl,
+        .err => {
+            posix.close(@intCast(client_fd));
+            return null;
+        },
+    };
+}
+
+fn registerClient(client_fd: posix.fd_t, ssl: ?*anyopaque, kq: i32) void {
+    disableNagle(client_fd);
+    markNonBlocking(client_fd);
+    const st = connState(client_fd) orelse {
+        if (ssl) |s| @import("root").koru_koru.koru_openssl.releaseServerSsl(@ptrCast(@alignCast(s)));
+        posix.close(client_fd);
+        return;
+    };
+    st.ssl = ssl;
+    armKqueueRead(kq, client_fd);
+}
+
+fn registerClientEpoll(client_fd: posix.fd_t, ssl: ?*anyopaque, epfd: i32) void {
+    const linux = std.os.linux;
+    disableNagle(client_fd);
+    markNonBlocking(client_fd);
+    const st = connState(client_fd) orelse {
+        if (ssl) |s| @import("root").koru_koru.koru_openssl.releaseServerSsl(@ptrCast(@alignCast(s)));
+        posix.close(client_fd);
+        return;
+    };
+    st.ssl = ssl;
+    var client_event = linux.epoll_event{
+        .events = linux.EPOLL.IN | linux.EPOLL.ONESHOT,
+        .data = .{ .fd = client_fd },
+    };
+    _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_ADD, client_fd, &client_event);
+}
+
+// ---------------------------------------------------------------------------
 // RUN — the loop. One variant per platform.
-// ============================================================================
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Shared helpers — identical on every POSIX platform, written once.
@@ -419,6 +598,20 @@ fn workerCount() usize {
 // connection with more to come, the other is a connection with nothing more
 // ever. Separating them is what `idle` is for.
 ~proc fill|zig {
+    if (st.ssl) |ssl_opaque| {
+        const ssl: *@import("root").koru_koru.koru_openssl.c.SSL = @ptrCast(@alignCast(ssl_opaque));
+        const rc = @import("root").koru_koru.koru_openssl.c.SSL_read(ssl, @ptrCast(st.buf[st.len..].ptr), @intCast(st.buf.len - st.len));
+        if (rc > 0) {
+            st.len += @intCast(rc);
+            return .more;
+        }
+        const err_code = @import("root").koru_koru.koru_openssl.c.SSL_get_error(ssl, rc);
+        return switch (err_code) {
+            @import("root").koru_koru.koru_openssl.c.SSL_ERROR_WANT_READ, @import("root").koru_koru.koru_openssl.c.SSL_ERROR_WANT_WRITE => .idle,
+            @import("root").koru_koru.koru_openssl.c.SSL_ERROR_ZERO_RETURN => .gone,
+            else => .gone,
+        };
+    }
     const n = $mod.posix.read(@intCast(st.fd), st.buf[st.len..]) catch |err| switch (err) {
         error.WouldBlock => return .idle,
         else => return .gone,
@@ -447,6 +640,10 @@ fn workerCount() usize {
 // ---------------------------------------------------------------------------
 
 ~proc run|zig {
+    if ($mod.maybeStartTls(tls_port, cert_path, key_path)) |err_msg| {
+        return .{ .failed = err_msg };
+    }
+
     var server = $mod.openListener(port) orelse return .{ .failed = "Failed to listen" };
 
     const n_workers = $mod.workerCount();
@@ -497,7 +694,6 @@ fn workerCount() usize {
                         },
                         .gone => {
                             $mod.releaseConn(fd);
-                            $mod.posix.close(fd);
                             continue;
                         },
                     }
@@ -508,7 +704,8 @@ fn workerCount() usize {
                     var alive = true;
                     while (consumed < st.len) {
                         const take = $mod.requestLen(st.buf[consumed..st.len]) orelse break;
-                        var exchange = $mod.Exchange{ .fd = fd, .raw = st.buf[consumed .. consumed + take] };
+                        var exchange = $mod.Exchange{ .fd = fd, .st = st, .raw = st.buf[consumed .. consumed + take] };
+                        if ($mod.requestWantsClose(exchange.raw)) exchange.keep_alive = false;
                         arrived(&exchange);
                         consumed += take;
                         if (!exchange.keep_alive) {
@@ -523,7 +720,6 @@ fn workerCount() usize {
 
                     if (!alive) {
                         $mod.releaseConn(fd);
-                        $mod.posix.close(fd);
                         continue;
                     }
 
@@ -548,31 +744,41 @@ fn workerCount() usize {
             return .{ .failed = "Failed to spawn worker" };
     }
 
+    var next: usize = 0;
+    if ($mod.tls_server_ctx != null) {
+        const TlsAccept = struct {
+            fn loop(kqs_ptr: *[$mod.MAX_WORKERS]i32, n: usize, next_ptr: *usize) void {
+                var tls_listener = $mod.openListener($mod.tls_listen_port) orelse return;
+                defer tls_listener.deinit();
+                while (true) {
+                    const conn = tls_listener.accept() catch continue;
+                    const client_fd = conn.stream.handle;
+                    const ssl = $mod.acceptTlsHandshake(@intCast(client_fd)) orelse continue;
+                    const worker = next_ptr.*;
+                    next_ptr.* = (next_ptr.* + 1) % n;
+                    $mod.registerClient(client_fd, ssl, kqs_ptr[worker]);
+                }
+            }
+        };
+        _ = std.Thread.spawn(.{}, TlsAccept.loop, .{ &kqs, n_workers, &next }) catch
+            return .{ .failed = "Failed to spawn TLS accept thread" };
+    }
+
     std.debug.print("Orisha listening on http://0.0.0.0:{}\n", .{port});
+    if ($mod.tls_server_ctx != null) {
+        std.debug.print("Orisha listening on https://0.0.0.0:{}\n", .{$mod.tls_listen_port});
+    }
     std.debug.print("Pump: kqueue, {} workers, keep-alive, TCP_NODELAY\n", .{n_workers});
 
     // Hand each new connection to the next worker in turn. A descriptor belongs
     // to that worker for the rest of its life, which is what makes the shared
     // connection table safe without a lock: no index is ever touched twice.
-    var next: usize = 0;
-    var arm: [1]$mod.libc.Kevent = undefined;
-    var none: [0]$mod.libc.Kevent = undefined;
     while (true) {
         const conn = server.accept() catch continue;
         const client_fd = conn.stream.handle;
-        $mod.disableNagle(client_fd);
-        $mod.markNonBlocking(client_fd);
-
-        arm[0] = .{
-            .ident = @intCast(client_fd),
-            .filter = $mod.libc.EVFILT.READ,
-            .flags = $mod.libc.EV.ADD | $mod.libc.EV.ONESHOT,
-            .fflags = 0,
-            .data = 0,
-            .udata = undefined,
-        };
-        _ = $mod.libc.kevent(kqs[next], &arm, 1, &none, 0, null);
+        const worker = next;
         next = (next + 1) % n_workers;
+        $mod.registerClient(client_fd, null, kqs[worker]);
     }
 
     return .{ .stopped = "Server stopped" };
@@ -584,6 +790,10 @@ fn workerCount() usize {
 
 ~proc run|epoll {
     const linux = std.os.linux;
+
+    if ($mod.maybeStartTls(tls_port, cert_path, key_path)) |err_msg| {
+        return .{ .failed = err_msg };
+    }
 
     var server = $mod.openListener(port) orelse return .{ .failed = "Failed to listen" };
 
@@ -643,7 +853,6 @@ fn workerCount() usize {
                         },
                         .gone => {
                             $mod.releaseConn(fd);
-                            $mod.posix.close(fd);
                             continue;
                         },
                     }
@@ -653,7 +862,8 @@ fn workerCount() usize {
                     var alive = true;
                     while (consumed < st.len) {
                         const take = $mod.requestLen(st.buf[consumed..st.len]) orelse break;
-                        var exchange = $mod.Exchange{ .fd = fd, .raw = st.buf[consumed .. consumed + take] };
+                        var exchange = $mod.Exchange{ .fd = fd, .st = st, .raw = st.buf[consumed .. consumed + take] };
+                        if ($mod.requestWantsClose(exchange.raw)) exchange.keep_alive = false;
                         arrived(&exchange);
                         consumed += take;
                         if (!exchange.keep_alive) {
@@ -666,7 +876,6 @@ fn workerCount() usize {
 
                     if (!alive) {
                         $mod.releaseConn(fd);
-                        $mod.posix.close(fd);
                         continue;
                     }
 
@@ -688,23 +897,33 @@ fn workerCount() usize {
             return .{ .failed = "Failed to spawn worker" };
     }
 
+    if ($mod.tls_server_ctx != null) {
+        const TlsAccept = struct {
+            fn loop(epfd: i32) void {
+                var tls_listener = $mod.openListener($mod.tls_listen_port) orelse return;
+                defer tls_listener.deinit();
+                while (true) {
+                    const conn = tls_listener.accept() catch continue;
+                    const client_fd = conn.stream.handle;
+                    const ssl = $mod.acceptTlsHandshake(@intCast(client_fd)) orelse continue;
+                    $mod.registerClientEpoll(client_fd, ssl, epfd);
+                }
+            }
+        };
+        _ = std.Thread.spawn(.{}, TlsAccept.loop, .{shared_epfd}) catch
+            return .{ .failed = "Failed to spawn TLS accept thread" };
+    }
+
     std.debug.print("Orisha listening on http://0.0.0.0:{}\n", .{port});
+    if ($mod.tls_server_ctx != null) {
+        std.debug.print("Orisha listening on https://0.0.0.0:{}\n", .{$mod.tls_listen_port});
+    }
     std.debug.print("Pump: epoll, {} workers on one shared queue, keep-alive, TCP_NODELAY\n", .{n_workers});
 
-    // Hand each new connection to the next worker in turn. A descriptor belongs
-    // to that worker for the rest of its life, which is what makes the shared
-    // connection table safe without a lock: no index is ever touched twice.
     while (true) {
         const conn = server.accept() catch continue;
         const client_fd = conn.stream.handle;
-        $mod.disableNagle(client_fd);
-        $mod.markNonBlocking(client_fd);
-
-        var client_event = linux.epoll_event{
-            .events = linux.EPOLL.IN | linux.EPOLL.ONESHOT,
-            .data = .{ .fd = client_fd },
-        };
-        _ = linux.epoll_ctl(shared_epfd, linux.EPOLL.CTL_ADD, client_fd, &client_event);
+        $mod.registerClientEpoll(client_fd, null, shared_epfd);
     }
 
     return .{ .stopped = "Server stopped" };
@@ -736,6 +955,9 @@ fn workerCount() usize {
 // a call site.
 
 ~proc run|io-uring {
+    if (tls_port != null) {
+        return .{ .failed = "TLS is not supported on the io_uring pump yet" };
+    }
     // `std.os.linux.IoUring` cannot be NAMED on a non-Linux target — it reaches
     // for `linux.E` and a macOS build has `darwin.E` instead, so this is a type
     // error, not a missing feature. The guard is comptime-known, so the body
@@ -820,7 +1042,8 @@ fn workerCount() usize {
             var alive = true;
             while (consumed < st.len) {
                 const take = $mod.requestLen(st.buf[consumed..st.len]) orelse break;
-                var exchange = $mod.Exchange{ .fd = fd, .raw = st.buf[consumed .. consumed + take] };
+                var exchange = $mod.Exchange{ .fd = fd, .st = st, .raw = st.buf[consumed .. consumed + take] };
+                if ($mod.requestWantsClose(exchange.raw)) exchange.keep_alive = false;
                 arrived(&exchange);
                 consumed += take;
                 if (!exchange.keep_alive) {
@@ -859,6 +1082,9 @@ fn workerCount() usize {
 // the application does not stall the network.
 
 ~proc run|unikraft {
+    if (tls_port != null) {
+        return .{ .failed = "TLS is not supported on the unikernel pump yet" };
+    }
     const fd = $mod.socket(2, 1, 0);
     if (fd < 0) return .{ .failed = "socket" };
 
@@ -953,7 +1179,8 @@ fn workerCount() usize {
             var alive = true;
             while (consumed < live.st.len) {
                 const take = $mod.requestLen(live.st.buf[consumed..live.st.len]) orelse break;
-                var x = $mod.Exchange{ .fd = live.st.fd, .raw = live.st.buf[consumed .. consumed + take] };
+                var x = $mod.Exchange{ .fd = live.st.fd, .st = &live.st, .raw = live.st.buf[consumed .. consumed + take] };
+                if ($mod.requestWantsClose(x.raw)) x.keep_alive = false;
                 arrived(&x);
                 consumed += take;
                 if (!x.keep_alive) {
@@ -983,13 +1210,21 @@ fn workerCount() usize {
 // already holds a whole rendered response passes it as `head` with an empty
 // `body`, which is what a pre-rendered static route does.
 ~proc reply|zig {
-    if (!writeAll(x.fd, head)) {
+    const st = x.st orelse connState(@intCast(x.fd)) orelse {
+        x.keep_alive = false;
+        return .{ .broken = "write failed" };
+    };
+    if (!writeAllConn(st, head)) {
         x.keep_alive = false;
         return .{ .broken = "write failed" };
     }
-    if (body.len > 0 and !writeAll(x.fd, body)) {
+    if (body.len > 0 and !writeAllConn(st, body)) {
         x.keep_alive = false;
         return .{ .broken = "write failed" };
+    }
+    if ($mod.requestWantsClose(x.raw)) {
+        x.keep_alive = false;
+        $mod.shutdownConn(st);
     }
     return .sent;
 }

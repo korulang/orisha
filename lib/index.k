@@ -89,12 +89,12 @@ handler -> { status: 404, body: "Not Found", content_type: null }
 // Adding a platform is a `~proc run|<name>` in orisha/pump plus a line in the
 // variants block. Nothing in this file changes.
 
-pub tor serve { port: u16 }
+pub tor serve { port: u16, tls_port: ?u16, cert_path: ?string, key_path: ?string }
 | shutdown string
 | failed string
 
 serve =
-    orisha/pump:run(port)
+    orisha/pump:run(port, tls_port, cert_path, key_path)
     ! arrived x |> orisha/pump:raw(x): raw |> orisha:answer(raw): a |> orisha/pump:reply(x, a.head, a.body)
         | sent |> orisha:release-body(a.body, allocated: a.body_allocated)
         | broken _ |> orisha:release-body(a.body, allocated: a.body_allocated)

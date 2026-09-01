@@ -1,0 +1,14 @@
+a.out
+output
+.zig-cache/
+backend.zig
+backend_output_emitted.zig
+build.zig
+build_backend.zig
+build_output.zig
+output_emitted.zig
+compiler_env.zig
+program.ast.json
+certs/
+profiles/generated/
+results/

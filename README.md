@@ -40,6 +40,7 @@ examples/
   hello/          # Minimal hello-world server
   static-server/  # Static file serving
 benchmarks/       # wrk scripts and result CSVs
+httparena/        # HttpArena board entry — see httparena/DISCIPLINE.md
 ```
 
 ## License

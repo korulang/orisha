@@ -5,6 +5,9 @@
 // platform, are in the companion `pump.kz`. This file has no host language in
 // it, so it has no `~` in it either.
 
+// TLS helpers live in koru/openssl; imported from orisha/index.k so emission
+// orders koru_openssl before this submodule in the merged module.
+
 // ============================================================================
 // RUN — the loop. One variant per platform.
 // ============================================================================
@@ -12,7 +15,7 @@
 // are the two ways the loop ends. `*Exchange` is a host type the companion
 // declares — a contract may name one, it just may not define one.
 
-pub tor run { port: u16 }
+pub tor run { port: u16, tls_port: ?u16, cert_path: ?string, key_path: ?string }
 ! arrived *Exchange
 | stopped string
 | failed string
