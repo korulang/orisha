@@ -42,20 +42,129 @@ fn gzipBody(allocator: std.mem.Allocator, content: []const u8) ?[]u8 {
             tags: []const []const u8,
             rating: Rating,
         };
-        const JsonOutItem = struct {
-            id: i64,
-            name: []const u8,
-            category: []const u8,
-            price: i64,
-            quantity: i64,
-            active: bool,
-            tags: []const []const u8,
-            rating: Rating,
-            total: i64,
-        };
 
         var dataset_parsed: ?std.json.Parsed([]DatasetItem) = null;
         var dataset_bytes: ?[]u8 = null;
+
+        const CachedItem = struct {
+            id: i64,
+            price: i64,
+            quantity: i64,
+            active: bool,
+            rating: Rating,
+            name_json: []const u8,
+            category_json: []const u8,
+            tags_json: []const u8,
+        };
+        var cached_items: ?[]CachedItem = null;
+
+        threadlocal var body_work: [192 * 1024]u8 = undefined;
+        threadlocal var http_out: [196 * 1024]u8 = undefined;
+
+        // Pre-rendered: answer() emits the whole message verbatim (no Date/X-Powered-By tax).
+        const pipeline_response =
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok";
+
+        fn escapeJsonString(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+            var out: std.ArrayList(u8) = .empty;
+            errdefer out.deinit(allocator);
+            try out.append(allocator, '"');
+            for (s) |c| {
+                switch (c) {
+                    '"' => try out.appendSlice(allocator, "\\\""),
+                    '\\' => try out.appendSlice(allocator, "\\\\"),
+                    '\n' => try out.appendSlice(allocator, "\\n"),
+                    '\r' => try out.appendSlice(allocator, "\\r"),
+                    '\t' => try out.appendSlice(allocator, "\\t"),
+                    else => try out.append(allocator, c),
+                }
+            }
+            try out.append(allocator, '"');
+            return out.toOwnedSlice(allocator);
+        }
+
+        fn tagsToJson(allocator: std.mem.Allocator, tags: []const []const u8) ![]u8 {
+            var out: std.ArrayList(u8) = .empty;
+            errdefer out.deinit(allocator);
+            try out.append(allocator, '[');
+            for (tags, 0..) |tag, i| {
+                if (i > 0) try out.append(allocator, ',');
+                const esc = try escapeJsonString(allocator, tag);
+                defer allocator.free(esc);
+                try out.appendSlice(allocator, esc);
+            }
+            try out.append(allocator, ']');
+            return out.toOwnedSlice(allocator);
+        }
+
+        fn ensureCache(source: []const DatasetItem) ![]const CachedItem {
+            if (cached_items) |items| return items;
+            const built = try alloc.alloc(CachedItem, source.len);
+            for (source, 0..) |src, i| {
+                const name_json = try escapeJsonString(alloc, src.name);
+                errdefer alloc.free(name_json);
+                const category_json = try escapeJsonString(alloc, src.category);
+                errdefer alloc.free(category_json);
+                const tags_json = try tagsToJson(alloc, src.tags);
+                built[i] = .{
+                    .id = src.id,
+                    .price = src.price,
+                    .quantity = src.quantity,
+                    .active = src.active,
+                    .rating = src.rating,
+                    .name_json = name_json,
+                    .category_json = category_json,
+                    .tags_json = tags_json,
+                };
+            }
+            cached_items = built;
+            return built;
+        }
+
+        fn finishHttp(content_type: []const u8, body: []const u8) ?[]const u8 {
+            return std.fmt.bufPrint(
+                &http_out,
+                "HTTP/1.1 200 OK\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n{s}",
+                .{ content_type, body.len, body },
+            ) catch null;
+        }
+
+        fn plainIntResponse(n: i64) ?[]const u8 {
+            var num: [32]u8 = undefined;
+            const num_slice = std.fmt.bufPrint(&num, "{d}", .{n}) catch return null;
+            return finishHttp("text/plain", num_slice);
+        }
+
+        fn writeJsonItem(w: anytype, item: CachedItem, m: i64) !void {
+            const total = item.price * item.quantity * m;
+            try w.print(
+                "{{\"id\":{d},\"name\":{s},\"category\":{s},\"price\":{d},\"quantity\":{d},\"active\":{},\"tags\":{s},\"rating\":{{\"score\":{d},\"count\":{d}}},\"total\":{d}}}",
+                .{
+                    item.id,
+                    item.name_json,
+                    item.category_json,
+                    item.price,
+                    item.quantity,
+                    item.active,
+                    item.tags_json,
+                    item.rating.score,
+                    item.rating.count,
+                    total,
+                },
+            );
+        }
+
+        fn jsonResponse(source: []const CachedItem, count: usize, m: i64) ?[]const u8 {
+            var stream = std.io.fixedBufferStream(&body_work);
+            const w = stream.writer();
+            w.print("{{\"count\":{d},\"items\":[", .{count}) catch return null;
+            for (0..count) |i| {
+                if (i > 0) w.writeAll(",") catch return null;
+                writeJsonItem(w, source[i], m) catch return null;
+            }
+            w.writeAll("]}") catch return null;
+            return finishHttp("application/json", stream.getWritten());
+        }
 
         fn datasetItems() ![]const DatasetItem {
             if (dataset_parsed) |parsed| return parsed.value;
@@ -102,10 +211,6 @@ fn gzipBody(allocator: std.mem.Allocator, content: []const u8) ?[]u8 {
             return std.mem.indexOf(u8, lower, "gzip") != null;
         }
 
-        // Pre-rendered: answer() emits `head` verbatim and skips per-request header formatting.
-        const pipeline_response =
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok";
-
         fn handle(r: *orisha.Request) orisha.Response {
             if (std.mem.eql(u8, r.path, "/pipeline")) {
                 return .{ .status = 200, .body = pipeline_response, .content_type = "text/plain", .body_allocated = false };
@@ -114,6 +219,9 @@ fn gzipBody(allocator: std.mem.Allocator, content: []const u8) ?[]u8 {
             if (std.mem.eql(u8, r.path, "/baseline11")) {
                 var total = sumQueryValues(r.query);
                 if (std.mem.eql(u8, r.method, "POST")) total += bodyAsInt(r.body);
+                if (plainIntResponse(total)) |msg| {
+                    return .{ .status = 200, .body = msg, .content_type = "text/plain", .body_allocated = false };
+                }
                 const body = std.fmt.allocPrint(alloc, "{d}", .{total}) catch {
                     return .{ .status = 500, .body = "out of memory", .content_type = "text/plain", .body_allocated = false };
                 };
@@ -128,6 +236,28 @@ fn gzipBody(allocator: std.mem.Allocator, content: []const u8) ?[]u8 {
                     return .{ .status = 500, .body = "No dataset", .content_type = "text/plain", .body_allocated = false };
                 };
                 const count = @min(want_count, source.len);
+                const cache = ensureCache(source) catch {
+                    return .{ .status = 500, .body = "cache failed", .content_type = "text/plain", .body_allocated = false };
+                };
+
+                if (!wantsGzip(r.accept_encoding)) {
+                    if (jsonResponse(cache, count, m)) |msg| {
+                        return .{ .status = 200, .body = msg, .content_type = "application/json", .body_allocated = false };
+                    }
+                }
+
+                // Gzip / fallback: build JSON in the heap (validate json-comp path).
+                const JsonOutItem = struct {
+                    id: i64,
+                    name: []const u8,
+                    category: []const u8,
+                    price: i64,
+                    quantity: i64,
+                    active: bool,
+                    tags: []const []const u8,
+                    rating: Rating,
+                    total: i64,
+                };
                 var out_items = alloc.alloc(JsonOutItem, count) catch {
                     return .{ .status = 500, .body = "out of memory", .content_type = "text/plain", .body_allocated = false };
                 };
@@ -154,6 +284,10 @@ fn gzipBody(allocator: std.mem.Allocator, content: []const u8) ?[]u8 {
                         alloc.free(json_body);
                         return .{ .status = 200, .body = gz, .content_type = "application/json", .content_encoding = "gzip", .body_allocated = true };
                     }
+                }
+                if (finishHttp("application/json", json_body)) |msg| {
+                    alloc.free(json_body);
+                    return .{ .status = 200, .body = msg, .content_type = "application/json", .body_allocated = false };
                 }
                 return .{ .status = 200, .body = json_body, .content_type = "application/json", .body_allocated = true };
             }

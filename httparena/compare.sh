@@ -1,6 +1,6 @@
 #!/usr/bin/env zsh
 export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:${PATH:-}"
-# Same-machine wrk comparison: Orisha HttpArena entry vs a minimal Go stdlib reference,
+# Same-machine wrk comparison: Orisha HttpArena entry vs ASP.NET Core reference,
 # plus HttpArena board numbers for context (different hardware, load generator, workload).
 #
 #   ./compare.sh
@@ -15,7 +15,7 @@ CONNECTIONS="${CONNECTIONS:-256}"
 THREADS="${THREADS:-4}"
 DATASET_PATH="${DATASET_PATH:-./data/dataset.json}"
 ORISHA_PORT="${ORISHA_PORT:-8080}"
-REF_PORT="${REF_PORT:-8090}"
+DOTNET_PORT="${DOTNET_PORT:-8091}"
 STAMP="$(/bin/date -u +%Y-%m-%dT%H-%M-%SZ)"
 OUT="$HERE/results/compare-${STAMP}.txt"
 mkdir -p "$HERE/results"
@@ -30,7 +30,7 @@ else
 fi
 command -v wrk >/dev/null 2>&1 || { echo "wrk not found" >&2; exit 1; }
 WRK="${WRK:-$(command -v wrk)}"
-command -v go >/dev/null 2>&1 || { echo "go not found (needed for stdlib reference)" >&2; exit 1; }
+command -v dotnet >/dev/null 2>&1 || { echo "dotnet not found (needed for .NET reference)" >&2; exit 1; }
 PYTHON="${PYTHON:-$(command -v python3)}"
 [ -n "$PYTHON" ] || { echo "python3 not found (needed for board context)" >&2; exit 1; }
 
@@ -43,7 +43,7 @@ rps_from_wrk() {
 }
 
 kill_ports() {
-    lsof -ti:"$ORISHA_PORT","$REF_PORT",8081 2>/dev/null | xargs kill 2>/dev/null || true
+    lsof -ti:"$ORISHA_PORT","$DOTNET_PORT",8081 2>/dev/null | xargs kill 2>/dev/null || true
     /bin/sleep 0.5
 }
 
@@ -60,12 +60,12 @@ wait_ready() {
 }
 
 ORISHA_PID=""
-REF_PID=""
+DOTNET_PID=""
 cleanup() {
     [ -n "$ORISHA_PID" ] && kill "$ORISHA_PID" 2>/dev/null || true
-    [ -n "$REF_PID" ] && kill "$REF_PID" 2>/dev/null || true
+    [ -n "$DOTNET_PID" ] && kill "$DOTNET_PID" 2>/dev/null || true
     wait "$ORISHA_PID" 2>/dev/null || true
-    wait "$REF_PID" 2>/dev/null || true
+    wait "$DOTNET_PID" 2>/dev/null || true
     kill_ports
 }
 trap cleanup EXIT INT TERM
@@ -82,18 +82,18 @@ kill_ports
 log "==> building Orisha (ReleaseFast)"
 DATASET_PATH="$DATASET_PATH" "$KORUC" main.k --release=fast >>"$OUT" 2>&1
 
-log "==> building Go stdlib reference"
-( cd "$HERE/refs" && CGO_ENABLED=0 go build -o minimal minimal.go ) >>"$OUT" 2>&1
+log "==> building ASP.NET Core HttpArena reference"
+( cd "$HERE/refs/dotnet" && dotnet publish -c Release -o bin/publish 2>/dev/null )
 
 log "==> starting servers"
 DATASET_PATH="$DATASET_PATH" ./a.out >>"$OUT" 2>&1 &
 ORISHA_PID=$!
-"$HERE/refs/minimal" >>"$OUT" 2>&1 &
-REF_PID=$!
+DATASET_PATH="$DATASET_PATH" "$HERE/refs/dotnet/bin/publish/httparena-ref" >>"$OUT" 2>&1 &
+DOTNET_PID=$!
 wait_ready "$ORISHA_PORT" || exit 1
-wait_ready "$REF_PORT" || exit 1
+wait_ready "$DOTNET_PORT" || exit 1
 
-typeset -A REF_RPS ORISHA_RPS
+typeset -A DOTNET_RPS ORISHA_RPS
 for entry in \
     "pipeline|/pipeline" \
     "baseline GET|/baseline11?a=13&b=42" \
@@ -101,27 +101,18 @@ for entry in \
     label="${entry%%|*}"
     path="${entry#*|}"
 
-    ref_url="http://127.0.0.1:${REF_PORT}${path}"
+    dotnet_url="http://127.0.0.1:${DOTNET_PORT}${path}"
     orisha_url="http://127.0.0.1:${ORISHA_PORT}${path}"
-
-    if [ "$label" = "json slice" ]; then
-        log ""
-        log "--- ${label} (Orisha only — reference server has no /json) ---"
-        rps="$(rps_from_wrk "$orisha_url")"
-        ORISHA_RPS["$label"]="$rps"
-        log "  Orisha: ${rps} req/s"
-        continue
-    fi
 
     log ""
     log "--- ${label} ---"
-    ref_rps="$(rps_from_wrk "$ref_url")"
+    dotnet_rps="$(rps_from_wrk "$dotnet_url")"
     orisha_rps="$(rps_from_wrk "$orisha_url")"
-    REF_RPS["$label"]="$ref_rps"
+    DOTNET_RPS["$label"]="$dotnet_rps"
     ORISHA_RPS["$label"]="$orisha_rps"
-    ratio="$(/usr/bin/awk -v o="$orisha_rps" -v g="$ref_rps" 'BEGIN { if (g>0) printf "%.0f%%", 100*o/g; else print "n/a" }')"
-    log "  Go net/http :${REF_PORT}  ${ref_rps} req/s"
-    log "  Orisha      :${ORISHA_PORT}  ${orisha_rps} req/s  (${ratio} of Go on this box)"
+    ratio="$(/usr/bin/awk -v o="$orisha_rps" -v d="$dotnet_rps" 'BEGIN { if (d>0) printf "%.0f%%", 100*o/d; else print "n/a" }')"
+    log "  ASP.NET Core :${DOTNET_PORT}  ${dotnet_rps} req/s"
+    log "  Orisha       :${ORISHA_PORT}  ${orisha_rps} req/s  (${ratio} of .NET on this box)"
 done
 
 log ""
@@ -176,7 +167,7 @@ PY
 
 log ""
 log "==> how to read this"
-log "- Same-box Go vs Orisha is the only apples-to-apples pair above."
+log "- Same-box ASP.NET Core vs Orisha is the apples-to-apples pair above."
 log "- Board numbers use gcannon on Linux io_uring hardware; do not divide our wrk rps into their gcannon rps."
 log "- Baseline board rotates GET + POST (CL + chunked); we only wrk GET baseline11."
 log "- Pipelined board uses gcannon -p 16; wrk here sends one in-flight request per connection."
