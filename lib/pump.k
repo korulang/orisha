@@ -21,6 +21,32 @@ pub tor run { port: u16, tls_port: ?u16, cert_path: ?string, key_path: ?string }
 | failed string
 
 // ============================================================================
+// PARTICIPANT VERBS — the same lifecycle, decomposed for std/pump
+// ============================================================================
+// `init` owns the machinery: listener, TLS context, worker kqueues, accept
+// threads. `! arrived` arms here — the workers it spawns are what fire it.
+// `step` is one pass of the accept loop: drain pending connections, hand each
+// to a worker round-robin, return how many were taken. Connection readiness
+// never reaches this level — it lives inside the workers' kqueues, which are
+// participant-internal. `wait` is the listener fd alone; `live` is `!stop`;
+// `stop` asks the server to retire at the next liveness check.
+
+pub tor init { port: u16, tls_port: ?u16, cert_path: ?string, key_path: ?string }
+! arrived *Exchange
+| ?started
+| failed string
+
+pub tor step {} -> i32
+
+pub tor live {} -> i64
+
+pub tor wait { i: i64 } -> { fd: i32, wait_ns: i128 }
+
+pub tor stop {}
+
+pub tor deinit {}
+
+// ============================================================================
 // FILL — get more bytes into a connection's buffer
 // ============================================================================
 // The mirror of `reply`. Writing has had a platform seam since the unikernel
@@ -81,8 +107,11 @@ pub tor fileno { x: *Exchange } -> usize
 // ============================================================================
 // RAW — the request bytes, for the parsing layer
 // ============================================================================
-// Implemented right here, in Koru, because there is nothing host-shaped about
-// reading a field.
+// An OWNED copy, not a borrow: `x.raw` lives in the pump's read buffer, and a
+// `->` return may not hand back a borrow of its parameter (610_007). The copy
+// lives in a per-request arena in the companion that resets on the next call —
+// after the current arm is fully answered — and every source of `Exchange.raw`
+// is a slice of `ConnState.buf`, so the copy always fits. Implemented in Zig
+// beside the arena; there is no Koru-level projection to refuse.
 
 pub tor raw { x: *Exchange } -> string
-raw -> x.raw

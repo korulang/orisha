@@ -227,6 +227,16 @@ fn maybeStartTls(
 var tls_server_ctx: ?*anyopaque = null;
 var tls_listen_port: u16 = 0;
 
+// Participant-verb state (std/pump contract). `init` fills these; `step`
+// accepts against the listener; `wait` exposes it; `stop`/`live` carry the
+// retirement flag. The workers' kqueues stay participant-internal — a conn
+// fd's readiness never reaches the pump's union wait.
+var listen_server: ?std.net.Server = null;
+var worker_kqs: [MAX_WORKERS]i32 = undefined;
+var worker_total: usize = 0;
+var worker_next: usize = 0;
+var should_stop: bool = false;
+
 // Drop the requests already answered and slide the unfinished tail to the
 // front, so the next read continues it instead of mistaking it for a new one.
 fn retainTail(buf: []u8, len: usize, consumed: usize) usize {
@@ -638,6 +648,177 @@ fn workerCount() usize {
 // ---------------------------------------------------------------------------
 // kqueue — macOS and the BSDs. The default variant.
 // ---------------------------------------------------------------------------
+
+~proc init|zig {
+    if ($mod.maybeStartTls(tls_port, cert_path, key_path)) |err_msg| {
+        return .{ .failed = err_msg };
+    }
+
+    $mod.listen_server = $mod.openListener(port) orelse return .{ .failed = "Failed to listen" };
+    $mod.worker_total = $mod.workerCount();
+    $mod.should_stop = false;
+
+    // The per-connection half of the loop, unchanged — one runs per worker,
+    // each on its own kqueue, each seeing only the descriptors handed to it.
+    const Worker = struct {
+    fn loop(kq: i32) void {
+        var changes: [1]$mod.libc.Kevent = undefined;
+        var no_changes: [0]$mod.libc.Kevent = undefined;
+        var events: [$mod.MAX_EVENTS]$mod.libc.Kevent = undefined;
+
+        while (true) {
+            const n = $mod.libc.kevent(kq, &no_changes, 0, &events, $mod.MAX_EVENTS, null);
+            if (n <= 0) continue;
+
+            for (events[0..@intCast(n)]) |event| {
+                const fd: $mod.posix.fd_t = @intCast(event.ident);
+
+                const st = $mod.connState(fd) orelse {
+                    $mod.posix.close(fd);
+                    continue;
+                };
+
+                switch ($mod.fill_event.handler(.{ .st = st })) {
+                    .more => {},
+                    // Nothing new to frame, but the connection is alive.
+                    // Re-arm and wait rather than closing it.
+                    .idle => {
+                        changes[0] = .{
+                            .ident = @intCast(fd),
+                            .filter = $mod.libc.EVFILT.READ,
+                            .flags = $mod.libc.EV.ADD | $mod.libc.EV.ONESHOT,
+                            .fflags = 0,
+                            .data = 0,
+                            .udata = undefined,
+                        };
+                        _ = $mod.libc.kevent(kq, &changes, 1, &no_changes, 0, null);
+                        continue;
+                    },
+                    .gone => {
+                        $mod.releaseConn(fd);
+                        continue;
+                    },
+                }
+
+                // Answer every COMPLETE request; keep any unfinished tail
+                // for the next read rather than parsing it as a fresh one.
+                var consumed: usize = 0;
+                var alive = true;
+                while (consumed < st.len) {
+                    const take = $mod.requestLen(st.buf[consumed..st.len]) orelse break;
+                    var exchange = $mod.Exchange{ .fd = fd, .st = st, .raw = st.buf[consumed .. consumed + take] };
+                    if ($mod.requestWantsClose(exchange.raw)) exchange.keep_alive = false;
+                    arrived(&exchange);
+                    consumed += take;
+                    if (!exchange.keep_alive) {
+                        alive = false;
+                        break;
+                    }
+                }
+                st.len = $mod.retainTail(&st.buf, st.len, consumed);
+
+                // Headers that never end are not a request this server can answer.
+                if (alive and st.len == st.buf.len) alive = false;
+
+                if (!alive) {
+                    $mod.releaseConn(fd);
+                    continue;
+                }
+
+                // ONESHOT disarms on delivery — re-arm for the next request.
+                changes[0] = .{
+                    .ident = @intCast(fd),
+                    .filter = $mod.libc.EVFILT.READ,
+                    .flags = $mod.libc.EV.ADD | $mod.libc.EV.ONESHOT,
+                    .fflags = 0,
+                    .data = 0,
+                    .udata = undefined,
+                };
+                _ = $mod.libc.kevent(kq, &changes, 1, &no_changes, 0, null);
+            }
+        }
+    }
+};
+
+    for (0..$mod.worker_total) |i| {
+        $mod.worker_kqs[i] = $mod.posix.kqueue() catch return .{ .failed = "Failed to create kqueue" };
+        _ = std.Thread.spawn(.{}, Worker.loop, .{ $mod.worker_kqs[i] }) catch
+            return .{ .failed = "Failed to spawn worker" };
+    }
+
+    if ($mod.tls_server_ctx != null) {
+            const TlsAccept = struct {
+        fn loop(kqs_ptr: *[$mod.MAX_WORKERS]i32, n: usize, next_ptr: *usize) void {
+            var tls_listener = $mod.openListener($mod.tls_listen_port) orelse return;
+            defer tls_listener.deinit();
+            while (true) {
+                const conn = tls_listener.accept() catch continue;
+                const client_fd = conn.stream.handle;
+                const ssl = $mod.acceptTlsHandshake(@intCast(client_fd)) orelse continue;
+                const worker = next_ptr.*;
+                next_ptr.* = (next_ptr.* + 1) % n;
+                $mod.registerClient(client_fd, ssl, kqs_ptr[worker]);
+            }
+        }
+    };
+
+        _ = std.Thread.spawn(.{}, TlsAccept.loop, .{ &$mod.worker_kqs, $mod.worker_total, &$mod.worker_next }) catch
+            return .{ .failed = "Failed to spawn TLS accept thread" };
+    }
+
+    std.debug.print("Orisha listening on http://0.0.0.0:{}\n", .{port});
+    if ($mod.tls_server_ctx != null) {
+        std.debug.print("Orisha listening on https://0.0.0.0:{}\n", .{$mod.tls_listen_port});
+    }
+    std.debug.print("Pump: kqueue, {} workers, keep-alive, TCP_NODELAY\n", .{$mod.worker_total});
+
+    return .{ .started = .{} };
+}
+
+~proc step|zig {
+    _ = &__koru_event_input;
+    // One pass of the old accept loop: while the listener signals, take the
+    // connection and hand it to the next worker in turn. Non-blocking poll
+    // first — accept() itself stays blocking; it just never gets the chance.
+    var accepted: i32 = 0;
+    if ($mod.listen_server) |*srv| {
+        while (true) {
+            var pfd = [_]std.posix.pollfd{.{ .fd = srv.stream.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+            if ((std.posix.poll(&pfd, 0) catch 0) <= 0) break;
+            const conn = srv.accept() catch break;
+            const client_fd = conn.stream.handle;
+            const w = $mod.worker_next;
+            $mod.worker_next = (w + 1) % $mod.worker_total;
+            $mod.registerClient(client_fd, null, $mod.worker_kqs[w]);
+            accepted += 1;
+        }
+    }
+    return accepted;
+}
+
+~proc live|zig {
+    _ = &__koru_event_input;
+    return @intFromBool(!$mod.should_stop);
+}
+
+~proc wait|zig {
+    _ = i;
+    const fd: i32 = if ($mod.listen_server) |*srv| srv.stream.handle else -1;
+    return .{ .fd = fd, .wait_ns = std.math.maxInt(i128) };
+}
+
+~proc stop|zig {
+    _ = &__koru_event_input;
+    $mod.should_stop = true;
+}
+
+~proc deinit|zig {
+    _ = &__koru_event_input;
+    if ($mod.listen_server) |*srv| {
+        srv.deinit();
+        $mod.listen_server = null;
+    }
+}
 
 ~proc run|zig {
     if ($mod.maybeStartTls(tls_port, cert_path, key_path)) |err_msg| {
@@ -1273,4 +1454,20 @@ fn workerCount() usize {
 
 ~proc fileno|unikraft {
     return @intCast(x.fd);
+}
+// RAW — owned copy of the request bytes for the parsing layer.
+//
+// `x.raw` borrows the pump's read buffer (`ConnState.buf`), and a Koru `->`
+// return may not hand back a borrow of its parameter (610_007) — so this proc
+// copies the bytes into a per-request arena instead of projecting the field.
+// The arena resets on every call; the previous arm is fully answered by then.
+// Every construction of `Exchange.raw` slices `ConnState.buf` (REQUEST_BUFFER),
+// so the copy fits by construction and `catch unreachable` never fires.
+var raw_arena_buf: [REQUEST_BUFFER]u8 = undefined;
+var raw_arena = std.heap.FixedBufferAllocator.init(&raw_arena_buf);
+
+~proc raw|zig {
+    raw_arena.reset();
+    const data = raw_arena.allocator().dupe(u8, x.raw) catch unreachable;
+    return data;
 }
