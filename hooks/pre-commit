@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
-# Thin shim → runs the CommonJS gate. The .cjs extension forces CommonJS so the
-# hook works regardless of the repo's package.json "type".
+# pre-commit — two walls:
+#   1. invariant gate, enforcing (shared manifest: koru/invariants;
+#      judgment rows universal, check: rows koru-scoped and skip here)
+#   2. the tilde gate below → runs the CommonJS gate. The .cjs extension
+#      forces CommonJS so the hook works regardless of the repo's
+#      package.json "type".
+set -euo pipefail
+ROOT="$(git rev-parse --show-toplevel)"
+GATE_BLOCK=1 python3 /Users/larsde/src/koru/invariants/gate.py --repo "$ROOT"
 exec node "$(dirname "$0")/pre-commit.cjs" "$@"
