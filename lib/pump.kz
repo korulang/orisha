@@ -5,11 +5,11 @@
 // pump does NOT do — parsing, routing, response shaping — belongs to the Koru
 // flow that consumes the stream, and is written once for every platform.
 //
-// The point of the split: a new platform is a `~proc run|<name>` body, not a
+// The point of the split: a new platform is a `~proc drive|<name>` body, not a
 // copy of the server. Selection is a build-time variant, so the unselected
 // pumps are not merely unused — they are not emitted at all.
 //
-//   ~[build(linux)]std/build:variants { "orisha/pump:run": "epoll" }
+//   ~[build(linux)]std/build:variants { "orisha/pump:drive": "epoll" }
 //
 // The `unikraft` variant is the reason this file exists: a unikernel has no
 // second thread to spawn and no kqueue, so it needs its own loop — and now
@@ -236,6 +236,10 @@ var worker_kqs: [MAX_WORKERS]i32 = undefined;
 var worker_total: usize = 0;
 var worker_next: usize = 0;
 var should_stop: bool = false;
+// Set by `init` on success — `live` reports 0 until the machinery actually
+// stands up, so a failed init retires the participant instead of pinning the
+// pump on an immortal that never was.
+var pump_started: bool = false;
 
 // Drop the requests already answered and slide the unfinished tail to the
 // front, so the next read continues it instead of mistaking it for a new one.
@@ -741,9 +745,14 @@ fn workerCount() usize {
 };
 
     for (0..$mod.worker_total) |i| {
-        $mod.worker_kqs[i] = $mod.posix.kqueue() catch return .{ .failed = "Failed to create kqueue" };
-        _ = std.Thread.spawn(.{}, Worker.loop, .{ $mod.worker_kqs[i] }) catch
+        $mod.worker_kqs[i] = $mod.posix.kqueue() catch {
+            if ($mod.listen_server) |*srv| { srv.deinit(); $mod.listen_server = null; }
+            return .{ .failed = "Failed to create kqueue" };
+        };
+        _ = std.Thread.spawn(.{}, Worker.loop, .{ $mod.worker_kqs[i] }) catch {
+            if ($mod.listen_server) |*srv| { srv.deinit(); $mod.listen_server = null; }
             return .{ .failed = "Failed to spawn worker" };
+        };
     }
 
     if ($mod.tls_server_ctx != null) {
@@ -772,6 +781,7 @@ fn workerCount() usize {
     }
     std.debug.print("Pump: kqueue, {} workers, keep-alive, TCP_NODELAY\n", .{$mod.worker_total});
 
+    $mod.pump_started = true;
     return .{ .started = .{} };
 }
 
@@ -798,7 +808,7 @@ fn workerCount() usize {
 
 ~proc live|zig {
     _ = &__koru_event_input;
-    return @intFromBool(!$mod.should_stop);
+    return @intFromBool($mod.pump_started and !$mod.should_stop);
 }
 
 ~proc wait|zig {
@@ -818,9 +828,366 @@ fn workerCount() usize {
         srv.deinit();
         $mod.listen_server = null;
     }
+    $mod.pump_started = false;
+    $mod.should_stop = false;
 }
 
+// Retirement verdict for a captured run's `| stopped` — "somebody stopped a
+// running server" versus "the machinery never stood up" (init failed). The
+// pump's driver calls the retire unit on the first `live() == 0` pass; this
+// is what keeps `| stopped` honest inside a compound pump. A stopped
+// participant also releases its listener — retirement means torn down, not
+// merely quiet.
+~proc __retire|zig {
+    _ = &__koru_event_input;
+    const stopped = $mod.pump_started and $mod.should_stop;
+    if (!stopped) return .{ .silent = .{} };
+    $mod.deinit_event.handler(.{});
+    return .{ .stopped = .{} };
+}
+
+// ---------------------------------------------------------------------------
+// RUN — context-aware. `orisha/pump:run(...)` reads the same whether it owns
+// the program's loop or an open `std/pump` absorbs it: no open pump ahead of
+// the site → emits `drive` (the standalone accept loops below). An open pump
+// → emits `init` at the site (carrying `! arrived` and `| failed`) plus the
+// join units `std/pump:run` enumerates: `__pump_<name>_{step,live,wait}_<idx>`,
+// and `__pump_<name>_retired_<idx>` when `| stopped` is armed.
+// ---------------------------------------------------------------------------
+
 ~proc run|zig {
+    const ast_functional = @import("ast_functional");
+
+    const flow = if (item.* == .flow) &item.flow else return .{};
+    const rinv = flow.inv();
+    if (rinv.inline_body != null) return .{};
+
+    // Helpers live in one container — a Zig local struct can't see the
+    // function's other locals, so these are members looking sideways at each
+    // other. The marker/decl scans restate koru_pump's PH (private to
+    // std/pump — consumer-side transforms restate them, channel.kz precedent).
+    //
+    // RULED: `// __pump_decl_<name>` / `// __pump_ran_<name>` is the
+    // open-pump marker spelling — decided in koru 7636e4146 and named in
+    // koru concepts/frag-comment-markers-are-the-inter-transform-wire.
+    //
+    // ASPIRATIONAL — the `__pump_decl_/__pump_ran_` scan is one edge of the
+    // comment wire, duplicated per participant library. The resolved
+    // migration is a typed program item (facet_decl precedent) owned by
+    // std/pump and queried, not scanned. See the frag above.
+    const TH = struct {
+        fn mkPath(a: std.mem.Allocator, module: []const u8, name: []const u8) ast.DottedPath {
+            const segs = a.alloc([]const u8, 1) catch unreachable;
+            segs[0] = a.dupe(u8, name) catch unreachable;
+            return ast.DottedPath{ .module_qualifier = a.dupe(u8, module) catch unreachable, .segments = segs };
+        }
+        fn refuse(a: std.mem.Allocator, f: *const ast.Flow, msg: []const u8) ast.Item {
+            const code = std.fmt.allocPrint(a, "comptime {{ @compileError(\"{s}\"); }}", .{msg}) catch unreachable;
+            return ast.Item{ .inline_code = ast.InlineCode{ .code = code, .location = f.location, .module = f.module } };
+        }
+        // A marker host_line is exactly `// <marker>` — anything looser and
+        // prose naming the marker (this file's own comments do) reads as a
+        // planted pump.
+        fn markerScan(its: []const ast.Item, w: []const u8) bool {
+            for (its) |*pi| {
+                switch (pi.*) {
+                    .host_line => |*hl| {
+                        const t = std.mem.trim(u8, hl.content, " \r\n\t");
+                        if (t.len >= 3 and std.mem.startsWith(u8, t, "// ") and std.mem.eql(u8, t[3..], w)) return true;
+                    },
+                    .module_decl => |*md| {
+                        if (markerScan(md.items, w)) return true;
+                    },
+                    else => {},
+                }
+            }
+            return false;
+        }
+        fn markerExists(prog: *const ast.Program, w: []const u8) bool {
+            return markerScan(prog.items, w);
+        }
+        // `// __pump_decl_<name>` planted whole — prose may name the marker
+        // pattern (`<name>` in angle brackets), so the tail must parse as a
+        // bare identifier.
+        fn declName(t: []const u8) ?[]const u8 {
+            const prefix = "// __pump_decl_";
+            if (!std.mem.startsWith(u8, t, prefix)) return null;
+            const name = t[prefix.len..];
+            if (name.len == 0) return null;
+            for (name) |ch| {
+                if (!std.ascii.isAlphanumeric(ch) and ch != '_') return null;
+            }
+            return name;
+        }
+        fn declScan(its: []const ast.Item, want: []const u8) bool {
+            for (its) |*pi| {
+                switch (pi.*) {
+                    .event_decl => |*ed| {
+                        if (ed.path.segments.len > 0 and std.mem.eql(u8, ed.path.segments[ed.path.segments.len - 1], want)) return true;
+                    },
+                    .proc_decl => |*pd| {
+                        if (pd.path.segments.len > 0 and std.mem.eql(u8, pd.path.segments[pd.path.segments.len - 1], want)) return true;
+                    },
+                    .module_decl => |*md| {
+                        if (declScan(md.items, want)) return true;
+                    },
+                    else => {},
+                }
+            }
+            return false;
+        }
+        fn declExists(prog: *const ast.Program, want: []const u8) bool {
+            return declScan(prog.items, want);
+        }
+        fn collectOpen(list: *std.ArrayList([]const u8), a: std.mem.Allocator, prog: *const ast.Program, its: []const ast.Item) void {
+            for (its) |*pi| {
+                switch (pi.*) {
+                    .host_line => |*hl| {
+                        const t = std.mem.trim(u8, hl.content, " \r\n\t");
+                        if (declName(t)) |name| {
+                            for (list.items) |seen| {
+                                if (std.mem.eql(u8, seen, name)) break;
+                            } else {
+                                const ran = std.fmt.allocPrint(a, "__pump_ran_{s}", .{name}) catch unreachable;
+                                if (!markerExists(prog, ran)) list.append(a, a.dupe(u8, name) catch unreachable) catch unreachable;
+                            }
+                        }
+                    },
+                    .module_decl => |*md| collectOpen(list, a, prog, md.items),
+                    else => {},
+                }
+            }
+        }
+        // A `->` return inside a transplanted arm would leave the generated
+        // unit's flow — detect it before splicing.
+        fn hasReturn(cont: *const ast.Continuation) bool {
+            if (cont.node) |*n| {
+                if (n.* == .branch_constructor) return true;
+            }
+            for (cont.continuations) |*cc| {
+                if (hasReturn(cc)) return true;
+            }
+            return false;
+        }
+        fn bareRet(a: std.mem.Allocator, val: []const u8) ast.Continuation {
+            return ast.Continuation{
+                .branch = a.dupe(u8, "") catch unreachable,
+                .binding = null,
+                .kind = .terminal,
+                .condition = null,
+                .node = ast.Node{ .branch_constructor = ast.BranchConstructor{
+                    .branch_name = a.dupe(u8, "") catch unreachable,
+                    .fields = &[_]ast.Field{},
+                    .plain_value = a.dupe(u8, val) catch unreachable,
+                    .is_bare_return = true,
+                } },
+                .indent = 0,
+                .continuations = &[_]ast.Continuation{},
+            };
+        }
+        // `__pump_<p>_<verb>_<i>` decl + impl: the module verb call, bound
+        // `-> <bind_name>`, with a bare-return tail answering `ret_expr`.
+        fn emitUnit(a: std.mem.Allocator, items: *std.ArrayList(ast.Item), flow_: *const ast.Flow, qual: ?[]const u8, unit: []const u8, verb: []const u8, args: []ast.Arg, input: []ast.Field, ret_ty: []const u8, bind_name: []const u8, ret_expr: []const u8, retain: []const []const u8) void {
+            const uname = a.dupe(u8, unit) catch unreachable;
+            items.append(a, ast.Item{ .event_decl = ast.EventDecl{
+                .path = mkPath(a, flow_.module, uname),
+                .input = ast.Shape{ .fields = input },
+                .branches = &[_]ast.Branch{},
+                .return_type = a.dupe(u8, ret_ty) catch unreachable,
+                .is_public = false,
+                .is_implicit_flow = false,
+                .annotations = retain,
+                .location = flow_.location,
+                .module = a.dupe(u8, flow_.module) catch unreachable,
+            } }) catch unreachable;
+            const vsegs = a.alloc([]const u8, 1) catch unreachable;
+            vsegs[0] = a.dupe(u8, verb) catch unreachable;
+            const vinv = ast.Invocation{
+                .path = ast.DottedPath{
+                    .module_qualifier = if (qual) |mq| a.dupe(u8, mq) catch unreachable else null,
+                    .segments = vsegs,
+                },
+                .args = args,
+                .source_module = a.dupe(u8, flow_.module) catch unreachable,
+                .return_binding = a.dupe(u8, bind_name) catch unreachable,
+            };
+            const tail = a.alloc(ast.Continuation, 1) catch unreachable;
+            tail[0] = bareRet(a, ret_expr);
+            items.append(a, ast.Item{ .flow = ast.Flow{
+                .body = ast.rootSite(vinv, tail, flow_.location),
+                .pre_label = null,
+                .impl_of = mkPath(a, flow_.module, uname),
+                .super_shape = null,
+                .is_pure = false,
+                .is_transitively_pure = false,
+                .location = flow_.location,
+                .module = a.dupe(u8, flow_.module) catch unreachable,
+            } }) catch unreachable;
+        }
+    };
+
+    // Open pumps: `__pump_decl_<n>` planted and no `__pump_ran_<n>` yet.
+    // One open pump absorbs this site; more than one is ambiguous.
+    var open = std.ArrayList([]const u8).initCapacity(allocator, 2) catch unreachable;
+    TH.collectOpen(&open, allocator, program, program.items);
+    if (open.items.len > 1) {
+        const msg = std.fmt.allocPrint(allocator, "orisha/pump:run: two pumps are open ('{s}', '{s}') - a captured run can't tell which to join; drive one before opening the next", .{ open.items[0], open.items[1] }) catch unreachable;
+        return .{ .replacement = TH.refuse(allocator, flow, msg) };
+    }
+
+    // Partition the site's arms: `!` is `arrived` and nothing else; `|`
+    // answers are `stopped`/`failed`; unlabeled `|>` steps ride the emitted
+    // call in either mode.
+    var arrived_arm: ?*const ast.Continuation = null;
+    var stopped_arm: ?*const ast.Continuation = null;
+    var failed_arm: ?*const ast.Continuation = null;
+    for (flow.body.continuations) |*cont| {
+        const cb = std.mem.trim(u8, cont.branch, " ");
+        if (cont.kind == .effect) {
+            if (!std.mem.eql(u8, cb, "arrived") or arrived_arm != null) {
+                const msg = std.fmt.allocPrint(allocator, "orisha/pump:run: `! {s}` doesn't parse on a run call - the pump's effect is `! arrived` (one exchange per request)", .{cb}) catch unreachable;
+                return .{ .replacement = TH.refuse(allocator, flow, msg) };
+            }
+            arrived_arm = cont;
+            continue;
+        }
+        if (cb.len == 0) continue;
+        if (std.mem.eql(u8, cb, "stopped")) {
+            if (stopped_arm != null) {
+                return .{ .replacement = TH.refuse(allocator, flow, "orisha/pump:run: one `| stopped` per run") };
+            }
+            stopped_arm = cont;
+        } else if (std.mem.eql(u8, cb, "failed")) {
+            if (failed_arm != null) {
+                return .{ .replacement = TH.refuse(allocator, flow, "orisha/pump:run: one `| failed` per run") };
+            }
+            failed_arm = cont;
+        } else {
+            const msg = std.fmt.allocPrint(allocator, "orisha/pump:run: `| {s}` doesn't parse - a run answers `| stopped` and `| failed`", .{cb}) catch unreachable;
+            return .{ .replacement = TH.refuse(allocator, flow, msg) };
+        }
+    }
+
+    if (open.items.len == 0) {
+        // Standalone — `drive` is today's fused accept loop, variants and all.
+        var inv_clone = ast_functional.cloneInvocation(allocator, rinv) catch unreachable;
+        const dsegs = allocator.alloc([]const u8, 1) catch unreachable;
+        dsegs[0] = allocator.dupe(u8, "drive") catch unreachable;
+        inv_clone.path.segments = dsegs;
+        const cloned = allocator.alloc(ast.Continuation, flow.body.continuations.len) catch unreachable;
+        for (flow.body.continuations, 0..) |*cont, i| {
+            cloned[i] = ast_functional.cloneContinuation(allocator, cont) catch unreachable;
+        }
+        return .{ .replacement = ast.Item{ .flow = ast.Flow{
+            .body = ast.rootSite(inv_clone, cloned, flow.location),
+            .annotations = flow.annotations,
+            .pre_label = flow.pre_label,
+            .impl_of = flow.impl_of,
+            .super_shape = flow.super_shape,
+            .inline_body = flow.inline_body,
+            .preamble_code = flow.preamble_code,
+            .is_pure = flow.is_pure,
+            .is_transitively_pure = flow.is_transitively_pure,
+            .location = flow.location,
+            .module = allocator.dupe(u8, flow.module) catch unreachable,
+        } } };
+    }
+
+    // Captured — join the open pump.
+    const pump_name = open.items[0];
+    if (stopped_arm) |sa| {
+        if (sa.binding) |b| {
+            if (b.len > 0 and !std.mem.eql(u8, b, "_")) {
+                return .{ .replacement = TH.refuse(allocator, flow, "orisha/pump:run: a captured `| stopped` can't bind a payload - the driver retires the participant; no reason string reaches the arm") };
+            }
+        }
+        if (TH.hasReturn(sa)) {
+            return .{ .replacement = TH.refuse(allocator, flow, "orisha/pump:run: a captured `| stopped` can't `->` return - the arm runs inside the pump's retire unit, not this flow") };
+        }
+    }
+
+    var join_idx: usize = 0;
+    while (TH.declExists(program, std.fmt.allocPrint(allocator, "__pump_{s}_step_{d}", .{ pump_name, join_idx }) catch unreachable)) join_idx += 1;
+
+    var appended = std.ArrayList(ast.Item).initCapacity(allocator, 8) catch unreachable;
+    const retain_ann = blk_ra: {
+        const anns = allocator.alloc([]const u8, 1) catch unreachable;
+        anns[0] = allocator.dupe(u8, "retain") catch unreachable;
+        break :blk_ra anns;
+    };
+    const mq = rinv.path.module_qualifier;
+    TH.emitUnit(allocator, &appended, flow, mq, std.fmt.allocPrint(allocator, "__pump_{s}_step_{d}", .{ pump_name, join_idx }) catch unreachable, "step", &[_]ast.Arg{}, &[_]ast.Field{}, "i32", "__koru_r", "__koru_r", retain_ann);
+    TH.emitUnit(allocator, &appended, flow, mq, std.fmt.allocPrint(allocator, "__pump_{s}_live_{d}", .{ pump_name, join_idx }) catch unreachable, "live", &[_]ast.Arg{}, &[_]ast.Field{}, "i64", "__koru_r", "__koru_r", retain_ann);
+    const wait_field = allocator.alloc(ast.Field, 1) catch unreachable;
+    wait_field[0] = ast.Field{ .name = allocator.dupe(u8, "i") catch unreachable, .type = allocator.dupe(u8, "i64") catch unreachable };
+    const wait_arg = allocator.alloc(ast.Arg, 1) catch unreachable;
+    wait_arg[0] = ast.Arg{ .name = allocator.dupe(u8, "i") catch unreachable, .value = allocator.dupe(u8, "i") catch unreachable };
+    TH.emitUnit(allocator, &appended, flow, mq, std.fmt.allocPrint(allocator, "__pump_{s}_wait_{d}", .{ pump_name, join_idx }) catch unreachable, "wait", wait_arg, wait_field, "{ fd: i32, wait_ns: i128 }", "__koru_w", ".{ .fd = __koru_w.fd, .wait_ns = __koru_w.wait_ns }", retain_ann);
+
+    if (stopped_arm) |sa| {
+        const rname = std.fmt.allocPrint(allocator, "__pump_{s}_retired_{d}", .{ pump_name, join_idx }) catch unreachable;
+        appended.append(allocator, ast.Item{ .event_decl = ast.EventDecl{
+            .path = TH.mkPath(allocator, flow.module, rname),
+            .input = ast.Shape{ .fields = &[_]ast.Field{} },
+            .branches = &[_]ast.Branch{},
+            .is_public = false,
+            .is_implicit_flow = false,
+            .annotations = retain_ann,
+            .location = flow.location,
+            .module = allocator.dupe(u8, flow.module) catch unreachable,
+        } }) catch unreachable;
+        const rsegs = allocator.alloc([]const u8, 1) catch unreachable;
+        rsegs[0] = allocator.dupe(u8, "__retire") catch unreachable;
+        const retire_inv = ast.Invocation{
+            .path = ast.DottedPath{
+                .module_qualifier = if (mq) |q| allocator.dupe(u8, q) catch unreachable else null,
+                .segments = rsegs,
+            },
+            .args = &[_]ast.Arg{},
+            .source_module = allocator.dupe(u8, flow.module) catch unreachable,
+        };
+        const sconts = allocator.alloc(ast.Continuation, 1) catch unreachable;
+        sconts[0] = ast_functional.cloneContinuation(allocator, sa) catch unreachable;
+        appended.append(allocator, ast.Item{ .flow = ast.Flow{
+            .body = ast.rootSite(retire_inv, sconts, flow.location),
+            .pre_label = null,
+            .impl_of = TH.mkPath(allocator, flow.module, rname),
+            .super_shape = null,
+            .is_pure = false,
+            .is_transitively_pure = false,
+            .location = flow.location,
+            .module = allocator.dupe(u8, flow.module) catch unreachable,
+        } }) catch unreachable;
+    }
+
+    // The site's replacement: `init` with the same args, wearing `! arrived`,
+    // `| failed`, and the unlabeled chain — everything but `| stopped`, which
+    // lives on the retire unit now.
+    var init_inv = ast_functional.cloneInvocation(allocator, rinv) catch unreachable;
+    const isegs = allocator.alloc([]const u8, 1) catch unreachable;
+    isegs[0] = allocator.dupe(u8, "init") catch unreachable;
+    init_inv.path.segments = isegs;
+    var iconts = std.ArrayList(ast.Continuation).initCapacity(allocator, flow.body.continuations.len) catch unreachable;
+    for (flow.body.continuations) |*cont| {
+        if (stopped_arm != null and cont == stopped_arm.?) continue;
+        iconts.append(allocator, ast_functional.cloneContinuation(allocator, cont) catch unreachable) catch unreachable;
+    }
+    return .{ .replacement = ast.Item{ .flow = ast.Flow{
+        .body = ast.rootSite(init_inv, iconts.items, flow.location),
+        .annotations = flow.annotations,
+        .pre_label = flow.pre_label,
+        .impl_of = flow.impl_of,
+        .super_shape = flow.super_shape,
+        .inline_body = flow.inline_body,
+        .preamble_code = flow.preamble_code,
+        .is_pure = flow.is_pure,
+        .is_transitively_pure = flow.is_transitively_pure,
+        .location = flow.location,
+        .module = allocator.dupe(u8, flow.module) catch unreachable,
+    } }, .appended = appended.toOwnedSlice(allocator) catch unreachable };
+}
+
+~proc drive|zig {
     if ($mod.maybeStartTls(tls_port, cert_path, key_path)) |err_msg| {
         return .{ .failed = err_msg };
     }
@@ -969,7 +1336,7 @@ fn workerCount() usize {
 // epoll — Linux. Selected by `--build=linux`.
 // ---------------------------------------------------------------------------
 
-~proc run|epoll {
+~proc drive|epoll {
     const linux = std.os.linux;
 
     if ($mod.maybeStartTls(tls_port, cert_path, key_path)) |err_msg| {
@@ -1135,7 +1502,7 @@ fn workerCount() usize {
 // to sit between the wire and the parser attaches at that harvest below, not at
 // a call site.
 
-~proc run|io-uring {
+~proc drive|io-uring {
     if (tls_port != null) {
         return .{ .failed = "TLS is not supported on the io_uring pump yet" };
     }
@@ -1262,7 +1629,7 @@ fn workerCount() usize {
 // Blocking accept is deliberate. lwip runs its own stack thread, so blocking in
 // the application does not stall the network.
 
-~proc run|unikraft {
+~proc drive|unikraft {
     if (tls_port != null) {
         return .{ .failed = "TLS is not supported on the unikernel pump yet" };
     }

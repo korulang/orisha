@@ -1,42 +1,57 @@
-// Two pumps, one driver: an interactive vaxis TUI and an Orisha HTTP server
-// in the same binary, composed by std/pump. Orisha's `! arrived` arms `init`
-// (its workers fire it on their own threads); vaxis's `!` surface rides the
-// join's `! step`. `q` in the terminal stops both: vaxis's quit drains its
-// live(), orisha's stop() drains its — then `| drained` tears both down.
+// Two natural run calls, one open pump: an interactive vaxis TUI and an
+// Orisha HTTP server written exactly as each would stand alone — the open
+// `std/pump` absorbs both. One thread, one kernel poll() over the listener
+// fd and the terminal's wake pipe, capped by vaxis's tick.
+//
+//   koruc run examples/pump-tui/main.k
+//   curl localhost:3001   — the counter climbs; q quits both.
+//
+// Nothing in either run call spells pump vocabulary: `create` opens the
+// region, `run` drives it, and each library's own run transform emits the
+// join units (`__pump_app_{step,live,wait,retired}_<i>`) that `std/pump:run`
+// enumerates. `| stopped`/`| done` ride those retire units — they fire when
+// the participant's `live()` first answers 0, which is exactly what `q`
+// causes for both. The served count is an atomic in lib/stats: `! arrived`
+// fires on orisha's worker threads, where a store write would be a race.
+//
+// A canned answer: the full `raw->answer->reply` pipeline lives in
+// orisha/index.k (always loaded via the `orisha` prefix), which drags
+// std/compiler into the consumer program — an ambient toolchain leak
+// unrelated to the pump composition. The pump verbs stand alone; reply()
+// with a static response is enough to prove requests arrive and get
+// answered from inside a compound pump.
 
 import std/io
+import std/fmt
 import std/pump
 import orisha/pump
 import koru/vaxis
+import lib/stats
 
-// A canned answer: the full `raw→answer→reply` pipeline lives in
-// orisha/index.k (always loaded via the `orisha` prefix), which drags std/compiler into the consumer program — an
-// ambient toolchain leak unrelated to the pump composition. The pump verbs
-// stand alone; reply() with a static response is enough to prove requests
-// arrive and get answered from inside a vaxis pump.
-orisha/pump:init(port: 3001)
-! arrived x |> orisha/pump:reply(x, head: "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 42\r\nConnection: close\r\n\r\nhello from a pump shared with a vaxis TUI\n", body: "")
+std/pump:create(app)
+| drained |> std/io:print.ln("pump drained")
+
+orisha/pump:run(port: 3001)
+! arrived x |> lib/stats:bump() |> orisha/pump:reply(x, head: "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 42\r\nConnection: close\r\n\r\nhello from a pump shared with a vaxis TUI\n", body: "")
     | sent |> _
     | broken _ |> _
 | failed e |> std/io:print.ln("orisha failed: {{ e:s }}")
+| stopped |> std/io:print.ln("orisha stopped")
 
-koru/vaxis:init(title: "pump-tui")
+koru/vaxis:run(title: "pump-tui")
+! draw _ |> lib/stats:count(): n
+    |> std/fmt:ln("requests served: {{ n:d }}"): line
+    |> koru/vaxis:box(x: 2, y: 1, w: 62, h: 9, border: true): f
+    |> koru/vaxis:write-in(win: f, x: 1, y: 0, text: "pump-tui — orisha + vaxis, one std/pump")
+    |> koru/vaxis:write-in(win: f, x: 1, y: 2, text: "http   orisha kqueue server — curl localhost:3001")
+    |> koru/vaxis:write-in(win: f, x: 1, y: 3, text: "tty    this vaxis dashboard — wake pipe + 16ms tick")
+    |> koru/vaxis:write-in(win: f, x: 1, y: 4, text: "wait   one poll() over both interests, nearest deadline")
+    |> koru/vaxis:write-in(win: f, x: 1, y: 6, line.text)
+    |> koru/vaxis:write-at(x: 2, y: 10, text: "q quits both — retire units tear each down")
+    |> koru/vaxis:render()
+! tick _ |> _
+! char k when k.ch == 'q' |> koru/vaxis:quit() |> orisha/pump:stop()
 | err e |> std/io:print.ln("vaxis failed: {{ e:s }}")
-
-std/pump:create(app)
-| drained |> orisha/pump:deinit() |> koru/vaxis:deinit()
-
-std/pump(app)
-! step |> orisha/pump:step()
-! live |> orisha/pump:live()
-! wait i |> orisha/pump:wait(i)
-
-std/pump(app)
-! step |> koru/vaxis:step()
-    ! draw _ |> koru/vaxis:write-styled(x: 2, y: 2, text: "vaxis + orisha, one pump — curl :3001, q quits both", style: { bold: false, dim: false, italic: false, strikethrough: false, fg: 0x5A56E0 })
-        |> koru/vaxis:render()
-    ! char k when k.ch == 'q' |> koru/vaxis:quit() |> orisha/pump:stop()
-! live |> koru/vaxis:live()
-! wait i |> koru/vaxis:wait(i)
+| done |> std/io:print.ln("vaxis done")
 
 std/pump:run(app)

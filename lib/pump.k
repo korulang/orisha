@@ -9,16 +9,43 @@
 // orders koru_openssl before this submodule in the merged module.
 
 // ============================================================================
-// RUN — the loop. One variant per platform.
+// RUN — context-aware surface; DRIVE — the standalone loop it lowers to
 // ============================================================================
-// `! arrived` fires once per request and RESUMES; `| stopped` and `| failed`
-// are the two ways the loop ends. `*Exchange` is a host type the companion
-// declares — a contract may name one, it just may not define one.
+// `run` is a transform in the companion `pump.kz`: with no `std/pump` open
+// above the call site it emits `drive` — the accept loop, one variant per
+// platform — and inside an open pump it emits `init` plus the join units that
+// capture it. Either way `! arrived` fires once per request and RESUMES;
+// `| stopped` and `| failed` are the two ways it ends. `*Exchange` is a host
+// type the companion declares — a contract may name one, it just may not
+// define one.
 
-pub tor run { port: u16, tls_port: ?u16, cert_path: ?string, key_path: ?string }
+pub tor drive { port: u16, tls_port: ?u16, cert_path: ?string, key_path: ?string }
 ! arrived *Exchange
 | stopped string
 | failed string
+
+// The transform signature rides machine-interface types — ABI names spelled
+// bare, `Allocator` qualified through std/compiler (refine.k convention).
+
+[comptime|transform|claims_descendants]pub tor run {
+    item: *const Item,
+    program: *const Program,
+    allocator: std/compiler:Allocator
+} -> SiteResult
+
+// ============================================================================
+// RETIRE — the verdict a captured run's retire unit asks for
+// ============================================================================
+// A compound pump's driver fires the retire unit on the first `live() == 0`
+// pass; `__retire` is what keeps `| stopped` honest — "a running server was
+// asked to stop" answers `stopped` (and tears the listener down); "the
+// machinery never stood up" answers `silent`, so a failed init doesn't get to
+// claim a shutdown that never happened. `__` marks generated-machinery
+// vocabulary — consumers never spell it.
+
+pub tor __retire {}
+| ?stopped
+| ?silent
 
 // ============================================================================
 // PARTICIPANT VERBS — the same lifecycle, decomposed for std/pump
@@ -28,8 +55,9 @@ pub tor run { port: u16, tls_port: ?u16, cert_path: ?string, key_path: ?string }
 // `step` is one pass of the accept loop: drain pending connections, hand each
 // to a worker round-robin, return how many were taken. Connection readiness
 // never reaches this level — it lives inside the workers' kqueues, which are
-// participant-internal. `wait` is the listener fd alone; `live` is `!stop`;
-// `stop` asks the server to retire at the next liveness check.
+// participant-internal. `wait` is the listener fd alone; `live` is
+// "started and not stopped" — a failed init never joins the pump; `stop` asks
+// the server to retire at the next liveness check.
 
 pub tor init { port: u16, tls_port: ?u16, cert_path: ?string, key_path: ?string }
 ! arrived *Exchange

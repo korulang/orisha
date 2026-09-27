@@ -119,7 +119,7 @@ pub tor release-body { body: string, allocated: bool }
 // One line per platform. The pump is what changes; serve never does.
 
 [build(linux)]std/build:variants {
-    "orisha/pump:run": "epoll"
+    "orisha/pump:drive": "epoll"
 }
 | configured _ |> _
 | skipped _ |> _
@@ -130,7 +130,7 @@ pub tor release-body { body: string, allocated: bool }
 // result rather than a hint. Needs Linux 5.1, which is why it is a separate
 // choice rather than the Linux default.
 [build(io-uring)]std/build:variants {
-    "orisha/pump:run": "io-uring"
+    "orisha/pump:drive": "io-uring"
 }
 | configured _ |> _
 | skipped _ |> _
@@ -145,9 +145,9 @@ pub tor release-body { body: string, allocated: bool }
 // rewrites the call sites the FLOW makes. The pump reads from inside its own
 // loop, in raw Zig, and a line here would have no effect on that call — it would
 // read as selection while selecting nothing. The unikernel loop names the reader
-// it wants directly instead. See `run|unikraft` in the companion.
+// it wants directly instead. See `drive|unikraft` in the companion.
 [build(unikraft)]std/build:variants {
-    "orisha/pump:run": "unikraft",
+    "orisha/pump:drive": "unikraft",
     "orisha/pump:reply": "unikraft"
 }
 | configured _ |> _

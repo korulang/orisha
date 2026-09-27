@@ -1,0 +1,20 @@
+// Request count for the dashboard. `orisha/pump:init`'s `! arrived` arm fires
+// on the server's worker threads — twelve of them, concurrently — so the
+// count is an atomic, not a store write.
+const std = @import("std");
+
+var requests: std.atomic.Value(i64) = std.atomic.Value(i64).init(0);
+
+~pub tor bump {}
+
+~proc bump|zig {
+    _ = &__koru_event_input;
+    _ = $mod.requests.fetchAdd(1, .monotonic);
+}
+
+~pub tor count {} -> i64
+
+~proc count|zig {
+    _ = &__koru_event_input;
+    return $mod.requests.load(.monotonic);
+}
