@@ -38,7 +38,7 @@ orisha/pump:run(port: 3001)
 | failed e |> std/io:print.ln("orisha failed: {{ e:s }}")
 | stopped |> std/io:print.ln("orisha stopped")
 
-koru/vaxis:run(title: "pump-tui")
+koru/vaxis:run(title: "pump-tui", tick_ms: 16)
 ! draw _ |> lib/stats:count(): n
     |> std/fmt:ln("requests served: {{ n:d }}"): line
     |> koru/vaxis:box(x: 2, y: 1, w: 62, h: 9, border: true): f
@@ -49,7 +49,6 @@ koru/vaxis:run(title: "pump-tui")
     |> koru/vaxis:write-in(win: f, x: 1, y: 6, line.text)
     |> koru/vaxis:write-at(x: 2, y: 10, text: "q quits both — retire units tear each down")
     |> koru/vaxis:render()
-! tick _ |> _
 ! char k when k.ch == 'q' |> koru/vaxis:quit() |> orisha/pump:stop()
 | err e |> std/io:print.ln("vaxis failed: {{ e:s }}")
 | done |> std/io:print.ln("vaxis done")
