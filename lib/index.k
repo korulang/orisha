@@ -187,7 +187,7 @@ pub tor release-body { body: string, allocated: bool }
 // ============================================================================
 // Generates inline lookup code that:
 //   1. Imports generated/<name>_routes.zig
-//   2. Calls lookupWithEtag(method, path, if_none_match)
+//   2. Calls lookupWithEtag(method, path, if_none_match, accept_encoding)
 //   3. Returns pre-built response (or fallback, or 404)
 //
 // Works as top-level handler or nested in a router catch-all:
