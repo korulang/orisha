@@ -1364,12 +1364,36 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes_const: []const P
     try output.appendSlice(allocator,
         \\});
         \\
+        \\/// Did this coding's own parameters refuse it? `q=0` is an explicit
+        \\/// refusal — presence in the list is not consent. A malformed qvalue
+        \\/// refuses too: identity is always legal, so doubt serves identity.
+        \\fn codingRefused(params: []const u8) bool {
+        \\    var it = std.mem.splitScalar(u8, params, ';');
+        \\    while (it.next()) |param| {
+        \\        const p = std.mem.trim(u8, param, " \t");
+        \\        if (p.len >= 2 and (p[0] == 'q' or p[0] == 'Q') and p[1] == '=') {
+        \\            const v = std.fmt.parseFloat(f64, std.mem.trim(u8, p[2..], " \t")) catch return true;
+        \\            return v == 0;
+        \\        }
+        \\    }
+        \\    return false;
+        \\}
         \\pub fn wantsGzip(accept_encoding: ?[]const u8) bool {
         \\    const ae = accept_encoding orelse return false;
-        \\    var lower_buf: [256]u8 = undefined;
-        \\    if (ae.len > lower_buf.len) return false;
-        \\    const lower = std.ascii.lowerString(&lower_buf, ae);
-        \\    return std.mem.indexOf(u8, lower, "gzip") != null;
+        \\    var star: ?[]const u8 = null;
+        \\    var it = std.mem.splitScalar(u8, ae, ',');
+        \\    while (it.next()) |raw_entry| {
+        \\        const entry = std.mem.trim(u8, raw_entry, " \t");
+        \\        const semi = std.mem.indexOfScalar(u8, entry, ';') orelse entry.len;
+        \\        const name = std.mem.trim(u8, entry[0..semi], " \t");
+        \\        if (std.ascii.eqlIgnoreCase(name, "gzip")) {
+        \\            // An explicit entry beats the wildcard (RFC 9110 §12.5.3).
+        \\            return !codingRefused(entry[semi..]);
+        \\        }
+        \\        if (std.mem.eql(u8, name, "*")) star = entry[semi..];
+        \\    }
+        \\    const sp = star orelse return false;
+        \\    return !codingRefused(sp);
         \\}
         \\pub fn lookup(method: []const u8, path: []const u8) ?[]const u8 {
         \\    const i = by_path.get(path) orelse return null;
@@ -1392,6 +1416,21 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes_const: []const P
         \\    try std.testing.expect(wantsGzip("br, GZIP, deflate"));
         \\    try std.testing.expect(!wantsGzip("br"));
         \\    try std.testing.expect(!wantsGzip("deflate"));
+        \\
+        \\    // q=0 is an explicit refusal — presence is not consent.
+        \\    try std.testing.expect(!wantsGzip("gzip;q=0"));
+        \\    try std.testing.expect(!wantsGzip("gzip;q=0.000"));
+        \\    try std.testing.expect(!wantsGzip("br;q=1, gzip;q=0"));
+        \\    try std.testing.expect(wantsGzip("gzip;q=0.5"));
+        \\    try std.testing.expect(wantsGzip("gzip ; q=0.5"));
+        \\
+        \\    // The wildcard admits what nothing refused — and an explicit
+        \\    // gzip entry decides over it in either direction.
+        \\    try std.testing.expect(wantsGzip("*"));
+        \\    try std.testing.expect(wantsGzip("br, *"));
+        \\    try std.testing.expect(!wantsGzip("*;q=0"));
+        \\    try std.testing.expect(!wantsGzip("gzip;q=0, *"));
+        \\    try std.testing.expect(wantsGzip("*;q=0, gzip"));
         \\}
         \\
         \\test "negotiated routes serve identity unless gzip is advertised" {
@@ -1399,7 +1438,9 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes_const: []const P
         \\        const gz = r.response_gzip orelse continue;
         \\        try std.testing.expectEqualStrings(r.response, lookupWithEtag(r.method, r.path, null, null).?);
         \\        try std.testing.expectEqualStrings(r.response, lookupWithEtag(r.method, r.path, null, "br").?);
+        \\        try std.testing.expectEqualStrings(r.response, lookupWithEtag(r.method, r.path, null, "gzip;q=0").?);
         \\        try std.testing.expectEqualStrings(gz, lookupWithEtag(r.method, r.path, null, "gzip").?);
+        \\        try std.testing.expectEqualStrings(gz, lookupWithEtag(r.method, r.path, null, "*").?);
         \\        const gz_head = gz[0..std.mem.indexOf(u8, gz, "\r\n\r\n").?];
         \\        const id_head = r.response[0..std.mem.indexOf(u8, r.response, "\r\n\r\n").?];
         \\        try std.testing.expect(std.mem.indexOf(u8, gz_head, "Content-Encoding: gzip") != null);

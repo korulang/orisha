@@ -5,8 +5,7 @@
 //
 // Build & run:  koruc main.k && ./a.out
 // Verify:       zig test generated/site_routes.zig   (emitted by the transform)
-//               curl -H 'Accept-Encoding: gzip' -D- http://localhost:3101/
-//               curl -D- http://localhost:3101/any-missing-path  (fallback)
+//               ./check.sh                           (wire assertions, incl. q=0)
 
 import orisha
 
