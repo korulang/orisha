@@ -57,6 +57,52 @@ check "deflate, gzip, br -> gzip"          "$BASE/index.html"  "deflate, gzip, b
 check "fallback gzip;q=0 -> identity"      "$BASE/no/such/path" "gzip;q=0"           0 1
 check "fallback gzip -> gzip"              "$BASE/no/such/path" "gzip"               1 1
 
+# HEAD: headers of the negotiated variant, and ZERO bytes after the head
+# terminator on the wire (curl -I would hide a leaked body — inspect raw).
+head_wire() {
+    local path="$1" ae="$2"
+    local ae_hdr=""
+    [ "$ae" != "NONE" ] && ae_hdr="Accept-Encoding: ${ae}\r\n"
+    printf "HEAD %s HTTP/1.1\r\nHost: x\r\n%bConnection: close\r\n\r\n" "$path" "$ae_hdr" \
+        | nc -w 3 localhost "$PORT"
+}
+head_check() {
+    local desc="$1" url_path="$2" ae="$3" want_ce="$4"
+    head_wire "$url_path" "$ae" > /tmp/ae_head.bin
+    if python3 - "$want_ce" /tmp/ae_head.bin <<'PY'
+import sys
+want_ce, path = sys.argv[1] == "1", sys.argv[2]
+d = open(path, 'rb').read()
+i = d.find(b"\r\n\r\n")
+if i < 0 or len(d) != i + 4:
+    print(f"FAIL head not terminal: {len(d)} bytes, terminator at {i}", file=sys.stderr)
+    sys.exit(1)
+has_ce = b"content-encoding: gzip" in d[:i].lower()
+sys.exit(0 if has_ce == want_ce else 1)
+PY
+    then printf 'ok   %s\n' "$desc"; else printf 'FAIL %s\n' "$desc"; fail=1; fi
+}
+head_check "HEAD no AE -> identity head only"    "/index.html" NONE   0
+head_check "HEAD AE:gzip -> gzip head only"      "/index.html" "gzip" 1
+head_check "HEAD AE:gzip;q=0 -> identity head"   "/index.html" "gzip;q=0" 0
+head_check "HEAD fallback AE:gzip -> gzip head"  "/no/such/path" "gzip" 1
+
+# Strong etags are per-representation: identity and gzip MUST differ, and
+# If-None-Match validates the selected variant only.
+etag_id="$(curl -s -D- -o /dev/null "$BASE/index.html" | grep -i '^etag:' | tr -d '\r' | awk '{print $2}')"
+etag_gz="$(curl -s -D- -o /dev/null -H 'Accept-Encoding: gzip' "$BASE/index.html" | grep -i '^etag:' | tr -d '\r' | awk '{print $2}')"
+if [ -n "$etag_id" ] && [ -n "$etag_gz" ] && [ "$etag_id" != "$etag_gz" ]; then
+    echo "ok   distinct strong etags ($etag_id vs $etag_gz)"
+else
+    echo "FAIL etags identical or missing: id=$etag_id gz=$etag_gz"; fail=1
+fi
+code=$(curl -s -o /dev/null -w '%{http_code}' -H "If-None-Match: $etag_gz" -H 'Accept-Encoding: gzip' "$BASE/index.html")
+[ "$code" = "304" ] && echo "ok   gzip etag + AE:gzip -> 304" || { echo "FAIL gzip etag revalidate: $code"; fail=1; }
+code=$(curl -s -o /dev/null -w '%{http_code}' -H "If-None-Match: $etag_id" "$BASE/index.html")
+[ "$code" = "304" ] && echo "ok   identity etag + no AE -> 304" || { echo "FAIL identity etag revalidate: $code"; fail=1; }
+code=$(curl -s -o /dev/null -w '%{http_code}' -H "If-None-Match: $etag_id" -H 'Accept-Encoding: gzip' "$BASE/index.html")
+[ "$code" = "200" ] && echo "ok   identity etag + AE:gzip -> 200 (wrong variant)" || { echo "FAIL cross-variant match: $code"; fail=1; }
+
 # Dynamic route is untouched by negotiation.
 body="$(curl -s "$BASE/api/health")"
 if [ "$body" = '{"status":"ok"}' ]; then

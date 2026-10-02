@@ -1028,6 +1028,7 @@ const ProcessedRoute = struct {
     response: []const u8,
     response_gzip: ?[]const u8,
     etag: []const u8,
+    etag_gzip: ?[]const u8,
 };
 
 fn stripQuotes(s: []const u8) []const u8 {
@@ -1053,9 +1054,9 @@ fn processDirectory(allocator: std.mem.Allocator, routes: *std.ArrayList(Process
         // SvelteKit's hashed assets all live under /_app/ — their URLs change
         // when the content does, so they are safe to cache as immutable.
         const http_resp = buildHttpResponse(allocator, content, mimeTypeFromPath(file_path), std.mem.startsWith(u8, route_path, "/_app/")) catch continue;
-        routes.append(allocator, .{ .method = method, .path = route_path, .response = http_resp.response, .response_gzip = http_resp.response_gzip, .etag = http_resp.etag }) catch continue;
+        routes.append(allocator, .{ .method = method, .path = route_path, .response = http_resp.response, .response_gzip = http_resp.response_gzip, .etag = http_resp.etag, .etag_gzip = http_resp.etag_gzip }) catch continue;
         if (std.mem.eql(u8, entry.path, "index.html") and std.mem.eql(u8, base_path, "/")) {
-            routes.append(allocator, .{ .method = method, .path = "/", .response = http_resp.response, .response_gzip = http_resp.response_gzip, .etag = http_resp.etag }) catch continue;
+            routes.append(allocator, .{ .method = method, .path = "/", .response = http_resp.response, .response_gzip = http_resp.response_gzip, .etag = http_resp.etag, .etag_gzip = http_resp.etag_gzip }) catch continue;
         }
 
         // A page is requested at /blog, and it is stored as blog.html. Serving
@@ -1074,9 +1075,9 @@ fn processDirectory(allocator: std.mem.Allocator, routes: *std.ArrayList(Process
             else
                 stem; // /blog.html -> /blog
             if (target.len > 0) {
-                routes.append(allocator, .{ .method = method, .path = target, .response = http_resp.response, .response_gzip = http_resp.response_gzip, .etag = http_resp.etag }) catch continue;
+                routes.append(allocator, .{ .method = method, .path = target, .response = http_resp.response, .response_gzip = http_resp.response_gzip, .etag = http_resp.etag, .etag_gzip = http_resp.etag_gzip }) catch continue;
                 const slashed = std.fmt.allocPrint(allocator, "{s}/", .{target}) catch continue;
-                routes.append(allocator, .{ .method = method, .path = slashed, .response = http_resp.response, .response_gzip = http_resp.response_gzip, .etag = http_resp.etag }) catch continue;
+                routes.append(allocator, .{ .method = method, .path = slashed, .response = http_resp.response, .response_gzip = http_resp.response_gzip, .etag = http_resp.etag, .etag_gzip = http_resp.etag_gzip }) catch continue;
             }
         }
     }
@@ -1086,7 +1087,7 @@ fn processFile(allocator: std.mem.Allocator, routes: *std.ArrayList(ProcessedRou
     const content = std.fs.cwd().readFileAlloc(allocator, file_path, 10 * 1024 * 1024) catch return;
     const content_type = content_type_override orelse mimeTypeFromPath(file_path);
     const http_resp = buildHttpResponse(allocator, content, content_type, std.mem.startsWith(u8, path, "/_app/")) catch return;
-    routes.append(allocator, .{ .method = method, .path = path, .response = http_resp.response, .response_gzip = http_resp.response_gzip, .etag = http_resp.etag }) catch return;
+    routes.append(allocator, .{ .method = method, .path = path, .response = http_resp.response, .response_gzip = http_resp.response_gzip, .etag = http_resp.etag, .etag_gzip = http_resp.etag_gzip }) catch return;
 }
 
 fn computeEtag(content: []const u8, out: *[64]u8) void {
@@ -1099,7 +1100,7 @@ fn computeEtag(content: []const u8, out: *[64]u8) void {
     }
 }
 
-const HttpResponse = struct { response: []const u8, response_gzip: ?[]const u8, etag: []const u8 };
+const HttpResponse = struct { response: []const u8, response_gzip: ?[]const u8, etag: []const u8, etag_gzip: ?[]const u8 };
 
 fn isCompressible(content_type: []const u8) bool {
     if (std.mem.startsWith(u8, content_type, "text/")) return true;
@@ -1145,12 +1146,21 @@ fn buildHttpResponse(allocator: std.mem.Allocator, content: []const u8, content_
     const etag = try allocator.dupe(u8, etag_buf[0..16]);
     const compressed = if (isCompressible(content_type)) gzipCompress(allocator, content) else null;
     const negotiated = compressed != null;
+    // Strong etags are per-REPRESENTATION (RFC 9110 §8.8.3): the identity and
+    // gzip bodies are different bytes, so they carry different validators.
+    // Sharing one strong etag lets a cache treat the two as interchangeable.
+    var etag_gzip: ?[]const u8 = null;
+    if (compressed) |gz| {
+        var gz_buf: [64]u8 = undefined;
+        computeEtag(gz, &gz_buf);
+        etag_gzip = try allocator.dupe(u8, gz_buf[0..16]);
+    }
     const response = try renderResponse(allocator, content, content_type, etag, false, negotiated, is_immutable);
     const response_gzip: ?[]const u8 = if (compressed) |gz|
-        try renderResponse(allocator, gz, content_type, etag, true, true, is_immutable)
+        try renderResponse(allocator, gz, content_type, etag_gzip.?, true, true, is_immutable)
     else
         null;
-    return .{ .response = response, .response_gzip = response_gzip, .etag = etag };
+    return .{ .response = response, .response_gzip = response_gzip, .etag = etag, .etag_gzip = etag_gzip };
 }
 
 fn renderResponse(allocator: std.mem.Allocator, body: []const u8, content_type: []const u8, etag: []const u8, gzipped: bool, negotiated: bool, is_immutable: bool) ![]const u8 {
@@ -1323,7 +1333,7 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes_const: []const P
     try output.appendSlice(allocator,
         \\// AUTO-GENERATED by Orisha
         \\const std = @import("std");
-        \\pub const Route = struct { method: []const u8, path: []const u8, response: []const u8, response_gzip: ?[]const u8, etag: []const u8 };
+        \\pub const Route = struct { method: []const u8, path: []const u8, response: []const u8, response_gzip: ?[]const u8, etag: []const u8, etag_gzip: ?[]const u8 };
         \\pub const response_304 = "HTTP/1.1 304 Not Modified\r\nConnection: keep-alive\r\n\r\n";
         \\pub const routes = [_]Route{
         \\
@@ -1336,6 +1346,11 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes_const: []const P
             try appendZigString(allocator, &output, gz);
         } else {
             try output.appendSlice(allocator, ", .response_gzip = null");
+        }
+        if (route.etag_gzip) |eg| {
+            try appendFmt(allocator, &output, ", .etag_gzip = \"{s}\"", .{eg});
+        } else {
+            try output.appendSlice(allocator, ", .etag_gzip = null");
         }
         try output.appendSlice(allocator, " },\n");
     }
@@ -1395,19 +1410,31 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes_const: []const P
         \\    const sp = star orelse return false;
         \\    return !codingRefused(sp);
         \\}
+        \\/// A GET route also answers HEAD — same selected representation, with
+        \\/// only the head on the wire (RFC 9110 §9.3.2: no body, ever).
+        \\fn headOnly(response: []const u8) []const u8 {
+        \\    const end = std.mem.indexOf(u8, response, "\r\n\r\n") orelse return response;
+        \\    return response[0 .. end + 4];
+        \\}
         \\pub fn lookup(method: []const u8, path: []const u8) ?[]const u8 {
+        \\    const head = std.mem.eql(u8, method, "HEAD");
         \\    const i = by_path.get(path) orelse return null;
         \\    const r = routes[i];
-        \\    if (!std.mem.eql(u8, r.method, method)) return null;
-        \\    return r.response;
+        \\    if (!std.mem.eql(u8, r.method, if (head) "GET" else method)) return null;
+        \\    return if (head) headOnly(r.response) else r.response;
         \\}
         \\pub fn lookupWithEtag(method: []const u8, path: []const u8, client_etag: ?[]const u8, accept_encoding: ?[]const u8) ?[]const u8 {
+        \\    const head = std.mem.eql(u8, method, "HEAD");
         \\    const i = by_path.get(path) orelse return null;
         \\    const r = routes[i];
-        \\    if (!std.mem.eql(u8, r.method, method)) return null;
-        \\    if (client_etag) |e| if (std.mem.eql(u8, e, r.etag)) return response_304;
-        \\    if (r.response_gzip) |gz| if (wantsGzip(accept_encoding)) return gz;
-        \\    return r.response;
+        \\    if (!std.mem.eql(u8, r.method, if (head) "GET" else method)) return null;
+        \\    // If-None-Match validates the SELECTED representation: identity and
+        \\    // gzip are different bytes and carry different strong etags.
+        \\    const use_gz = r.response_gzip != null and wantsGzip(accept_encoding);
+        \\    const picked = if (use_gz) r.response_gzip.? else r.response;
+        \\    const picked_etag = if (use_gz) r.etag_gzip.? else r.etag;
+        \\    if (client_etag) |e| if (std.mem.eql(u8, e, picked_etag)) return response_304;
+        \\    return if (head) headOnly(picked) else picked;
         \\}
         \\
         \\test "wantsGzip reads the advertisement" {
@@ -1447,7 +1474,7 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes_const: []const P
         \\        try std.testing.expect(std.mem.indexOf(u8, gz_head, "Vary: Accept-Encoding") != null);
         \\        try std.testing.expect(std.mem.indexOf(u8, id_head, "Vary: Accept-Encoding") != null);
         \\        try std.testing.expect(std.mem.indexOf(u8, id_head, "Content-Encoding") == null);
-        \\        try std.testing.expectEqualStrings(response_304, lookupWithEtag(r.method, r.path, r.etag, "gzip").?);
+        \\        try std.testing.expectEqualStrings(response_304, lookupWithEtag(r.method, r.path, r.etag, null).?);
         \\    }
         \\}
         \\
@@ -1457,6 +1484,34 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes_const: []const P
         \\        try std.testing.expectEqualStrings(r.response, lookupWithEtag(r.method, r.path, null, "gzip").?);
         \\        const head = r.response[0..std.mem.indexOf(u8, r.response, "\r\n\r\n").?];
         \\        try std.testing.expect(std.mem.indexOf(u8, head, "Content-Encoding") == null);
+        \\    }
+        \\}
+        \\
+        \\test "HEAD answers with the selected variant's head and no body" {
+        \\    for (routes) |r| {
+        \\        const head = lookupWithEtag("HEAD", r.path, null, null).?;
+        \\        const head_end = std.mem.indexOf(u8, r.response, "\r\n\r\n").? + 4;
+        \\        // The head is the identity variant's head — and it is ALL of it.
+        \\        try std.testing.expectEqualStrings(r.response[0..head_end], head);
+        \\        try std.testing.expectEqual(head_end, head.len);
+        \\        if (r.response_gzip) |gz| {
+        \\            const gz_head = lookupWithEtag("HEAD", r.path, null, "gzip").?;
+        \\            const gz_end = std.mem.indexOf(u8, gz, "\r\n\r\n").? + 4;
+        \\            try std.testing.expectEqualStrings(gz[0..gz_end], gz_head);
+        \\            try std.testing.expectEqual(gz_end, gz_head.len);
+        \\        }
+        \\    }
+        \\}
+        \\
+        \\test "identity and gzip carry distinct strong etags" {
+        \\    for (routes) |r| {
+        \\        const gz_etag = r.etag_gzip orelse continue;
+        \\        try std.testing.expect(!std.mem.eql(u8, r.etag, gz_etag));
+        \\        // 304 only when the client holds the SELECTED variant's etag.
+        \\        try std.testing.expectEqualStrings(response_304, lookupWithEtag(r.method, r.path, gz_etag, "gzip").?);
+        \\        try std.testing.expectEqualStrings(response_304, lookupWithEtag(r.method, r.path, r.etag, null).?);
+        \\        // The other variant's etag does not validate this selection.
+        \\        try std.testing.expectEqualStrings(r.response_gzip.?, lookupWithEtag(r.method, r.path, r.etag, "gzip").?);
         \\    }
         \\}
         \\
@@ -1559,7 +1614,9 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes_const: []const P
     // Fallback handling
     if (static_fallback) |fallback| {
         // SPA fallback: look up the fallback file
-        ib.appendSlice(allocator, " else if (_static_routes.lookupWithEtag(\"GET\", \"/") catch unreachable;
+        // HEAD must keep its head-only semantics through the fallback too —
+        // hardcoding "GET" here would ship the body (RFC 9110 §9.3.2).
+        ib.appendSlice(allocator, " else if (_static_routes.lookupWithEtag(if (std.mem.eql(u8, req.method, \"HEAD\")) \"HEAD\" else \"GET\", \"/") catch unreachable;
         ib.appendSlice(allocator, fallback) catch unreachable;
         ib.appendSlice(allocator, "\", null, req.accept_encoding)) |_fallback_resp| {\n") catch unreachable;
         ib.appendSlice(allocator, "        return .{ .status = 200, .body = _fallback_resp, .content_type = null };\n") catch unreachable;
