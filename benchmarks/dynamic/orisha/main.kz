@@ -12,8 +12,10 @@ const c = @cImport({
 });
 
 // Vendored amalgamation — the same sqlite3.c rusqlite's bundled feature
-// compiles, with its exact build_bundled flags. The benchmark then measures
-// identical sqlite internals across contestants, not three library builds.
+// compiles (sqlite 3.53.2), but built LEAN (benchmarks/build_sqlite.sh):
+// no FTS/RTREE/SOUNDEX/STAT4/load-extension/memory-management. Those all
+// register per-open work the cold leg pays on every request. FLAVOR=bundled
+// reproduces rusqlite's exact flags for same-internals verification.
 ~std/build:requires {
     exe.addObjectFile(.{ .cwd_relative = "sqlite3_amalg.o" });
 }
