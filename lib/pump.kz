@@ -179,9 +179,11 @@ fn releaseConn(fd: posix.fd_t) void {
 }
 
 fn closeConn(st: *ConnState) void {
-    if (st.ssl) |ssl| {
-        @import("root").koru_koru.koru_openssl.releaseServerSsl(@ptrCast(@alignCast(ssl)));
-        st.ssl = null;
+    if (HAS_OPENSSL) {
+        if (st.ssl) |ssl| {
+            @import("root").koru_koru.koru_openssl.releaseServerSsl(@ptrCast(@alignCast(ssl)));
+            st.ssl = null;
+        }
     }
     if (st.fd >= 0) {
         posix.shutdown(@intCast(st.fd), .both) catch {};
@@ -198,9 +200,11 @@ fn shutdownConn(st: *ConnState) void {
 }
 
 fn writeAllConn(st: *ConnState, data: []const u8) bool {
-    if (st.ssl) |ssl_opaque| {
-        const ssl: *@import("root").koru_koru.koru_openssl.c.SSL = @ptrCast(@alignCast(ssl_opaque));
-        return @import("root").koru_koru.koru_openssl.sslWriteAll(ssl, st.fd, data, std.heap.page_allocator);
+    if (HAS_OPENSSL) {
+        if (st.ssl) |ssl_opaque| {
+            const ssl: *@import("root").koru_koru.koru_openssl.c.SSL = @ptrCast(@alignCast(ssl_opaque));
+            return @import("root").koru_koru.koru_openssl.sslWriteAll(ssl, st.fd, data, std.heap.page_allocator);
+        }
     }
     return writeAll(@intCast(st.fd), data);
 }
@@ -209,11 +213,13 @@ fn writeAllConn(st: *ConnState, data: []const u8) bool {
 // stream cipher with no scatter write, so the ssl leg keeps two sslWriteAll
 // calls; cleartext (the benchmark path) goes out as a single segment.
 fn writevAllConn(st: *ConnState, head: []const u8, body: []const u8) bool {
-    if (st.ssl) |ssl_opaque| {
-        const ssl: *@import("root").koru_koru.koru_openssl.c.SSL = @ptrCast(@alignCast(ssl_opaque));
-        const mod = @import("root").koru_koru.koru_openssl;
-        return mod.sslWriteAll(ssl, st.fd, head, std.heap.page_allocator) and
-            (body.len == 0 or mod.sslWriteAll(ssl, st.fd, body, std.heap.page_allocator));
+    if (HAS_OPENSSL) {
+        if (st.ssl) |ssl_opaque| {
+            const ssl: *@import("root").koru_koru.koru_openssl.c.SSL = @ptrCast(@alignCast(ssl_opaque));
+            const mod = @import("root").koru_koru.koru_openssl;
+            return mod.sslWriteAll(ssl, st.fd, head, std.heap.page_allocator) and
+                (body.len == 0 or mod.sslWriteAll(ssl, st.fd, body, std.heap.page_allocator));
+        }
     }
     var iov = [2]posix.iovec_const{
         .{ .base = head.ptr, .len = head.len },
@@ -254,22 +260,47 @@ fn maybeStartTls(
     cert_path: ?[]const u8,
     key_path: ?[]const u8,
 ) ?[]const u8 {
-    const tp = tls_port orelse return null;
-    const cert = cert_path orelse "/certs/server.crt";
-    const key = key_path orelse "/certs/server.key";
-    const loaded = @import("root").koru_koru.koru_openssl.loadServerCtx(std.heap.page_allocator, cert, key);
-    switch (loaded) {
-        .ok => |ctx| {
-            tls_server_ctx = ctx;
-            tls_listen_port = tp;
-            return null;
-        },
-        .err => |e| return e.msg,
+    if (HAS_OPENSSL) {
+        const tp = tls_port orelse return null;
+        const cert = cert_path orelse "/certs/server.crt";
+        const key = key_path orelse "/certs/server.key";
+        const loaded = @import("root").koru_koru.koru_openssl.loadServerCtx(std.heap.page_allocator, cert, key);
+        switch (loaded) {
+            .ok => |ctx| {
+                tls_server_ctx = ctx;
+                tls_listen_port = tp;
+                return null;
+            },
+            .err => |e| return e.msg,
+        }
+    } else {
+        // Params unused when the gate is false — a plain `_ =` discard is a
+        // compile error on targets where the branch above is live, so these
+        // are real references in a branch that is never emitted there.
+        std.mem.doNotOptimizeAway(cert_path);
+        std.mem.doNotOptimizeAway(key_path);
     }
+    return if (tls_port != null)
+        "orisha:serve got tls_port, but this target cannot link openssl"
+    else
+        null;
 }
 
 var tls_server_ctx: ?*anyopaque = null;
 var tls_listen_port: u16 = 0;
+
+// TLS exists only where a system openssl can be linked — this must stay the
+// same condition as koru/openssl's ~std/build:requires, which emits no link
+// flags outside it. When this is comptime-false nothing can ever assign
+// `st.ssl` (acceptServerSsl is unreachable), so every `if (st.ssl)` leg below
+// is dead code Zig never analyzes — which is also what keeps the package's
+// @cImport out of the build and lets non-TLS programs cross-compile for musl
+// and freestanding targets at all.
+pub const HAS_OPENSSL = switch (@import("builtin").os.tag) {
+    .macos => true,
+    .linux => @import("builtin").abi != .musl,
+    else => false,
+};
 
 // Participant-verb state (std/pump contract). `init` fills these; `step`
 // accepts against the listener; `wait` exposes it; `stop`/`live` carry the
@@ -497,23 +528,32 @@ fn armKqueueRead(kq: i32, fd: posix.fd_t) void {
 }
 
 fn acceptTlsHandshake(client_fd: c_int) ?*anyopaque {
-    const ctx_ptr = tls_server_ctx orelse return null;
-    const ctx: *@import("root").koru_koru.koru_openssl.ServerCtx = @ptrCast(@alignCast(ctx_ptr));
-    const accepted = @import("root").koru_koru.koru_openssl.acceptServerSsl(ctx, client_fd, std.heap.page_allocator);
-    return switch (accepted) {
-        .ok => |ssl| ssl,
-        .err => {
-            posix.close(@intCast(client_fd));
-            return null;
-        },
-    };
+    if (HAS_OPENSSL) {
+        const ctx_ptr = tls_server_ctx orelse return null;
+        const ctx: *@import("root").koru_koru.koru_openssl.ServerCtx = @ptrCast(@alignCast(ctx_ptr));
+        const accepted = @import("root").koru_koru.koru_openssl.acceptServerSsl(ctx, client_fd, std.heap.page_allocator);
+        return switch (accepted) {
+            .ok => |ssl| ssl,
+            .err => {
+                posix.close(@intCast(client_fd));
+                return null;
+            },
+        };
+    } else {
+        // Refuse the connection we cannot handshake — also keeps client_fd a
+        // real use, where `_ = client_fd` would error as a pointless discard.
+        posix.close(@intCast(client_fd));
+    }
+    return null;
 }
 
 fn registerClient(client_fd: posix.fd_t, ssl: ?*anyopaque, kq: i32) void {
     disableNagle(client_fd);
     markNonBlocking(client_fd);
     const st = connState(client_fd) orelse {
-        if (ssl) |s| @import("root").koru_koru.koru_openssl.releaseServerSsl(@ptrCast(@alignCast(s)));
+        if (HAS_OPENSSL) {
+            if (ssl) |s| @import("root").koru_koru.koru_openssl.releaseServerSsl(@ptrCast(@alignCast(s)));
+        }
         posix.close(client_fd);
         return;
     };
@@ -526,7 +566,9 @@ fn registerClientEpoll(client_fd: posix.fd_t, ssl: ?*anyopaque, epfd: i32) void 
     disableNagle(client_fd);
     markNonBlocking(client_fd);
     const st = connState(client_fd) orelse {
-        if (ssl) |s| @import("root").koru_koru.koru_openssl.releaseServerSsl(@ptrCast(@alignCast(s)));
+        if (HAS_OPENSSL) {
+            if (ssl) |s| @import("root").koru_koru.koru_openssl.releaseServerSsl(@ptrCast(@alignCast(s)));
+        }
         posix.close(client_fd);
         return;
     };
@@ -656,19 +698,21 @@ fn workerCount() usize {
 // connection with more to come, the other is a connection with nothing more
 // ever. Separating them is what `idle` is for.
 ~proc fill|zig {
-    if (st.ssl) |ssl_opaque| {
-        const ssl: *@import("root").koru_koru.koru_openssl.c.SSL = @ptrCast(@alignCast(ssl_opaque));
-        const rc = @import("root").koru_koru.koru_openssl.c.SSL_read(ssl, @ptrCast(st.buf[st.len..].ptr), @intCast(st.buf.len - st.len));
-        if (rc > 0) {
-            st.len += @intCast(rc);
-            return .more;
+    if ($mod.HAS_OPENSSL) {
+        if (st.ssl) |ssl_opaque| {
+            const ssl: *@import("root").koru_koru.koru_openssl.c.SSL = @ptrCast(@alignCast(ssl_opaque));
+            const rc = @import("root").koru_koru.koru_openssl.c.SSL_read(ssl, @ptrCast(st.buf[st.len..].ptr), @intCast(st.buf.len - st.len));
+            if (rc > 0) {
+                st.len += @intCast(rc);
+                return .more;
+            }
+            const err_code = @import("root").koru_koru.koru_openssl.c.SSL_get_error(ssl, rc);
+            return switch (err_code) {
+                @import("root").koru_koru.koru_openssl.c.SSL_ERROR_WANT_READ, @import("root").koru_koru.koru_openssl.c.SSL_ERROR_WANT_WRITE => .idle,
+                @import("root").koru_koru.koru_openssl.c.SSL_ERROR_ZERO_RETURN => .gone,
+                else => .gone,
+            };
         }
-        const err_code = @import("root").koru_koru.koru_openssl.c.SSL_get_error(ssl, rc);
-        return switch (err_code) {
-            @import("root").koru_koru.koru_openssl.c.SSL_ERROR_WANT_READ, @import("root").koru_koru.koru_openssl.c.SSL_ERROR_WANT_WRITE => .idle,
-            @import("root").koru_koru.koru_openssl.c.SSL_ERROR_ZERO_RETURN => .gone,
-            else => .gone,
-        };
     }
     const n = $mod.posix.read(@intCast(st.fd), st.buf[st.len..]) catch |err| switch (err) {
         error.WouldBlock => return .idle,
@@ -1612,8 +1656,8 @@ fn workerCount() usize {
                 // The buffer lives in the connection's own state, which is
                 // heap-stable — the kernel writes into it before we are told.
                 _ = ring.recv(@intCast(client_fd), client_fd, .{ .buffer = fresh.buf[0..] }, 0) catch {
+                    // releaseConn closes the fd — a second close is EBADF.
                     $mod.releaseConn(client_fd);
-                    $mod.posix.close(client_fd);
                 };
                 continue;
             }
@@ -1623,7 +1667,6 @@ fn workerCount() usize {
 
             if (cqe.res <= 0) {
                 $mod.releaseConn(fd);
-                $mod.posix.close(fd);
                 continue;
             }
             st.len += @intCast(cqe.res);
@@ -1648,14 +1691,12 @@ fn workerCount() usize {
 
             if (!alive) {
                 $mod.releaseConn(fd);
-                $mod.posix.close(fd);
                 continue;
             }
 
             // Ask for the next bytes, appending to whatever is unfinished.
             _ = ring.recv(@intCast(fd), fd, .{ .buffer = st.buf[st.len..] }, 0) catch {
                 $mod.releaseConn(fd);
-                $mod.posix.close(fd);
             };
         }
     }
