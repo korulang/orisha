@@ -25,8 +25,8 @@ next. Two runs are not comparable without checking it.
 
 ## What is served
 
-korulang.org's real static build — 1,118 files, roughly 66 MB uncompressed.
-Not synthetic fixtures.
+korulang.org's real static build — 1,118 files, roughly 66 MB uncompressed at
+the August runs, 6,163 files at the October re-run. Not synthetic fixtures.
 
 ## The rules, and the measurement that produced each one
 
@@ -249,3 +249,50 @@ something periodic rather than something contended.
 Diagnosing it needs timing inside the server rather than more benchmark rounds,
 and it is worth doing: a server with a 113 ms p99 is worse than one 40% slower
 with a 4 ms p99 for anything a person is waiting on.
+
+## 2026-10-03: a real regression, and two fixes the gate paid for
+
+`results/2026-10-03T08-04-24Z` is the first run since August. Three things
+changed about the rig itself, all recorded: `c-4` is no longer offered in
+`ams3`, so the pair ran in `fra1`; the site grew to 6,163 files; and the
+binary bakes identity+gzip variants with `Accept-Encoding` gating and a
+`Vary` header, where the August binary served a single representation.
+
+Two defects were found and fixed *by the run*, not before it:
+
+- **The build could not produce the binaries at all.** `lib/pump.kz` gained an
+  unconditional `~import koru/openssl` with TLS (65dacf9, 2026-09-01), and the
+  package's `~std/build:requires` hard-coded this Mac's Homebrew prefix and
+  linked `ssl`/`crypto` into every target — including `x86_64-linux-musl`,
+  where Homebrew's archive is not an ELF file. The package now emits link
+  requirements only where a system OpenSSL can exist, and the pump gates every
+  TLS leg on a comptime `HAS_OPENSSL` that mirrors that condition — a musl or
+  freestanding build drops the legs entirely, and asking for `tls_port` on one
+  fails loudly instead of at the linker.
+- **orisha-uring failed correctness 0/6163** — every teardown path in the
+  io_uring drive closed the descriptor twice (`releaseConn` already closes;
+  `std.posix.close` on EBADF is `unreachable`). First closed connection,
+  dead worker. The redundant closes are removed (`results/2026-10-03T07-20-22Z`
+  keeps the failing verify).
+
+And the headline the run exists to report: **Orisha is no longer the fastest
+server in this field, and it is not close.** Median req/s on `/200.html` at
+200 connections, August run against October run, same CPU model both times
+(Xeon Platinum 8168):
+
+    server         Aug (ams3)   Oct (fra1)
+    h2o             133,649      134,526
+    nginx           118,761      115,881
+    ols              97,184       93,109
+    sws              51,243       50,515
+    orisha-epoll    202,678       32,874
+    orisha-uring    105,633       12,392
+
+Every control reproduces its August number within noise; both orisha variants
+lost ~85%. The regression is therefore in code that changed between the runs,
+not in the machines. Everything in `lib/pump.kz` since 2026-08-11 is in the
+window: Response owning its body, `orisha/io`, `pump:fileno`, the participant-
+verb decomposition (fe215c0), `run` as a context-branching transform
+(39104a8), and the writev merge (05ba3c3). A native build of the same source
+serves 165k req/s on this Mac through the identical lookup code, so the
+request path is not the slow part — the Linux pump paths are.

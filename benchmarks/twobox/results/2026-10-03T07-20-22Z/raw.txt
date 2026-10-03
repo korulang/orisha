@@ -1,0 +1,16 @@
+WIRE|orisha-epoll|Content-Encoding: gzip Content-Length: 13383 
+VERIFY|orisha-epoll|6163|0|6163
+WIRE|orisha-uring|Content-Encoding: gzip Content-Length: 13383 
+    MISMATCH 200.html (want 2614, got 0)
+    MISMATCH KoruLogo.png (want 223288, got 0)
+./measure.sh: line 38: /tmp/tmp.0K5S9soTPO/0: No such file or directory
+./measure.sh: line 38: /tmp/tmp.0K5S9soTPO/1: No such file or directory
+./measure.sh: line 38: /tmp/tmp.0K5S9soTPO/2: No such file or directory
+    MISMATCH KoruLogo.svg (want 12862, got 0)
+    MISMATCH KoruLogo.webp (want 53902, got 0)
+./measure.sh: line 38: /tmp/tmp.0K5S9soTPO/3: No such file or directory
+    MISMATCH _app/env.js (want 179, got 0)
+./measure.sh: line 38: /tmp/tmp.0K5S9soTPO/4: No such file or directory
+VERIFY|orisha-uring|0|6163|6163
+WIRE|nginx|Content-Encoding: gzip Content-Length: 13355 
+VERIFY|nginx|6163|0|6163
