@@ -6,10 +6,9 @@
 // Run: koruc main.kz && ./a.out
 
 ~import orisha
+~import koru/sqlite3
 const std = @import("std");
-const c = @cImport({
-    @cInclude("sqlite3.h");
-});
+const c = koru_koru.koru_sqlite3.c;
 
 // Vendored amalgamation — the same sqlite3.c rusqlite's bundled feature
 // compiles (sqlite 3.53.2), but built LEAN (benchmarks/build_sqlite.sh):
@@ -99,10 +98,59 @@ fn dbUserJsonHot(id: []const u8) ?[]const u8 {
     return .{ .status = 200, .body = userJsonBody(id), .content_type = "application/json" };
 }
 
+// Package leg: the driver path a real Koru program writes — libs/sqlite3's
+// own API end to end (open → Source-block query → close per request). The
+// row text is a row-scoped borrow, so pkgRow materializes it into a
+// per-thread cell before the borrow dies; pkgDone reads it at the terminal.
+fn pkgCell() *?[]const u8 {
+    const S = struct {
+        threadlocal var body: ?[]const u8 = null;
+    };
+    return &S.body;
+}
+fn pkgBuf() *[256]u8 {
+    const S = struct {
+        threadlocal var buf: [256]u8 = undefined;
+    };
+    return &S.buf;
+}
+
+~tor pkgBegin { }
+~proc pkgBegin|zig {
+    pkgCell().* = null;
+}
+
+~tor pkgRow { id: string, name: string }
+~proc pkgRow|zig {
+    pkgCell().* = std.fmt.bufPrint(pkgBuf(), "{{\"id\":\"{s}\",\"name\":\"{s}\"}}", .{ id, name }) catch "{}";
+}
+
+~tor pkgDone { id: string } -> orisha:Response
+~proc pkgDone|zig {
+    _ = id;
+    return .{ .status = 200, .body = pkgCell().* orelse "{}", .content_type = "application/json" };
+}
+
+~tor pkgErr { } -> orisha:Response
+~proc pkgErr|zig {
+    return .{ .status = 500, .body = "{\"error\":\"db\"}", .content_type = "application/json" };
+}
+
+~tor dbUserPkg { id: string } -> orisha:Response
+~dbUserPkg = pkgBegin() |> koru/sqlite3:open(path: "../bench.db")
+| db d |> koru/sqlite3:default(conn: d) {
+        SELECT name FROM users WHERE id = {{id}}
+    }
+    ! row r |> koru/sqlite3:col.text(stmt: r, index: 0): n |> pkgRow(id, name: n)
+    | done d2 |> koru/sqlite3:close(conn: d2) |> pkgDone(id): r -> r
+    | err e |> koru/sqlite3:close(e.conn) |> pkgErr(): r -> r
+| err _ |> pkgErr(): r -> r
+
 // Implement the handler as a subflow with router
 // Log-guided order based on access.log (most frequent first)
 ~orisha:handler = orisha:router(req)
 ! [GET /api/db/hot/users/:id] p |> dbUserHot(p.id)
+! [GET /api/db/pkg/users/:id] p |> dbUserPkg(p.id)
 ! [GET /api/db/users/:id] p |> dbUser(p.id)
 ! [GET /api/users/:id] p |> userJson(p.id)
 ! [GET /json] -> { status: 200, body: "{\"message\":\"Hello, World!\"}", content_type: "application/json" }
