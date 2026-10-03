@@ -68,3 +68,4 @@ profile.json
 generated/
 compiler_env.json
 program.ast.json
+benchmarks/dynamic/bench.db

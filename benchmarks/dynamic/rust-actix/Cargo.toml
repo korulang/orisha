@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 actix-web = "4"
 bytes = "1"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 simd-json = "0.14"
 simd-json-derive = "0.15"
