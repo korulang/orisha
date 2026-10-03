@@ -11,8 +11,11 @@ const c = @cImport({
     @cInclude("sqlite3.h");
 });
 
+// Vendored amalgamation — the same sqlite3.c rusqlite's bundled feature
+// compiles, with its exact build_bundled flags. The benchmark then measures
+// identical sqlite internals across contestants, not three library builds.
 ~std/build:requires {
-    exe.linkSystemLibrary("sqlite3");
+    exe.addObjectFile(.{ .cwd_relative = "sqlite3_amalg.o" });
 }
 
 // Build JSON body for /api/users/:id (upstream formatting)
@@ -32,7 +35,7 @@ fn dbUserJson(id: []const u8) ?[]const u8 {
         threadlocal var buf: [256]u8 = undefined;
     };
     var db: ?*c.sqlite3 = null;
-    if (c.sqlite3_open("../bench.db", &db) != c.SQLITE_OK) return null;
+    if (c.sqlite3_open_v2("../bench.db", &db, c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_NOMUTEX | c.SQLITE_OPEN_URI | c.SQLITE_OPEN_PRIVATECACHE, null) != c.SQLITE_OK) return null;
     defer _ = c.sqlite3_close(db);
     var stmt: ?*c.sqlite3_stmt = null;
     const sql = "SELECT name FROM users WHERE id = ?1";
@@ -57,7 +60,7 @@ fn dbUserJsonHot(id: []const u8) ?[]const u8 {
         threadlocal var stmt: ?*c.sqlite3_stmt = null;
     };
     if (S.stmt == null) {
-        if (c.sqlite3_open("../bench.db", &S.db) != c.SQLITE_OK) return null;
+        if (c.sqlite3_open_v2("../bench.db", &S.db, c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_NOMUTEX | c.SQLITE_OPEN_URI | c.SQLITE_OPEN_PRIVATECACHE, null) != c.SQLITE_OK) return null;
         const sql = "SELECT name FROM users WHERE id = ?1";
         if (c.sqlite3_prepare_v2(S.db, sql, sql.len, &S.stmt, null) != c.SQLITE_OK) return null;
     }

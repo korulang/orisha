@@ -3,7 +3,8 @@
 # Servers open ../bench.db relative to benchmarks/dynamic/<contestant>.
 set -euo pipefail
 DB="$(dirname "$0")/dynamic/bench.db"
-sqlite3 "$DB" "DROP TABLE IF EXISTS users;
+sqlite3 "$DB" "PRAGMA journal_mode=WAL;
+DROP TABLE IF EXISTS users;
 CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT NOT NULL);
 WITH RECURSIVE g(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM g WHERE i<10000)
   INSERT INTO users(id,name) SELECT i, 'User '||i FROM g;"

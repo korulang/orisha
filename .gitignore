@@ -69,3 +69,6 @@ generated/
 compiler_env.json
 program.ast.json
 benchmarks/dynamic/bench.db
+benchmarks/dynamic/bench.db-shm
+benchmarks/dynamic/bench.db-wal
+benchmarks/dynamic/orisha/sqlite3_amalg.o

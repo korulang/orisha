@@ -153,8 +153,16 @@ async fn get_db_user_hot(path: web::Path<String>) -> HttpResponse<Bytes> {
     let body = HOT_STMT.with(|cell| -> Option<Bytes> {
         let mut slot = cell.borrow_mut();
         if slot.is_none() {
-            let conn: &'static rusqlite::Connection =
-                Box::leak(Box::new(rusqlite::Connection::open("../bench.db").ok()?));
+            let conn: &'static rusqlite::Connection = Box::leak(Box::new(
+                rusqlite::Connection::open_with_flags(
+                    "../bench.db",
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                        | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                        | rusqlite::OpenFlags::SQLITE_OPEN_PRIVATE_CACHE,
+                )
+                .ok()?,
+            ));
             *slot = conn.prepare("SELECT name FROM users WHERE id = ?1").ok();
         }
         let stmt = slot.as_mut()?;
