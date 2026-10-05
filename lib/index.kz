@@ -945,6 +945,7 @@ fn headerPrefixKeepAlive(status: u16) ?[]const u8 {
                 program.main_module_name,
                 &result_counter,
                 2,
+                program.items,
             ) catch unreachable;
             ib.appendSlice(allocator, code) catch unreachable;
         }
@@ -961,6 +962,7 @@ fn headerPrefixKeepAlive(status: u16) ?[]const u8 {
             program.main_module_name,
             &result_counter,
             2,
+            program.items,
         ) catch unreachable;
         ib.appendSlice(allocator, code) catch unreachable;
         ib.appendSlice(allocator, "    }\n") catch unreachable;
