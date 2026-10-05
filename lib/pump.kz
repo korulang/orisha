@@ -255,6 +255,19 @@ fn writevAllConn(st: *ConnState, head: []const u8, body: []const u8) bool {
     return true;
 }
 
+// Writing to a peer-closed socket raises SIGPIPE; the default action kills
+// the process silently. Any server that keep-alives must ignore it once, up
+// front — then send/write/SSL_write return EPIPE and the write loop treats a
+// vanished peer as an ordinary close. Called at the top of every drive body.
+fn ignoreSigpipe() void {
+    const ign = posix.Sigaction{
+        .handler = .{ .handler = posix.SIG.IGN },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.PIPE, &ign, null);
+}
+
 fn maybeStartTls(
     tls_port: ?u16,
     cert_path: ?[]const u8,
@@ -742,6 +755,8 @@ fn workerCount() usize {
 // ---------------------------------------------------------------------------
 
 ~proc init|zig {
+    $mod.ignoreSigpipe();
+
     if ($mod.maybeStartTls(tls_port, cert_path, key_path)) |err_msg| {
         return .{ .failed = err_msg };
     }
@@ -1276,6 +1291,8 @@ fn workerCount() usize {
 }
 
 ~proc drive|zig {
+    $mod.ignoreSigpipe();
+
     if ($mod.maybeStartTls(tls_port, cert_path, key_path)) |err_msg| {
         return .{ .failed = err_msg };
     }
@@ -1425,6 +1442,8 @@ fn workerCount() usize {
 // ---------------------------------------------------------------------------
 
 ~proc drive|epoll {
+    $mod.ignoreSigpipe();
+
     const linux = std.os.linux;
 
     if ($mod.maybeStartTls(tls_port, cert_path, key_path)) |err_msg| {
@@ -1602,6 +1621,8 @@ fn workerCount() usize {
     if (@import("builtin").os.tag != .linux) {
         return .{ .failed = "io_uring is a Linux mechanism — build with --build=linux for this host" };
     }
+
+    $mod.ignoreSigpipe();
 
     const linux = std.os.linux;
 
