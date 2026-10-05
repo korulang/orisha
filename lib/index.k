@@ -17,6 +17,12 @@
 //   orisha:router(req)              - Pattern-branch router transform
 //   orisha:static(name, root, ...)  - Declare static files to embed at compile time
 //   orisha:static-router(name)      - Transform: inline static file lookup + fallback
+//   orisha:header(req, name)        - One request header, scanned lazily -> ?string
+//   orisha:cookie(req, name)        - One pair out of the Cookie header -> ?string
+//   orisha:form(req, name)          - One urlencoded field out of req.body -> ?string
+//   orisha:query-param(req, name)   - The same codec over req.query -> ?string
+//   Response.extra_headers          - CRLF block of response headers (Location,
+//                                     Set-Cookie, ...) spliced into the head
 //
 // Example (simplest server):
 //   ~orisha:handler -> { status: 200, body: "Hello!", content_type: "text/plain" }
@@ -112,6 +118,38 @@ pub tor answer { raw: string } -> { head: string, body: string, body_allocated: 
 // Free a handler body that fmt.blk allocated. Static slices and fmt:ln TLS
 // buffers arrive with allocated=false; those must not be freed.
 pub tor release-body { body: string, allocated: bool }
+
+// ============================================================================
+// REQUEST HEADERS — lazy reads over the raw block
+// ============================================================================
+// `req.headers` is the whole header block — request line through the blank
+// line — borrowed from the request bytes. These accessors scan it only when
+// asked, so a route that never asks pays one stored slice and nothing more.
+// Names are case-insensitive (RFC 9110); the answer borrows the request and
+// dies with it. `Cookie`, `Origin`, `Sec-WebSocket-*` — everything the client
+// sent is reachable this way.
+//
+//   orisha:header(req: req, name: "origin")
+//   orisha:header(req: req, name: "sec-websocket-key")
+
+pub tor header { req: *Request, name: string } -> ?string
+
+// One pair out of the `Cookie` header — "a=1; b=2" — so a handler does not
+// split the header itself. Cookie names are case-sensitive (RFC 6265).
+pub tor cookie { req: *Request, name: string } -> ?string
+
+// ============================================================================
+// BODY FIELDS — one codec, two seams
+// ============================================================================
+// `form` reads application/x-www-form-urlencoded fields out of `req.body` and
+// refuses (null) a request that never declared that content type — parsing a
+// JSON body as pairs is how a string value becomes a phantom field.
+// `query-param` runs the same codec over `req.query`, where no declaration
+// exists. `+` is a space, %XX a byte; a pair without `=` is a flag and
+// matches no name.
+
+pub tor form { req: *Request, name: string } -> ?string
+pub tor query-param { req: *Request, name: string } -> ?string
 
 // ============================================================================
 // PLATFORM SELECTION

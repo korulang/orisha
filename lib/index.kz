@@ -46,6 +46,10 @@ pub const Request = struct {
     body: ?[]const u8,
     accept_encoding: ?[]const u8 = null,
     if_none_match: ?[]const u8 = null,
+    // The raw header block — request line through the blank line — borrowed
+    // from the request bytes. `header`/`cookie` scan it lazily on demand, so
+    // a route that never asks pays one slice store and nothing else.
+    headers: ?[]const u8 = null,
 
     // For param extraction by router
     allocator: std.mem.Allocator,
@@ -137,11 +141,19 @@ pub const ConnHandle = struct {
         return .{ .failed = .{ .msg = "Failed to allocate request", .server = server } };
     };
     const duped_body: ?[]const u8 = if (body) |b| allocator.dupe(u8, b) catch b else null;
+    // `buffer` is this frame's stack — the block has to be duped for the same
+    // reason the body is, or `req.headers` would read a dead frame. A dupe
+    // that fails leaves null rather than a slice of the stack.
+    const headers_block: ?[]const u8 = if (std.mem.indexOf(u8, request_data, "\r\n\r\n")) |he|
+        allocator.dupe(u8, request_data[0 .. he + 4]) catch null
+    else
+        null;
     req.* = .{
         .method = allocator.dupe(u8, method) catch method,
         .path = allocator.dupe(u8, path) catch path,
         .body = duped_body,
         .if_none_match = null,
+        .headers = headers_block,
         .allocator = allocator,
     };
 
@@ -223,6 +235,15 @@ pub const Response = struct {
     body: []const u8,
     content_type: ?ContentType,
     content_encoding: ?ContentType = null,
+    // Handler-supplied headers as ONE preformatted block — "Name: value"
+    // lines, each CRLF-terminated, spliced into the head ahead of
+    // `Connection:`. This is how a 302 carries a Location and a login a
+    // Set-Cookie. The shape is a blob rather than a []Header list because the
+    // handler already holds the bytes (fmt:ln, a literal) — a list would make
+    // every response pay a walk it does not otherwise need. Well-formedness
+    // is checked in `answer`: a block that cannot splice cleanly is a handler
+    // bug and answers 500, never a truncated head.
+    extra_headers: ?ContentType = null,
     // fmt.blk HTML is `allocPrint`; JSON `fmt:ln` is a TLS buffer; static
     // routes are comptime slices. Only the first must be freed after send.
     // Default false so existing `{ status, body, content_type }` produces stay
@@ -245,6 +266,17 @@ pub const Response = struct {
 // Freestanding gets one too. The unikernel never spawns a thread, so it has
 // exactly one of these — the cost is the same 512 bytes it already had.
 threadlocal var header_buf: [512]u8 = undefined;
+
+// The wide twin, for responses that carry `extra_headers`. A 512-byte cap is
+// honest for the fixed head — it fits the longest canned status line plus
+// Date, Content-Type and Content-Length with room to spare — but it is not a
+// ceiling a handler's headers can live under, so the extras path gets its own
+// 4K instead of growing the fast one. The alternative ownership story (heap
+// per response) has no free site: `reply` writes `head` and drops it, with no
+// flag to say who owns it — and adding one would make every response pay for
+// the rare case. A block that does not fit 4K answers 500 rather than going
+// out truncated; a truncated head is a response split, not a shorter reply.
+threadlocal var header_buf_wide: [4096]u8 = undefined;
 
 // ============================================================================
 // THE ALLOCATOR SEAM
@@ -362,6 +394,104 @@ fn decodeChunkedPayload(body: []const u8, out: []u8) ?[]const u8 {
     }
 }
 
+// The whole contract an `extra_headers` block has to satisfy: a sequence of
+// "Name: value" lines, each CRLF-terminated, no blank line anywhere. A blank
+// line IS the head terminator — one here pushes everything after it into the
+// body, which is response splitting; a missing final CRLF welds the last
+// header onto `Connection:`; a line with no colon is not a header at all.
+// Each check is cheap against the cost of splicing garbage onto the wire.
+fn extraHeadersWellFormed(extras: []const u8) bool {
+    if (extras.len == 0 or !std.mem.endsWith(u8, extras, "\r\n")) return false;
+    var scan: usize = 0;
+    while (scan < extras.len) {
+        const nl = std.mem.indexOfPos(u8, extras, scan, "\r\n") orelse return false;
+        const line = extras[scan..nl];
+        if (line.len == 0) return false;
+        if (std.mem.indexOfScalar(u8, line, ':') == null) return false;
+        // A bare \r or \n inside a line is a malformed line ending wearing
+        // a colon — it splices as a second, unvalidated line.
+        if (std.mem.indexOfAny(u8, line, "\r\n") != null) return false;
+        scan = nl + 2;
+    }
+    return true;
+}
+
+// One pair out of a `Cookie:` header — "a=1; b=2" — so a handler does not
+// split it itself. Cookie names are case-sensitive (RFC 6265); the answer is
+// a borrow of the header block, so it dies with the request.
+fn cookieValue(cookies: []const u8, name: []const u8) ?[]const u8 {
+    var pairs = std.mem.splitScalar(u8, cookies, ';');
+    while (pairs.next()) |pair| {
+        const trimmed = std.mem.trim(u8, pair, " \t");
+        const eq = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;
+        if (std.mem.eql(u8, trimmed[0..eq], name)) {
+            return std.mem.trim(u8, trimmed[eq + 1 ..], " \t");
+        }
+    }
+    return null;
+}
+
+// application/x-www-form-urlencoded, the ONE codec `form` and `query-param`
+// share: '+' is a space, %XX a byte. An input with no escapes answers its own
+// slice — the common case allocates nothing. The escaped case decodes into
+// the request's arena, which lives exactly as long as the value can be used.
+fn urlDecode(allocator: std.mem.Allocator, s: []const u8) ?[]const u8 {
+    if (std.mem.indexOfAny(u8, s, "%+") == null) return s;
+    const out = allocator.alloc(u8, s.len) catch return null;
+    var w: usize = 0;
+    var r: usize = 0;
+    while (r < s.len) {
+        if (s[r] == '+') {
+            out[w] = ' ';
+            w += 1;
+            r += 1;
+        } else if (s[r] == '%' and r + 2 < s.len) {
+            const hi = std.fmt.charToDigit(s[r + 1], 16) catch {
+                out[w] = s[r];
+                w += 1;
+                r += 1;
+                continue;
+            };
+            const lo = std.fmt.charToDigit(s[r + 2], 16) catch {
+                out[w] = s[r];
+                w += 1;
+                r += 1;
+                continue;
+            };
+            out[w] = hi * 16 + lo;
+            w += 1;
+            r += 3;
+        } else {
+            out[w] = s[r];
+            w += 1;
+            r += 1;
+        }
+    }
+    return out[0..w];
+}
+
+// "k1=v1&k2=v2" -> the decoded value of `name`, borrowed or arena-decoded as
+// urlDecode decides. Keys arrive encoded too, so the comparison runs against
+// the decoded key — for an unescaped key that is the slice itself, so the
+// common case still allocates nothing. A pair with no '=' is a flag and
+// matches no name.
+fn formField(allocator: std.mem.Allocator, encoded: []const u8, name: []const u8) ?[]const u8 {
+    var pairs = std.mem.splitScalar(u8, encoded, '&');
+    while (pairs.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        const key = urlDecode(allocator, pair[0..eq]) orelse continue;
+        if (std.mem.eql(u8, key, name)) {
+            return urlDecode(allocator, pair[eq + 1 ..]);
+        }
+    }
+    return null;
+}
+
+// The one canned failure answer, shared by every leg that cannot build a
+// head. It announces an EMPTY body, so it must never have bytes written
+// after it — on keep-alive the next read would parse them as a response.
+const RESPONSE_500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
 ~proc answer|zig {
     const req_allocator = $mod.requestAllocator();
     var method: []const u8 = "GET";
@@ -412,10 +542,12 @@ fn decodeChunkedPayload(body: []const u8, out: []u8) ?[]const u8 {
         null;
 
     var body: ?[]const u8 = null;
+    var headers_block: ?[]const u8 = null;
 
     if (std.mem.indexOf(u8, raw, "\r\n\r\n")) |header_end| {
         const headers_end = header_end + 4;
         const head = raw[0..headers_end];
+        headers_block = head;
         const body_raw = if (headers_end < raw.len) raw[headers_end..] else "";
         if (transferEncodingChunkedHead(head)) {
             var decoded_buf: [4096]u8 = undefined;
@@ -434,6 +566,7 @@ fn decodeChunkedPayload(body: []const u8, out: []u8) ?[]const u8 {
         .body = body,
         .accept_encoding = accept_encoding,
         .if_none_match = client_etag,
+        .headers = headers_block,
         .allocator = req_allocator,
     };
 
@@ -452,30 +585,56 @@ fn decodeChunkedPayload(body: []const u8, out: []u8) ?[]const u8 {
     var date_buf: [29]u8 = undefined;
     formatHttpDate(&date_buf);
 
+    // `extra_headers` is the one knob a handler has over the head: one
+    // preformatted block of "Name: value" lines, spliced in ahead of
+    // `Connection:`. A block that cannot splice is a handler bug — and an
+    // owned body still must not leak, so it is freed HERE rather than handed
+    // to release-body through a record that no longer carries it.
+    const extras: []const u8 = if (res.extra_headers) |raw_extras| blk: {
+        if (!extraHeadersWellFormed(raw_extras)) {
+            if (res.body_allocated) koru_allocator().free(res.body);
+            return .{ .head = RESPONSE_500, .body = "", .body_allocated = false };
+        }
+        break :blk raw_extras;
+    } else "";
+
+    // Extras get the wide buffer; a response without them stays on the 512
+    // one it has always used — the no-extras answer is byte-for-byte the path
+    // it was.
+    const head_out: []u8 = if (extras.len == 0) header_buf[0..] else header_buf_wide[0..];
+
+    // A bufPrint failure answers null now, not the canned 500, so the leg
+    // below can send an EMPTY body. The old shape wrote the 500's
+    // "Content-Length: 0" head and then still shipped res.body after it —
+    // on keep-alive those bytes became the NEXT response's head.
     const head = if (res.content_encoding) |enc| blk: {
         if (headerPrefixKeepAlive(res.status)) |prefix| {
             break :blk std.fmt.bufPrint(
-                &header_buf,
-                "{s}{d}\r\nContent-Type: {s}\r\nContent-Encoding: {s}\r\nDate: {s}\r\nX-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\nConnection: keep-alive\r\n\r\n",
-                .{ prefix, res.body.len, res_ct, enc, &date_buf },
-            ) catch "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                head_out,
+                "{s}{d}\r\nContent-Type: {s}\r\nContent-Encoding: {s}\r\nDate: {s}\r\nX-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\n{s}Connection: keep-alive\r\n\r\n",
+                .{ prefix, res.body.len, res_ct, enc, &date_buf, extras },
+            ) catch null;
         }
         break :blk std.fmt.bufPrint(
-            &header_buf,
-            "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Encoding: {s}\r\nContent-Length: {d}\r\nDate: {s}\r\nX-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\nConnection: keep-alive\r\n\r\n",
-            .{ res.status, statusText(res.status), res_ct, enc, res.body.len, &date_buf },
-        ) catch "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            head_out,
+            "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Encoding: {s}\r\nContent-Length: {d}\r\nDate: {s}\r\nX-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\n{s}Connection: keep-alive\r\n\r\n",
+            .{ res.status, statusText(res.status), res_ct, enc, res.body.len, &date_buf, extras },
+        ) catch null;
     } else if (headerPrefixKeepAlive(res.status)) |prefix|
-        std.fmt.bufPrint(&header_buf, "{s}{d}\r\nContent-Type: {s}\r\nDate: {s}\r\nX-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\nConnection: keep-alive\r\n\r\n", .{ prefix, res.body.len, res_ct, &date_buf }) catch
-            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        std.fmt.bufPrint(head_out, "{s}{d}\r\nContent-Type: {s}\r\nDate: {s}\r\nX-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\n{s}Connection: keep-alive\r\n\r\n", .{ prefix, res.body.len, res_ct, &date_buf, extras }) catch
+            null
     else
         std.fmt.bufPrint(
-            &header_buf,
-            "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nDate: {s}\r\nX-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\nConnection: keep-alive\r\n\r\n",
-            .{ res.status, statusText(res.status), res_ct, res.body.len, &date_buf },
-        ) catch "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            head_out,
+            "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nDate: {s}\r\nX-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\n{s}Connection: keep-alive\r\n\r\n",
+            .{ res.status, statusText(res.status), res_ct, res.body.len, &date_buf, extras },
+        ) catch null;
 
-    return .{ .head = head, .body = res.body, .body_allocated = res.body_allocated };
+    const head_slice = head orelse {
+        if (res.body_allocated) koru_allocator().free(res.body);
+        return .{ .head = RESPONSE_500, .body = "", .body_allocated = false };
+    };
+    return .{ .head = head_slice, .body = res.body, .body_allocated = res.body_allocated };
 }
 
 ~proc release-body|zig {
@@ -484,16 +643,56 @@ fn decodeChunkedPayload(body: []const u8, out: []u8) ?[]const u8 {
     }
 }
 
+// The lazy read over `req.headers`: scan the block only when a handler asks.
+// The answer is a borrow of the request bytes — valid for the handler's life,
+// which is as long as anything may keep it.
+~proc header|zig {
+    const head = req.headers orelse return null;
+    return headerValue(head, name);
+}
+
+~proc cookie|zig {
+    const head = req.headers orelse return null;
+    const cookies = headerValue(head, "cookie") orelse return null;
+    return cookieValue(cookies, name);
+}
+
+// `form` reads fields only off a body that declared itself urlencoded — a
+// JSON body parsed as pairs is how a string value becomes a phantom field.
+~proc form|zig {
+    const head = req.headers orelse return null;
+    const ct = headerValue(head, "content-type") orelse return null;
+    const urlencoded = "application/x-www-form-urlencoded";
+    if (ct.len < urlencoded.len or !std.ascii.eqlIgnoreCase(ct[0..urlencoded.len], urlencoded)) return null;
+    const body = req.body orelse return null;
+    return formField(req.allocator, body, name);
+}
+
+~proc query-param|zig {
+    const q = req.query orelse return null;
+    return formField(req.allocator, q, name);
+}
+
 fn statusText(status: u16) []const u8 {
     return switch (status) {
         200 => "OK",
         201 => "Created",
         204 => "No Content",
+        // The redirect family — `extra_headers` makes a 302 with a Location a
+        // first-class answer, so it stops reading "Unknown" on the wire.
+        301 => "Moved Permanently",
+        302 => "Found",
+        303 => "See Other",
+        304 => "Not Modified",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
+        429 => "Too Many Requests",
         500 => "Internal Server Error",
+        503 => "Service Unavailable",
         else => "Unknown",
     };
 }
