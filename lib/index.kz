@@ -445,7 +445,12 @@ fn decodeChunkedPayload(body: []const u8, out: []u8) ?[]const u8 {
         // Pre-rendered static routes: the whole message is `head`. `body`
         // is empty, so it must not carry the allocated flag — freeing ""
         // would be a phantom free of a literal.
-        return .{ .head = res.body, .body = "", .body_allocated = false };
+        // Baked messages carry no Date — it is serve-time (RFC 9110 §10.1.1),
+        // so the send path splices the current line in after the status line.
+        // `date_hole` is that insertion offset; 0 means "head is already
+        // complete" and every non-baked head takes it.
+        const hole = if (std.mem.indexOfScalar(u8, res.body, '\r')) |cr| cr + 2 else 0;
+        return .{ .head = res.body, .body = "", .body_allocated = false, .date_hole = hole };
     }
 
     const res_ct = if (res.content_type) |ct_str| ct_str else "text/plain";
@@ -475,7 +480,7 @@ fn decodeChunkedPayload(body: []const u8, out: []u8) ?[]const u8 {
             .{ res.status, statusText(res.status), res_ct, res.body.len, &date_buf },
         ) catch "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
-    return .{ .head = head, .body = res.body, .body_allocated = res.body_allocated };
+    return .{ .head = head, .body = res.body, .body_allocated = res.body_allocated, .date_hole = 0 };
 }
 
 ~proc release-body|zig {
@@ -512,6 +517,27 @@ fn formatHttpDate(buf: *[29]u8) void {
         formatHttpDateFromEpoch(&cached_date_buf, epoch);
     }
     @memcpy(buf[0..29], cached_date_buf[0..29]);
+}
+
+/// The whole `Date: …\r\n` line (37 bytes) as a stable threadlocal slice, for
+/// callers that splice the header into a baked message — the send path's
+/// `date_hole` iovec points straight at this. Same second-granularity cache
+/// as `formatHttpDate`: Date varies on the clock, not per request, so the
+/// hot path does a lookup, never a format.
+threadlocal var cached_line_epoch: i64 = -1;
+threadlocal var date_line_buf: [37]u8 = undefined;
+
+pub fn httpDateLine() *const [37]u8 {
+    const epoch = time(null);
+    if (epoch != cached_line_epoch) {
+        cached_line_epoch = epoch;
+        var v: [29]u8 = undefined;
+        formatHttpDateFromEpoch(&v, epoch);
+        @memcpy(date_line_buf[0..6], "Date: ");
+        @memcpy(date_line_buf[6..35], &v);
+        @memcpy(date_line_buf[35..37], "\r\n");
+    }
+    return &date_line_buf;
 }
 
 fn formatHttpDateFromEpoch(buf: *[29]u8, epoch: i64) void {
