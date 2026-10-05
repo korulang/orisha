@@ -297,12 +297,17 @@ threadlocal var header_buf_wide: [4096]u8 = undefined;
 const koru_builtin = @import("builtin");
 const orisha_freestanding = koru_builtin.target.os.tag == .freestanding;
 
-var request_arena_buf: [64 * 1024]u8 = undefined;
-var request_arena = std.heap.FixedBufferAllocator.init(&request_arena_buf);
+// The arena is threadlocal for the same reason the header buffers are: the
+// pump runs one worker per thread, and a shared arena lets one worker's
+// reset() drop live allocations another worker's handler is still reading.
+// The FBA state is threadlocal too — `allocator()` returns a pointer into
+// it, so it cannot be a stack local in requestAllocator.
+threadlocal var request_arena_buf: [64 * 1024]u8 = undefined;
+threadlocal var request_arena_state: std.heap.FixedBufferAllocator = undefined;
 
 fn requestAllocator() std.mem.Allocator {
-    request_arena.reset();
-    return request_arena.allocator();
+    request_arena_state = std.heap.FixedBufferAllocator.init(&request_arena_buf);
+    return request_arena_state.allocator();
 }
 
 // The request target is not the lookup key, and the difference is invisible
