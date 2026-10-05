@@ -1042,15 +1042,41 @@ fn headerPrefixKeepAlive(status: u16) ?[]const u8 {
         ib.appendSlice(allocator, pp.method) catch unreachable;
         ib.appendSlice(allocator, "\") and ") catch unreachable;
 
-        if (pp.params.len == 0) {
+        // A parameterized pattern keeps the prefix fast path only when its
+        // single ':' segment is the LAST segment. Anything more — a param
+        // mid-pattern ("/rooms/:id/messages"), multiple params, or a '*'
+        // segment — takes the segment-wise matcher: the prefix path emitted
+        // startsWith(prefix) + a greedy capture, silently truncating the
+        // pattern's tail and shadowing every more-specific route behind it.
+        var seen_param_seg = false;
+        var param_then_trailing = false;
+        var has_wildcard_seg = false;
+        {
+            var sit = std.mem.splitScalar(u8, pp.path, '/');
+            while (sit.next()) |seg| {
+                if (seg.len == 0) continue;
+                if (seen_param_seg) param_then_trailing = true;
+                if (seg.len > 1 and seg[0] == ':') {
+                    seen_param_seg = true;
+                } else if (seg.len == 1 and seg[0] == '*') {
+                    has_wildcard_seg = true;
+                }
+            }
+        }
+        const simple_param = pp.params.len == 1 and !param_then_trailing and !has_wildcard_seg;
+
+        if (pp.params.len == 0 and !has_wildcard_seg) {
             // Exact path match
             ib.appendSlice(allocator, "std.mem.eql(u8, (") catch unreachable;
             ib.appendSlice(allocator, req_expr) catch unreachable;
             ib.appendSlice(allocator, ").path, \"") catch unreachable;
             ib.appendSlice(allocator, pp.path) catch unreachable;
             ib.appendSlice(allocator, "\")") catch unreachable;
-        } else {
-            // Prefix match for parameterized routes
+        } else if (simple_param) {
+            // Prefix match for trailing-param routes. The captured segment
+            // may not contain '/' (a param never crosses a separator) and
+            // may not be empty — both checked here so "/rooms/x/messages"
+            // falls through to the longer pattern instead of being eaten.
             var prefix_end: usize = 0;
             var path_iter = std.mem.splitScalar(u8, pp.path, '/');
             while (path_iter.next()) |seg| {
@@ -1059,11 +1085,50 @@ fn headerPrefixKeepAlive(status: u16) ?[]const u8 {
             }
             const prefix = if (prefix_end > 0) pp.path[0..prefix_end] else "/";
 
+            var plen_buf: [10]u8 = undefined;
+            const plen_str = std.fmt.bufPrint(&plen_buf, "{}", .{prefix.len}) catch "0";
+
             ib.appendSlice(allocator, "std.mem.startsWith(u8, (") catch unreachable;
             ib.appendSlice(allocator, req_expr) catch unreachable;
             ib.appendSlice(allocator, ").path, \"") catch unreachable;
             ib.appendSlice(allocator, prefix) catch unreachable;
-            ib.appendSlice(allocator, "\")") catch unreachable;
+            ib.appendSlice(allocator, "\") and (") catch unreachable;
+            ib.appendSlice(allocator, req_expr) catch unreachable;
+            ib.appendSlice(allocator, ").path.len > ") catch unreachable;
+            ib.appendSlice(allocator, plen_str) catch unreachable;
+            ib.appendSlice(allocator, " and std.mem.indexOfScalar(u8, (") catch unreachable;
+            ib.appendSlice(allocator, req_expr) catch unreachable;
+            ib.appendSlice(allocator, ").path[") catch unreachable;
+            ib.appendSlice(allocator, plen_str) catch unreachable;
+            ib.appendSlice(allocator, "..], '/') == null") catch unreachable;
+        } else {
+            // Segment-wise match: literals compare, ':' segments capture,
+            // '*' consumes the rest, and the path must end exactly.
+            ib.appendSlice(allocator, "blk: {\n") catch unreachable;
+            ib.appendSlice(allocator, "            var _it = std.mem.splitScalar(u8, (") catch unreachable;
+            ib.appendSlice(allocator, req_expr) catch unreachable;
+            ib.appendSlice(allocator, ").path, '/');\n            _ = _it.next();\n") catch unreachable;
+            var wsegs = std.mem.splitScalar(u8, pp.path, '/');
+            var wildcard_emitted = false;
+            while (wsegs.next()) |seg| {
+                if (seg.len == 0) continue;
+                if (seg.len == 1 and seg[0] == '*') {
+                    ib.appendSlice(allocator, "            break :blk true;\n") catch unreachable;
+                    wildcard_emitted = true;
+                    break;
+                }
+                if (seg.len > 1 and seg[0] == ':') {
+                    ib.appendSlice(allocator, "            _ = _it.next() orelse break :blk false;\n") catch unreachable;
+                } else {
+                    ib.appendSlice(allocator, "            if (!std.mem.eql(u8, _it.next() orelse break :blk false, \"") catch unreachable;
+                    ib.appendSlice(allocator, seg) catch unreachable;
+                    ib.appendSlice(allocator, "\")) break :blk false;\n") catch unreachable;
+                }
+            }
+            if (!wildcard_emitted) {
+                ib.appendSlice(allocator, "            if (_it.next() != null) break :blk false;\n            break :blk true;\n") catch unreachable;
+            }
+            ib.appendSlice(allocator, "        }") catch unreachable;
         }
 
         ib.appendSlice(allocator, ") {\n") catch unreachable;
@@ -1077,29 +1142,68 @@ fn headerPrefixKeepAlive(status: u16) ?[]const u8 {
                     false;
 
                 if (needs_param) {
-                    var prefix_end2: usize = 0;
-                    var path_iter2 = std.mem.splitScalar(u8, pp.path, '/');
-                    while (path_iter2.next()) |seg| {
-                        if (seg.len > 0 and seg[0] == ':') break;
-                        prefix_end2 += seg.len + 1;
-                    }
-                    const prefix2 = if (prefix_end2 > 0) pp.path[0..prefix_end2] else "/";
+                    if (simple_param) {
+                        var prefix_end2: usize = 0;
+                        var path_iter2 = std.mem.splitScalar(u8, pp.path, '/');
+                        while (path_iter2.next()) |seg| {
+                            if (seg.len > 0 and seg[0] == ':') break;
+                            prefix_end2 += seg.len + 1;
+                        }
+                        const prefix2 = if (prefix_end2 > 0) pp.path[0..prefix_end2] else "/";
 
-                    var len_buf: [10]u8 = undefined;
-                    const prefix_len_str = std.fmt.bufPrint(&len_buf, "{}", .{prefix2.len}) catch "0";
-                    ib.appendSlice(allocator, "        const _p = (") catch unreachable;
-                    ib.appendSlice(allocator, req_expr) catch unreachable;
-                    ib.appendSlice(allocator, ").path;\n") catch unreachable;
-                    ib.appendSlice(allocator, "        const _param = if (_p.len >= ") catch unreachable;
-                    ib.appendSlice(allocator, prefix_len_str) catch unreachable;
-                    ib.appendSlice(allocator, ") _p[") catch unreachable;
-                    ib.appendSlice(allocator, prefix_len_str) catch unreachable;
-                    ib.appendSlice(allocator, "..] else \"\";\n") catch unreachable;
-                    ib.appendSlice(allocator, "        const ") catch unreachable;
-                    ib.appendSlice(allocator, param_cont.binding.?) catch unreachable;
-                    ib.appendSlice(allocator, " = .{ .") catch unreachable;
-                    ib.appendSlice(allocator, pp.params[0]) catch unreachable;
-                    ib.appendSlice(allocator, " = _param };\n") catch unreachable;
+                        var len_buf: [10]u8 = undefined;
+                        const prefix_len_str = std.fmt.bufPrint(&len_buf, "{}", .{prefix2.len}) catch "0";
+                        ib.appendSlice(allocator, "        const _p = (") catch unreachable;
+                        ib.appendSlice(allocator, req_expr) catch unreachable;
+                        ib.appendSlice(allocator, ").path;\n") catch unreachable;
+                        ib.appendSlice(allocator, "        const _param = if (_p.len >= ") catch unreachable;
+                        ib.appendSlice(allocator, prefix_len_str) catch unreachable;
+                        ib.appendSlice(allocator, ") _p[") catch unreachable;
+                        ib.appendSlice(allocator, prefix_len_str) catch unreachable;
+                        ib.appendSlice(allocator, "..] else \"\";\n") catch unreachable;
+                        ib.appendSlice(allocator, "        const ") catch unreachable;
+                        ib.appendSlice(allocator, param_cont.binding.?) catch unreachable;
+                        ib.appendSlice(allocator, " = .{ .") catch unreachable;
+                        ib.appendSlice(allocator, pp.params[0]) catch unreachable;
+                        ib.appendSlice(allocator, " = _param };\n") catch unreachable;
+                    } else {
+                        // Re-walk the path positionally: the condition's
+                        // matcher already proved the shape, so captures are
+                        // just the ':' segments in order.
+                        ib.appendSlice(allocator, "        const _p = (") catch unreachable;
+                        ib.appendSlice(allocator, req_expr) catch unreachable;
+                        ib.appendSlice(allocator, ").path;\n") catch unreachable;
+                        ib.appendSlice(allocator, "        var _it2 = std.mem.splitScalar(u8, _p, '/');\n        _ = _it2.next();\n") catch unreachable;
+                        var cap_idx: usize = 0;
+                        var csegs = std.mem.splitScalar(u8, pp.path, '/');
+                        while (csegs.next()) |seg| {
+                            if (seg.len == 0) continue;
+                            if (seg.len == 1 and seg[0] == '*') break;
+                            if (seg.len > 1 and seg[0] == ':') {
+                                var nbuf: [10]u8 = undefined;
+                                const nstr = std.fmt.bufPrint(&nbuf, "{}", .{cap_idx}) catch "0";
+                                ib.appendSlice(allocator, "        const _cap") catch unreachable;
+                                ib.appendSlice(allocator, nstr) catch unreachable;
+                                ib.appendSlice(allocator, " = _it2.next() orelse \"\";\n") catch unreachable;
+                                cap_idx += 1;
+                            } else {
+                                ib.appendSlice(allocator, "        _ = _it2.next();\n") catch unreachable;
+                            }
+                        }
+                        ib.appendSlice(allocator, "        const ") catch unreachable;
+                        ib.appendSlice(allocator, param_cont.binding.?) catch unreachable;
+                        ib.appendSlice(allocator, " = .{ ") catch unreachable;
+                        for (pp.params, 0..) |pname, i| {
+                            if (i > 0) ib.appendSlice(allocator, ", ") catch unreachable;
+                            var nbuf: [10]u8 = undefined;
+                            const nstr = std.fmt.bufPrint(&nbuf, "{}", .{i}) catch "0";
+                            ib.appendSlice(allocator, ".") catch unreachable;
+                            ib.appendSlice(allocator, pname) catch unreachable;
+                            ib.appendSlice(allocator, " = _cap") catch unreachable;
+                            ib.appendSlice(allocator, nstr) catch unreachable;
+                        }
+                        ib.appendSlice(allocator, " };\n") catch unreachable;
+                    }
                 }
             }
         }
