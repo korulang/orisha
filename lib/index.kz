@@ -907,7 +907,7 @@ fn headerPrefixKeepAlive(status: u16) ?[]const u8 {
 
         // Continuation code
         if (cont) |active_cont| {
-            const code = continuation_codegen.generateContinuationChain(
+            const code = continuation_codegen.generateContinuationChainWithItems(
                 allocator,
                 active_cont,
                 program.main_module_name,
@@ -924,7 +924,7 @@ fn headerPrefixKeepAlive(status: u16) ?[]const u8 {
     // Catch-all as else (guarantees all paths covered for Zig control flow)
     if (catch_all_cont) |cont| {
         ib.appendSlice(allocator, " else {\n") catch unreachable;
-        const code = continuation_codegen.generateContinuationChain(
+        const code = continuation_codegen.generateContinuationChainWithItems(
             allocator,
             cont,
             program.main_module_name,
