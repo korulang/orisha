@@ -223,6 +223,10 @@ pub const Response = struct {
     body: []const u8,
     content_type: ?ContentType,
     content_encoding: ?ContentType = null,
+    // Caller-supplied extra header lines, verbatim including \r\n terminators
+    // ("Vary: Accept\r\nVary: accept-encoding\r\n"). Spliced into the head
+    // between the managed headers and the trailer. Null = no extras.
+    extra_headers: ?ContentType = null,
     // fmt.blk HTML is `allocPrint`; JSON `fmt:ln` is a TLS buffer; static
     // routes are comptime slices. Only the first must be freed after send.
     // Default false so existing `{ status, body, content_type }` produces stay
@@ -243,8 +247,9 @@ pub const Response = struct {
 // pump had exactly one thread from the day the workers were removed.
 //
 // Freestanding gets one too. The unikernel never spawns a thread, so it has
-// exactly one of these — the cost is the same 512 bytes it already had.
-threadlocal var header_buf: [512]u8 = undefined;
+// exactly one of these. 1024 bytes — the managed head is ~250, the rest is
+// headroom for caller `extra_headers`.
+threadlocal var header_buf: [1024]u8 = undefined;
 
 // ============================================================================
 // THE ALLOCATOR SEAM
@@ -454,6 +459,7 @@ fn decodeChunkedPayload(body: []const u8, out: []u8) ?[]const u8 {
     }
 
     const res_ct = if (res.content_type) |ct_str| ct_str else "text/plain";
+    const extra = res.extra_headers orelse "";
     var date_buf: [29]u8 = undefined;
     formatHttpDate(&date_buf);
 
@@ -461,23 +467,23 @@ fn decodeChunkedPayload(body: []const u8, out: []u8) ?[]const u8 {
         if (headerPrefixKeepAlive(res.status)) |prefix| {
             break :blk std.fmt.bufPrint(
                 &header_buf,
-                "{s}{d}\r\nContent-Type: {s}\r\nContent-Encoding: {s}\r\nDate: {s}\r\nX-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\nConnection: keep-alive\r\n\r\n",
-                .{ prefix, res.body.len, res_ct, enc, &date_buf },
+                "{s}{d}\r\nContent-Type: {s}\r\nContent-Encoding: {s}\r\nDate: {s}\r\n{s}X-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\nConnection: keep-alive\r\n\r\n",
+                .{ prefix, res.body.len, res_ct, enc, &date_buf, extra },
             ) catch "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         }
         break :blk std.fmt.bufPrint(
             &header_buf,
-            "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Encoding: {s}\r\nContent-Length: {d}\r\nDate: {s}\r\nX-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\nConnection: keep-alive\r\n\r\n",
-            .{ res.status, statusText(res.status), res_ct, enc, res.body.len, &date_buf },
+            "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Encoding: {s}\r\nContent-Length: {d}\r\nDate: {s}\r\n{s}X-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\nConnection: keep-alive\r\n\r\n",
+            .{ res.status, statusText(res.status), res_ct, enc, res.body.len, &date_buf, extra },
         ) catch "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
     } else if (headerPrefixKeepAlive(res.status)) |prefix|
-        std.fmt.bufPrint(&header_buf, "{s}{d}\r\nContent-Type: {s}\r\nDate: {s}\r\nX-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\nConnection: keep-alive\r\n\r\n", .{ prefix, res.body.len, res_ct, &date_buf }) catch
+        std.fmt.bufPrint(&header_buf, "{s}{d}\r\nContent-Type: {s}\r\nDate: {s}\r\n{s}X-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\nConnection: keep-alive\r\n\r\n", .{ prefix, res.body.len, res_ct, &date_buf, extra }) catch
             "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     else
         std.fmt.bufPrint(
             &header_buf,
-            "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nDate: {s}\r\nX-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\nConnection: keep-alive\r\n\r\n",
-            .{ res.status, statusText(res.status), res_ct, res.body.len, &date_buf },
+            "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nDate: {s}\r\n{s}X-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\nConnection: keep-alive\r\n\r\n",
+            .{ res.status, statusText(res.status), res_ct, res.body.len, &date_buf, extra },
         ) catch "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
     return .{ .head = head, .body = res.body, .body_allocated = res.body_allocated, .date_hole = 0 };
