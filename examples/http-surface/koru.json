@@ -1,0 +1,8 @@
+{
+  "name": "orisha-http-surface",
+  "version": "0.1.0",
+  "paths": {
+    "orisha": "../../lib",
+    "koru": ["../../../koru-libs", "../../../../../../koru-libs"]
+  }
+}

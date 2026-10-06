@@ -156,9 +156,19 @@ pub const ConnState = struct {
 
 var conn_states: [MAX_TRACKED_FD]?*ConnState = .{null} ** MAX_TRACKED_FD;
 
+// The "no index is ever touched twice" claim is false: the accept thread
+// writes the slot (registerClient → connState) while a worker detaches it
+// (releaseConn), and the kernel reissues a just-closed fd immediately. The
+// lock makes the table honest; the ordering — detach BEFORE close in
+// releaseConn — is what keeps a reissued descriptor from inheriting the
+// previous connection's buffered tail, ssl, or a second close.
+var conn_states_mu: std.Thread.Mutex = .{};
+
 fn connState(fd: posix.fd_t) ?*ConnState {
     const idx: usize = @intCast(fd);
     if (idx >= MAX_TRACKED_FD) return null;
+    conn_states_mu.lock();
+    defer conn_states_mu.unlock();
     if (conn_states[idx]) |s| return s;
     const s = std.heap.c_allocator.create(ConnState) catch return null;
     s.* = .{ .fd = fd };
@@ -168,11 +178,17 @@ fn connState(fd: posix.fd_t) ?*ConnState {
 
 fn releaseConn(fd: posix.fd_t) void {
     const idx: usize = @intCast(fd);
-    if (idx >= MAX_TRACKED_FD) return;
-    if (conn_states[idx]) |s| {
-        closeConn(s);
-        std.heap.c_allocator.destroy(s);
-        conn_states[idx] = null;
+    if (idx >= MAX_TRACKED_FD) {
+        posix.close(@intCast(fd));
+        return;
+    }
+    conn_states_mu.lock();
+    const s = conn_states[idx];
+    conn_states[idx] = null;
+    conn_states_mu.unlock();
+    if (s) |st| {
+        closeConn(st);
+        std.heap.c_allocator.destroy(st);
     } else {
         posix.close(@intCast(fd));
     }
@@ -276,6 +292,19 @@ fn writevAllConn(st: *ConnState, head: []const u8, body: []const u8, date_hole: 
         }
     }
     return true;
+}
+
+// Writing to a peer-closed socket raises SIGPIPE; the default action kills
+// the process silently. Any server that keep-alives must ignore it once, up
+// front — then send/write/SSL_write return EPIPE and the write loop treats a
+// vanished peer as an ordinary close. Called at the top of every drive body.
+fn ignoreSigpipe() void {
+    const ign = posix.Sigaction{
+        .handler = .{ .handler = posix.SIG.IGN },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.PIPE, &ign, null);
 }
 
 fn maybeStartTls(
@@ -765,6 +794,8 @@ fn workerCount() usize {
 // ---------------------------------------------------------------------------
 
 ~proc init|zig {
+    $mod.ignoreSigpipe();
+
     if ($mod.maybeStartTls(tls_port, cert_path, key_path)) |err_msg| {
         return .{ .failed = err_msg };
     }
@@ -1299,6 +1330,8 @@ fn workerCount() usize {
 }
 
 ~proc drive|zig {
+    $mod.ignoreSigpipe();
+
     if ($mod.maybeStartTls(tls_port, cert_path, key_path)) |err_msg| {
         return .{ .failed = err_msg };
     }
@@ -1448,6 +1481,8 @@ fn workerCount() usize {
 // ---------------------------------------------------------------------------
 
 ~proc drive|epoll {
+    $mod.ignoreSigpipe();
+
     const linux = std.os.linux;
 
     if ($mod.maybeStartTls(tls_port, cert_path, key_path)) |err_msg| {
@@ -1625,6 +1660,8 @@ fn workerCount() usize {
     if (@import("builtin").os.tag != .linux) {
         return .{ .failed = "io_uring is a Linux mechanism — build with --build=linux for this host" };
     }
+
+    $mod.ignoreSigpipe();
 
     const linux = std.os.linux;
 
@@ -1942,14 +1979,18 @@ fn workerCount() usize {
 // `x.raw` borrows the pump's read buffer (`ConnState.buf`), and a Koru `->`
 // return may not hand back a borrow of its parameter (610_007) — so this proc
 // copies the bytes into a per-request arena instead of projecting the field.
-// The arena resets on every call; the previous arm is fully answered by then.
 // Every construction of `Exchange.raw` slices `ConnState.buf` (REQUEST_BUFFER),
 // so the copy fits by construction and `catch unreachable` never fires.
-var raw_arena_buf: [REQUEST_BUFFER]u8 = undefined;
-var raw_arena = std.heap.FixedBufferAllocator.init(&raw_arena_buf);
+//
+// The arena MUST be threadlocal: workers run on their own threads and a
+// shared arena lets one worker's reset()+dupe overwrite a slice another
+// worker's router is still parsing — a mangled path is a 404, a mangled path
+// that lands on a live route is a wrong response. The response-side buffer in
+// the companion got this treatment; the request side was missed.
+threadlocal var raw_arena_buf: [REQUEST_BUFFER]u8 = undefined;
 
 ~proc raw|zig {
-    raw_arena.reset();
-    const data = raw_arena.allocator().dupe(u8, x.raw) catch unreachable;
+    var fba = std.heap.FixedBufferAllocator.init(&raw_arena_buf);
+    const data = fba.allocator().dupe(u8, x.raw) catch unreachable;
     return data;
 }
