@@ -612,7 +612,7 @@ const RESPONSE_500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\
     const extras: []const u8 = if (res.extra_headers) |raw_extras| blk: {
         if (!extraHeadersWellFormed(raw_extras)) {
             if (res.body_allocated) koru_allocator().free(res.body);
-            return .{ .head = RESPONSE_500, .body = "", .body_allocated = false };
+            return .{ .head = RESPONSE_500, .body = "", .body_allocated = false, .date_hole = 0 };
         }
         break :blk raw_extras;
     } else "";
