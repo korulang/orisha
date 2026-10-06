@@ -586,7 +586,15 @@ const RESPONSE_500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\
         return .{ .head = res.body, .body = "", .body_allocated = false };
     }
 
-    const res_ct = if (res.content_type) |ct_str| ct_str else "text/plain";
+    // `content_type: null` means NO Content-Type header — a bare redirect or
+    // empty-body answer has no type to declare. The old text/plain default
+    // spelled a header the handler never asked for, which matters on the wire:
+    // topcoat's 307 carries none, and a hard default makes it unspellable.
+    var ct_line_buf: [512]u8 = undefined;
+    const res_ct: []const u8 = if (res.content_type) |ct_str|
+        std.fmt.bufPrint(&ct_line_buf, "Content-Type: {s}\r\n", .{ct_str}) catch ""
+    else
+        "";
     var date_buf: [29]u8 = undefined;
     formatHttpDate(&date_buf);
 
@@ -616,22 +624,22 @@ const RESPONSE_500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\
         if (headerPrefixKeepAlive(res.status)) |prefix| {
             break :blk std.fmt.bufPrint(
                 head_out,
-                "{s}{d}\r\nContent-Type: {s}\r\nContent-Encoding: {s}\r\nDate: {s}\r\nX-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\n{s}Connection: keep-alive\r\n\r\n",
+                "{s}{d}\r\n{s}Content-Encoding: {s}\r\nDate: {s}\r\nX-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\n{s}Connection: keep-alive\r\n\r\n",
                 .{ prefix, res.body.len, res_ct, enc, &date_buf, extras },
             ) catch null;
         }
         break :blk std.fmt.bufPrint(
             head_out,
-            "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Encoding: {s}\r\nContent-Length: {d}\r\nDate: {s}\r\nX-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\n{s}Connection: keep-alive\r\n\r\n",
+            "HTTP/1.1 {d} {s}\r\n{s}Content-Encoding: {s}\r\nContent-Length: {d}\r\nDate: {s}\r\nX-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\n{s}Connection: keep-alive\r\n\r\n",
             .{ res.status, statusText(res.status), res_ct, enc, res.body.len, &date_buf, extras },
         ) catch null;
     } else if (headerPrefixKeepAlive(res.status)) |prefix|
-        std.fmt.bufPrint(head_out, "{s}{d}\r\nContent-Type: {s}\r\nDate: {s}\r\nX-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\n{s}Connection: keep-alive\r\n\r\n", .{ prefix, res.body.len, res_ct, &date_buf, extras }) catch
+        std.fmt.bufPrint(head_out, "{s}{d}\r\n{s}Date: {s}\r\nX-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\n{s}Connection: keep-alive\r\n\r\n", .{ prefix, res.body.len, res_ct, &date_buf, extras }) catch
             null
     else
         std.fmt.bufPrint(
             head_out,
-            "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nDate: {s}\r\nX-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\n{s}Connection: keep-alive\r\n\r\n",
+            "HTTP/1.1 {d} {s}\r\n{s}Content-Length: {d}\r\nDate: {s}\r\nX-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\n{s}Connection: keep-alive\r\n\r\n",
             .{ res.status, statusText(res.status), res_ct, res.body.len, &date_buf, extras },
         ) catch null;
 
@@ -695,6 +703,7 @@ fn statusText(status: u16) []const u8 {
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
+        405 => "Method Not Allowed",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
