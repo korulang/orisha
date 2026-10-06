@@ -149,7 +149,7 @@ const MAX_TRACKED_FD = 4096;
 // already IS `c_int`, so the hosted pumps hand theirs over unchanged.
 pub const ConnState = struct {
     fd: c_int = -1,
-    ssl: ?*anyopaque = null,
+    ssl: ?*ServerTls = null,
     buf: [REQUEST_BUFFER]u8 = undefined,
     len: usize = 0,
 };
@@ -196,8 +196,10 @@ fn releaseConn(fd: posix.fd_t) void {
 
 fn closeConn(st: *ConnState) void {
     if (HAS_OPENSSL) {
-        if (st.ssl) |ssl| {
-            @import("root").koru_koru.koru_openssl.releaseServerSsl(@ptrCast(@alignCast(ssl)));
+        if (st.ssl) |tls| {
+            const mod = @import("root").koru_koru.koru_openssl;
+            if (tls.ssl) |s| mod.releaseServerSsl(s);
+            tls.allocator.destroy(tls);
             st.ssl = null;
         }
     }
@@ -217,9 +219,10 @@ fn shutdownConn(st: *ConnState) void {
 
 fn writeAllConn(st: *ConnState, data: []const u8) bool {
     if (HAS_OPENSSL) {
-        if (st.ssl) |ssl_opaque| {
-            const ssl: *@import("root").koru_koru.koru_openssl.c.SSL = @ptrCast(@alignCast(ssl_opaque));
-            return @import("root").koru_koru.koru_openssl.sslWriteAll(ssl, st.fd, data, std.heap.page_allocator);
+        if (st.ssl) |tls| {
+            const mod = @import("root").koru_koru.koru_openssl;
+            const s = tls.ssl orelse return false;
+            return mod.sslWriteAll(s, st.fd, data, std.heap.page_allocator);
         }
     }
     return writeAll(@intCast(st.fd), data);
@@ -236,17 +239,17 @@ fn writeAllConn(st: *ConnState, data: []const u8) bool {
 fn writevAllConn(st: *ConnState, head: []const u8, body: []const u8, date_hole: usize) bool {
     const date_line: []const u8 = if (date_hole != 0) @import("root").koru_orisha.httpDateLine() else "";
     if (HAS_OPENSSL) {
-        if (st.ssl) |ssl_opaque| {
-            const ssl: *@import("root").koru_koru.koru_openssl.c.SSL = @ptrCast(@alignCast(ssl_opaque));
+        if (st.ssl) |tls| {
             const mod = @import("root").koru_koru.koru_openssl;
+            const s = tls.ssl orelse return false;
             const ok_head = if (date_hole != 0)
-                mod.sslWriteAll(ssl, st.fd, head[0..date_hole], std.heap.page_allocator) and
-                    mod.sslWriteAll(ssl, st.fd, date_line, std.heap.page_allocator) and
-                    mod.sslWriteAll(ssl, st.fd, head[date_hole..], std.heap.page_allocator)
+                mod.sslWriteAll(s, st.fd, head[0..date_hole], std.heap.page_allocator) and
+                    mod.sslWriteAll(s, st.fd, date_line, std.heap.page_allocator) and
+                    mod.sslWriteAll(s, st.fd, head[date_hole..], std.heap.page_allocator)
             else
-                mod.sslWriteAll(ssl, st.fd, head, std.heap.page_allocator);
+                mod.sslWriteAll(s, st.fd, head, std.heap.page_allocator);
             return ok_head and
-                (body.len == 0 or mod.sslWriteAll(ssl, st.fd, body, std.heap.page_allocator));
+                (body.len == 0 or mod.sslWriteAll(s, st.fd, body, std.heap.page_allocator));
         }
     }
     var iov = [4]posix.iovec_const{
@@ -338,7 +341,16 @@ fn maybeStartTls(
         null;
 }
 
-var tls_server_ctx: ?*anyopaque = null;
+// The TLS handle types, named not opaque: a connection's `ssl` is an open
+// `*Tls` the ConnState owns until releaseConn frees it (releaseServerSsl +
+// destroy — the pump keeps the fd, so the package's `close` is NOT called;
+// it would double-close the socket). Both are comptime-selected off
+// HAS_OPENSSL so a non-TLS target never resolves the openssl cImport — the
+// same gate that keeps cross-compile free of openssl headers.
+const ServerTls = if (HAS_OPENSSL) @import("root").koru_koru.koru_openssl.Tls else anyopaque;
+const ServerTlsCtx = if (HAS_OPENSSL) @import("root").koru_koru.koru_openssl.ServerCtx else anyopaque;
+
+var tls_server_ctx: ?*ServerTlsCtx = null;
 var tls_listen_port: u16 = 0;
 
 // TLS exists only where a system openssl can be linked — this must stay the
@@ -579,13 +591,25 @@ fn armKqueueRead(kq: i32, fd: posix.fd_t) void {
     _ = libc.kevent(kq, &changes, 1, &none, 0, null);
 }
 
-fn acceptTlsHandshake(client_fd: c_int) ?*anyopaque {
+fn acceptTlsHandshake(client_fd: c_int) ?*ServerTls {
     if (HAS_OPENSSL) {
-        const ctx_ptr = tls_server_ctx orelse return null;
-        const ctx: *@import("root").koru_koru.koru_openssl.ServerCtx = @ptrCast(@alignCast(ctx_ptr));
-        const accepted = @import("root").koru_koru.koru_openssl.acceptServerSsl(ctx, client_fd, std.heap.page_allocator);
+        const openssl = @import("root").koru_koru.koru_openssl;
+        const ctx = tls_server_ctx orelse return null;
+        const accepted = openssl.acceptServerSsl(ctx, client_fd, std.heap.page_allocator);
         return switch (accepted) {
-            .ok => |ssl| ssl,
+            .ok => |ssl| blk: {
+                // The pump wraps the raw handle in the package's Tls so
+                // `ConnState.ssl` names what it is — an open TLS connection.
+                // The fd stays pump-owned: teardown frees via releaseServerSsl
+                // + destroy, never the package `close` (it would double-close).
+                const conn = std.heap.page_allocator.create(openssl.Tls) catch {
+                    openssl.releaseServerSsl(ssl);
+                    posix.close(@intCast(client_fd));
+                    return null;
+                };
+                conn.* = .{ .ssl = ssl, .ctx = ctx.ctx, .owns_ctx = false, .fd = client_fd, .allocator = std.heap.page_allocator };
+                break :blk conn;
+            },
             .err => {
                 posix.close(@intCast(client_fd));
                 return null;
@@ -599,12 +623,16 @@ fn acceptTlsHandshake(client_fd: c_int) ?*anyopaque {
     return null;
 }
 
-fn registerClient(client_fd: posix.fd_t, ssl: ?*anyopaque, kq: i32) void {
+fn registerClient(client_fd: posix.fd_t, ssl: ?*ServerTls, kq: i32) void {
     disableNagle(client_fd);
     markNonBlocking(client_fd);
     const st = connState(client_fd) orelse {
         if (HAS_OPENSSL) {
-            if (ssl) |s| @import("root").koru_koru.koru_openssl.releaseServerSsl(@ptrCast(@alignCast(s)));
+            if (ssl) |tls| {
+                const mod = @import("root").koru_koru.koru_openssl;
+                if (tls.ssl) |s| mod.releaseServerSsl(s);
+                tls.allocator.destroy(tls);
+            }
         }
         posix.close(client_fd);
         return;
@@ -613,13 +641,17 @@ fn registerClient(client_fd: posix.fd_t, ssl: ?*anyopaque, kq: i32) void {
     armKqueueRead(kq, client_fd);
 }
 
-fn registerClientEpoll(client_fd: posix.fd_t, ssl: ?*anyopaque, epfd: i32) void {
+fn registerClientEpoll(client_fd: posix.fd_t, ssl: ?*ServerTls, epfd: i32) void {
     const linux = std.os.linux;
     disableNagle(client_fd);
     markNonBlocking(client_fd);
     const st = connState(client_fd) orelse {
         if (HAS_OPENSSL) {
-            if (ssl) |s| @import("root").koru_koru.koru_openssl.releaseServerSsl(@ptrCast(@alignCast(s)));
+            if (ssl) |tls| {
+                const mod = @import("root").koru_koru.koru_openssl;
+                if (tls.ssl) |s| mod.releaseServerSsl(s);
+                tls.allocator.destroy(tls);
+            }
         }
         posix.close(client_fd);
         return;
@@ -751,17 +783,19 @@ fn workerCount() usize {
 // ever. Separating them is what `idle` is for.
 ~proc fill|zig {
     if ($mod.HAS_OPENSSL) {
-        if (st.ssl) |ssl_opaque| {
-            const ssl: *@import("root").koru_koru.koru_openssl.c.SSL = @ptrCast(@alignCast(ssl_opaque));
-            const rc = @import("root").koru_koru.koru_openssl.c.SSL_read(ssl, @ptrCast(st.buf[st.len..].ptr), @intCast(st.buf.len - st.len));
+        if (st.ssl) |tls| {
+            const mod = @import("root").koru_koru.koru_openssl;
+            // `sslFill` can't substitute here — its `more` carries no byte
+            // count, and this read must advance st.len.
+            const s = tls.ssl orelse return .gone;
+            const rc = mod.c.SSL_read(s, @ptrCast(st.buf[st.len..].ptr), @intCast(st.buf.len - st.len));
             if (rc > 0) {
                 st.len += @intCast(rc);
                 return .more;
             }
-            const err_code = @import("root").koru_koru.koru_openssl.c.SSL_get_error(ssl, rc);
+            const err_code = mod.c.SSL_get_error(s, rc);
             return switch (err_code) {
-                @import("root").koru_koru.koru_openssl.c.SSL_ERROR_WANT_READ, @import("root").koru_koru.koru_openssl.c.SSL_ERROR_WANT_WRITE => .idle,
-                @import("root").koru_koru.koru_openssl.c.SSL_ERROR_ZERO_RETURN => .gone,
+                mod.c.SSL_ERROR_WANT_READ, mod.c.SSL_ERROR_WANT_WRITE => .idle,
                 else => .gone,
             };
         }
