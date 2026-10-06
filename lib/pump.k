@@ -109,7 +109,7 @@ pub tor deinit {}
 // rendered response passes it as `head` with an empty `body`, which is what a
 // pre-rendered static route does.
 
-pub tor reply { x: *Exchange, head: string, body: string }
+pub tor reply { x: *Exchange, head: string, body: string, date_hole: usize }
 | sent
 | broken string
 

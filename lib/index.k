@@ -95,7 +95,7 @@ pub tor serve { port: u16, tls_port: ?u16, cert_path: ?string, key_path: ?string
 
 serve =
     orisha/pump:run(port, tls_port, cert_path, key_path)
-    ! arrived x |> orisha/pump:raw(x): raw |> orisha:answer(raw): a |> orisha/pump:reply(x, a.head, a.body)
+    ! arrived x |> orisha/pump:raw(x): raw |> orisha:answer(raw): a |> orisha/pump:reply(x, a.head, a.body, a.date_hole)
         | sent |> orisha:release-body(a.body, allocated: a.body_allocated)
         | broken _ |> orisha:release-body(a.body, allocated: a.body_allocated)
     | stopped s -> shutdown s
@@ -107,7 +107,7 @@ serve =
 // Platform-free by construction: it takes bytes and returns bytes, and never
 // names a file descriptor. Every pump shares it. The body is in the companion.
 
-pub tor answer { raw: string } -> { head: string, body: string, body_allocated: bool }
+pub tor answer { raw: string } -> { head: string, body: string, body_allocated: bool, date_hole: usize }
 
 // Free a handler body that fmt.blk allocated. Static slices and fmt:ln TLS
 // buffers arrive with allocated=false; those must not be freed.
