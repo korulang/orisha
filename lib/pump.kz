@@ -268,9 +268,14 @@ fn writevAllConn(st: *ConnState, head: []const u8, body: []const u8, date_hole: 
         };
         total += date_line.len;
     }
+    // The live iovec count: 4 when the Date splice widened the set, 2
+    // otherwise. Slicing `iov[idx..]` unbounded would hand writev the
+    // `undefined` tail — a len of garbage is an instant EFAULT and a dead
+    // connection, which is why this bound exists at all.
+    const iov_count: usize = if (date_hole != 0) 4 else 2;
     var idx: usize = if (head.len == 0) 1 else 0;
     while (total > 0) {
-        const n = posix.writev(@intCast(st.fd), iov[idx..]) catch |err| switch (err) {
+        const n = posix.writev(@intCast(st.fd), iov[idx..][0 .. iov_count - idx]) catch |err| switch (err) {
             error.WouldBlock => {
                 var pfd = [_]posix.pollfd{.{ .fd = @intCast(st.fd), .events = posix.POLL.OUT, .revents = 0 }};
                 const ready = posix.poll(&pfd, WRITE_WAIT_MS) catch return false;
@@ -283,7 +288,7 @@ fn writevAllConn(st: *ConnState, head: []const u8, body: []const u8, date_hole: 
         if (n == 0) return false;
         var rem: usize = @intCast(n);
         total -= rem;
-        while (rem > 0 and idx < iov.len) {
+        while (rem > 0 and idx < iov_count) {
             if (rem >= iov[idx].len) {
                 rem -= iov[idx].len;
                 idx += 1;
