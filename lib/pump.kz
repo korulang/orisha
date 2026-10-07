@@ -53,7 +53,7 @@ const MAX_EVENTS = 64;
 // inverts that: the read is submitted UP FRONT and the completion says it already
 // happened. So this pump has no readiness step at all — the loop body handles a
 // result, never a hint.
-const URING_ENTRIES: u16 = 256;
+const URING_ENTRIES: u16 = 4096;
 const URING_ACCEPT: u64 = std.math.maxInt(u64);
 
 // One read is not one request.
@@ -2689,7 +2689,14 @@ fn workerCount() usize {
                     }
                 }
                 if (cqe.flags & linux.IORING_CQE_F_MORE == 0) {
-                    _ = w.ring.accept_multishot($mod.URING_ACCEPT, w.listen_fd, null, null, 0) catch {};
+                    // The acceptor retired — a worker without one is a dead
+                    // quarter of the port (SO_REUSEPORT keeps hashing conns
+                    // to it), so a full SQ is not an acceptable answer: push
+                    // what's staged and try again.
+                    _ = w.ring.accept_multishot($mod.URING_ACCEPT, w.listen_fd, null, null, 0) catch {
+                        _ = w.ring.submit() catch {};
+                        _ = w.ring.accept_multishot($mod.URING_ACCEPT, w.listen_fd, null, null, 0) catch {};
+                    };
                 }
                 return;
             }
