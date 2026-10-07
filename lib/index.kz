@@ -622,6 +622,23 @@ const RESPONSE_500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\
     // it was.
     const head_out: []u8 = if (extras.len == 0) header_buf[0..] else header_buf_wide[0..];
 
+    // 101 is a handshake, not a response: no Content-Length, no managed
+    // `Connection` (the handler spells `Connection: Upgrade` in extras), and
+    // no body. The pump watches the head's status on the way out and flips
+    // the connection to websocket frames.
+    if (res.status == 101) {
+        const head101 = std.fmt.bufPrint(
+            head_out,
+            "HTTP/1.1 101 Switching Protocols\r\n{s}Date: {s}\r\nX-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\n\r\n",
+            .{ extras, &date_buf },
+        ) catch {
+            if (res.body_allocated) koru_allocator().free(res.body);
+            return .{ .head = RESPONSE_500, .body = "", .body_allocated = false, .date_hole = 0 };
+        };
+        if (res.body_allocated) koru_allocator().free(res.body);
+        return .{ .head = head101, .body = "", .body_allocated = false, .date_hole = 0 };
+    }
+
     // A bufPrint failure answers null now, not the canned 500, so the leg
     // below can send an EMPTY body. The old shape wrote the 500's
     // "Content-Length: 0" head and then still shipped res.body after it —
@@ -670,6 +687,22 @@ const RESPONSE_500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\
     return headerValue(head, name);
 }
 
+// base64(SHA-1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")) — RFC 6455 §4.2.2.
+// The answer lives in the request arena: the upgrade head is built and sent
+// before the arm returns, so the accept value's life is the request's.
+~proc ws-accept|zig {
+    const head = req.headers orelse return null;
+    const key = headerValue(head, "sec-websocket-key") orelse return null;
+    var sha = std.crypto.hash.Sha1.init(.{});
+    sha.update(key);
+    sha.update("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    var digest: [20]u8 = undefined;
+    sha.final(&digest);
+    var enc: [28]u8 = undefined;
+    const out = std.base64.standard.Encoder.encode(&enc, &digest);
+    return $mod.requestAllocator().dupe(u8, out) catch null;
+}
+
 ~proc cookie|zig {
     const head = req.headers orelse return null;
     const cookies = headerValue(head, "cookie") orelse return null;
@@ -697,6 +730,7 @@ fn statusText(status: u16) []const u8 {
         200 => "OK",
         201 => "Created",
         204 => "No Content",
+        101 => "Switching Protocols",
         // The redirect family — `extra_headers` makes a 302 with a Location a
         // first-class answer, so it stops reading "Unknown" on the wire.
         301 => "Moved Permanently",

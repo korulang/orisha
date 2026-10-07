@@ -14,13 +14,15 @@
 // `run` is a transform in the companion `pump.kz`: with no `std/pump` open
 // above the call site it emits `drive` — the accept loop, one variant per
 // platform — and inside an open pump it emits `init` plus the join units that
-// capture it. Either way `! arrived` fires once per request and RESUMES;
-// `| stopped` and `| failed` are the two ways it ends. `*Exchange` is a host
+// capture it. Either way `! arrived` fires once per request and RESUMES, and
+// `! frame` fires once per complete websocket message after a 101 answer
+// flips the connection; `| stopped` and `| failed` are the two ways it ends. `*Exchange` is a host
 // type the companion declares — a contract may name one, it just may not
 // define one.
 
 pub tor drive { port: u16, tls_port: ?u16, cert_path: ?string, key_path: ?string }
 ! arrived *Exchange
+! frame *Exchange
 | stopped string
 | failed string
 
@@ -61,6 +63,7 @@ pub tor __retire {}
 
 pub tor init { port: u16, tls_port: ?u16, cert_path: ?string, key_path: ?string }
 ! arrived *Exchange
+! frame *Exchange
 | ?started
 | failed string
 
@@ -112,6 +115,35 @@ pub tor deinit {}
 pub tor reply { x: *Exchange, head: string, body: string, date_hole: usize }
 | sent
 | broken string
+
+// ============================================================================
+// WS-SEND / WS-CLOSE — the websocket write side
+// ============================================================================
+// Only meaningful inside a `! frame` arm, on a connection a 101 answer already
+// upgraded: `ws-send` emits one unmasked frame, `ws-close` a close frame plus
+// the hang-up. `opcode` absent means echo what was dispatched — `x.opcode`
+// carries it (0x1 text, 0x2 binary); 0 falls back to text. A broken write is
+// reported the same way `hang-up` reports it — the pump reaps the connection
+// when the arm returns, so there is no `| broken` to spell.
+
+pub tor ws-send { x: *Exchange, payload: string, opcode: ?u8 }
+
+pub tor ws-close { x: *Exchange }
+
+// ============================================================================
+// WS-FRAME — a complete websocket message on an upgraded connection
+// ============================================================================
+// Abstract like orisha:handler — serve's `! frame` arm routes every complete
+// message here and the default drops it; a claimant implements the tor to do
+// something with them. `f.raw` is the reassembled payload and `f.opcode` is
+// 0x1 text or 0x2 binary. Ping, pong and close never reach the arm — the
+// pump answers control frames at the seam.
+//
+// It is not spelled `frame` because `! frame` lowers to a zig symbol named
+// `frame` — the same fate `arrived` has — and a tor with that name would
+// collide with the arm's own callback in the emitted file.
+
+[abstract|retain]pub tor ws-frame { f: *Exchange }
 
 // ============================================================================
 // HANG-UP — refuse to keep the connection

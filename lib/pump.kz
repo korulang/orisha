@@ -38,6 +38,9 @@ pub const Exchange = struct {
     st: ?*ConnState = null,
     raw: []const u8,
     keep_alive: bool = true,
+    // On a `! frame` dispatch this is the websocket message opcode (0x1 text,
+    // 0x2 binary); on `! arrived` it is 0 and means nothing.
+    opcode: u8 = 0,
 };
 
 const READ_BUFFER = 4096;
@@ -147,11 +150,34 @@ const MAX_TRACKED_FD = 4096;
 // from the unikernel pump too, and `x86_64-freestanding` has no `std.posix`
 // syscall layer to name a descriptor type with. On Linux and macOS `posix.fd_t`
 // already IS `c_int`, so the hosted pumps hand theirs over unchanged.
+// The connection's protocol mode. `http` is every connection at accept; a 101
+// answer flips it to `ws`, after which bytes on the wire are websocket frames
+// and `requestLen` never sees them again.
+pub const ConnMode = enum { http, ws };
+
 pub const ConnState = struct {
     fd: c_int = -1,
     ssl: ?*ServerTls = null,
+    mode: ConnMode = .http,
     buf: [REQUEST_BUFFER]u8 = undefined,
     len: usize = 0,
+    // Websocket reassembly — only meaningful while mode == .ws. `buf` holds
+    // undispatched wire bytes like always; frames too big or fragmented for
+    // one buffer accumulate their (unmasked) payload into `ws_msg`, and the
+    // frame fields carry the in-flight frame's parse state across fills.
+    ws_in_frame: bool = false,
+    ws_need: usize = 0,
+    ws_fin: bool = true,
+    ws_op: u8 = 0,
+    ws_mask: [4]u8 = .{ 0, 0, 0, 0 },
+    ws_seen: usize = 0,
+    ws_msg: std.ArrayListUnmanaged(u8) = .{},
+    ws_msg_op: u8 = 0,
+    ws_msg_open: bool = false,
+    // Control payloads are ≤125 bytes by spec (RFC 6455 §5.5) — they get their
+    // own fixed buffer so a ping mid-fragment never joins the message.
+    ws_ctrl: [125]u8 = undefined,
+    ws_ctrl_len: usize = 0,
 };
 
 var conn_states: [MAX_TRACKED_FD]?*ConnState = .{null} ** MAX_TRACKED_FD;
@@ -208,6 +234,7 @@ fn closeConn(st: *ConnState) void {
         posix.close(@intCast(st.fd));
         st.fd = -1;
     }
+    st.ws_msg.deinit(std.heap.c_allocator);
     st.len = 0;
 }
 
@@ -434,6 +461,151 @@ fn requestWantsClose(raw: []const u8) bool {
 }
 
 // ---------------------------------------------------------------------------
+// Websocket framing — the ws half of ConnState.mode.
+// ---------------------------------------------------------------------------
+// The wire grammar (RFC 6455 §5.2): fin/opcode byte, mask+length byte, 0/2/8
+// extended-length bytes, 0/4 mask-key bytes, payload. Every read boundary can
+// split ANY of those, so parsing is a state machine across fills — ws_in_frame
+// etc. on ConnState — not a slice function like requestLen.
+
+const WsHdr = struct {
+    fin: bool,
+    op: u8,
+    mask: [4]u8, // all-zero when the frame is unmasked, so XOR is uniform
+    len: usize,
+    hdr: usize, // header byte count — consumed before the payload starts
+};
+
+// Parse one frame header, or null when the buffered bytes cannot spell one
+// yet. A 64-bit length with the high bit set is a malformed frame — but so is
+// an unmasked client frame per RFC 6455 §5.3; both are accepted leniently
+// (topcoat's tokio-tungstenite rejects unmasked; the oracle never sends one,
+// so the divergence is unmeasured).
+fn wsHeader(buf: []const u8) ?WsHdr {
+    if (buf.len < 2) return null;
+    const fin = buf[0] & 0x80 != 0;
+    const op = buf[0] & 0x0F;
+    const masked = buf[1] & 0x80 != 0;
+    var len: usize = buf[1] & 0x7F;
+    var i: usize = 2;
+    if (len == 126) {
+        if (buf.len < i + 2) return null;
+        len = std.mem.readInt(u16, buf[i..][0..2], .big);
+        i += 2;
+    } else if (len == 127) {
+        if (buf.len < i + 8) return null;
+        len = @intCast(std.mem.readInt(u64, buf[i..][0..8], .big));
+        i += 8;
+    }
+    var mask: [4]u8 = .{ 0, 0, 0, 0 };
+    if (masked) {
+        if (buf.len < i + 4) return null;
+        @memcpy(&mask, buf[i..][0..4]);
+        i += 4;
+    }
+    return .{ .fin = fin, .op = op, .mask = mask, .len = len, .hdr = i };
+}
+
+// What a completed websocket frame means for the loop. `message` borrows
+// st.ws_msg — valid until the caller clears it, which it must do once `frame`
+// returns. `ping`/`close` borrow st.ws_ctrl. `dead` is a protocol violation:
+// the connection is finished either way.
+const WsItem = union(enum) {
+    message: struct { op: u8, payload: []const u8 },
+    ping: []const u8,
+    close: []const u8,
+    dead,
+};
+
+// Consume bytes for the next dispatchable item. Returns null when nothing
+// complete is buffered. Control frames complete inside one ws_ctrl buffer;
+// data frames append to ws_msg and a fragmented message only surfaces when
+// its final continuation lands.
+fn wsNext(st: *ConnState, consumed: *usize) ?WsItem {
+    while (consumed.* < st.len) {
+        if (!st.ws_in_frame) {
+            const h = wsHeader(st.buf[consumed.*..st.len]) orelse return null;
+            consumed.* += h.hdr;
+            st.ws_in_frame = true;
+            st.ws_op = h.op;
+            st.ws_fin = h.fin;
+            st.ws_need = h.len;
+            st.ws_mask = h.mask;
+            st.ws_seen = 0;
+            st.ws_ctrl_len = 0;
+        }
+        if (st.ws_need > 0) {
+            const take = @min(st.ws_need, st.len - consumed.*);
+            if (st.ws_op >= 0x8) {
+                // A control frame over 125 bytes violates RFC 6455 §5.5.
+                if (st.ws_ctrl_len + take > st.ws_ctrl.len) return .dead;
+                for (st.buf[consumed.* .. consumed.* + take], 0..) |b, k| {
+                    st.ws_ctrl[st.ws_ctrl_len + k] = b ^ st.ws_mask[(st.ws_seen + k) & 3];
+                }
+                st.ws_ctrl_len += take;
+            } else {
+                const base = st.ws_msg.items.len;
+                st.ws_msg.resize(std.heap.c_allocator, base + take) catch return .dead;
+                for (st.buf[consumed.* .. consumed.* + take], 0..) |b, k| {
+                    st.ws_msg.items[base + k] = b ^ st.ws_mask[(st.ws_seen + k) & 3];
+                }
+            }
+            consumed.* += take;
+            st.ws_seen += take;
+            st.ws_need -= take;
+            if (st.ws_need != 0) return null;
+        }
+        // Frame complete.
+        st.ws_in_frame = false;
+        switch (st.ws_op) {
+            0x8 => return .{ .close = st.ws_ctrl[0..st.ws_ctrl_len] },
+            0x9 => return .{ .ping = st.ws_ctrl[0..st.ws_ctrl_len] },
+            0xA => continue, // pong — nothing to answer
+            0x0 => {
+                // Continuation outside a fragmented message violates §5.4.
+                if (!st.ws_msg_open) return .dead;
+                if (st.ws_fin) {
+                    st.ws_msg_open = false;
+                    return .{ .message = .{ .op = st.ws_msg_op, .payload = st.ws_msg.items } };
+                }
+            },
+            0x1, 0x2 => {
+                // A new data frame mid-message violates §5.4.
+                if (st.ws_msg_open) return .dead;
+                st.ws_msg_op = st.ws_op;
+                if (st.ws_fin) {
+                    return .{ .message = .{ .op = st.ws_op, .payload = st.ws_msg.items } };
+                }
+                st.ws_msg_open = true;
+            },
+            else => return .dead,
+        }
+    }
+    return null;
+}
+
+// Emit one unmasked frame — server frames are never masked (§5.1) and never
+// fragmented here: a message the application sent is one frame.
+fn wsSendFrame(st: *ConnState, opcode: u8, payload: []const u8) bool {
+    var hdr: [10]u8 = undefined;
+    hdr[0] = 0x80 | opcode;
+    var hlen: usize = 2;
+    if (payload.len < 126) {
+        hdr[1] = @intCast(payload.len);
+    } else if (payload.len <= 0xFFFF) {
+        hdr[1] = 126;
+        std.mem.writeInt(u16, hdr[2..4], @intCast(payload.len), .big);
+        hlen = 4;
+    } else {
+        hdr[1] = 127;
+        std.mem.writeInt(u64, hdr[2..10], payload.len, .big);
+        hlen = 10;
+    }
+    if (!writeAllConn(st, hdr[0..hlen])) return false;
+    return payload.len == 0 or writeAllConn(st, payload);
+}
+
+// ---------------------------------------------------------------------------
 // The unikernel's sockets, as plain C.
 // ---------------------------------------------------------------------------
 // Unikraft's posix-socket + lwip put these in the image as ordinary symbols in
@@ -564,8 +736,11 @@ fn ukAdmit(incoming: c_int) void {
     uk_seq += 1;
     for (&uk_conns) |*s| {
         if (s.st.fd >= 0) continue;
-        s.st.fd = incoming;
-        s.st.len = 0;
+        // A slot keeps its buffer's ws state across connections otherwise:
+        // the second connection through a slot that ran websocket traffic
+        // would start in ws mode with a half-parsed frame.
+        s.st.ws_msg.deinit(std.heap.c_allocator);
+        s.st = .{ .fd = incoming };
         s.seq = uk_seq;
         s.last_seen = wallClockSeconds(null);
             return;
@@ -576,8 +751,8 @@ fn ukAdmit(incoming: c_int) void {
         if (s.seq < oldest.seq) oldest = s;
     }
     _ = close(oldest.st.fd);
-    oldest.st.fd = incoming;
-    oldest.st.len = 0;
+    oldest.st.ws_msg.deinit(std.heap.c_allocator);
+    oldest.st = .{ .fd = incoming };
     oldest.seq = uk_seq;
     oldest.last_seen = wallClockSeconds(null);
 }
@@ -883,6 +1058,50 @@ fn workerCount() usize {
                         $mod.releaseConn(fd);
                         continue;
                     },
+                }
+
+                // An upgraded connection speaks frames, not requests — wsNext
+                // is the splitter, control frames are answered at the seam,
+                // and complete messages reach the flow's `! frame` arm.
+                if (st.mode == .ws) {
+                    var ws_consumed: usize = 0;
+                    var ws_alive = true;
+                    while (ws_consumed < st.len) {
+                        const item = $mod.wsNext(st, &ws_consumed) orelse break;
+                        switch (item) {
+                            .ping => |pl| {
+                                if (!$mod.wsSendFrame(st, 0xA, pl)) ws_alive = false;
+                            },
+                            .close => |pl| {
+                                _ = $mod.wsSendFrame(st, 0x8, pl);
+                                ws_alive = false;
+                            },
+                            .dead => ws_alive = false,
+                            .message => |m| {
+                                var fx = $mod.Exchange{ .fd = fd, .st = st, .raw = m.payload, .opcode = m.op };
+                                frame(&fx);
+                                st.ws_msg.clearRetainingCapacity();
+                                if (!fx.keep_alive) ws_alive = false;
+                            },
+                        }
+                        if (!ws_alive) break;
+                    }
+                    st.len = $mod.retainTail(&st.buf, st.len, ws_consumed);
+                    if (ws_alive and st.len == st.buf.len) ws_alive = false;
+                    if (!ws_alive) {
+                        $mod.releaseConn(fd);
+                        continue;
+                    }
+                    changes[0] = .{
+                        .ident = @intCast(fd),
+                        .filter = $mod.libc.EVFILT.READ,
+                        .flags = $mod.libc.EV.ADD | $mod.libc.EV.ONESHOT,
+                        .fflags = 0,
+                        .data = 0,
+                        .udata = undefined,
+                    };
+                    _ = $mod.libc.kevent(kq, &changes, 1, &no_changes, 0, null);
+                    continue;
                 }
 
                 // Answer every COMPLETE request; keep any unfinished tail
@@ -1216,21 +1435,27 @@ fn workerCount() usize {
         return .{ .replacement = TH.refuse(allocator, flow, msg) };
     }
 
-    // Partition the site's arms: `!` is `arrived` and nothing else; `|`
-    // answers are `stopped`/`failed`; unlabeled `|>` steps ride the emitted
-    // call in either mode.
+    // Partition the site's arms: `!` is `arrived` (one exchange per request)
+    // or `frame` (one dispatch per complete websocket message); `|` answers
+    // are `stopped`/`failed`; unlabeled `|>` steps ride the emitted call in
+    // either mode.
     var arrived_arm: ?*const ast.Continuation = null;
+    var frame_arm: ?*const ast.Continuation = null;
     var stopped_arm: ?*const ast.Continuation = null;
     var failed_arm: ?*const ast.Continuation = null;
     for (flow.body.continuations) |*cont| {
         const cb = std.mem.trim(u8, cont.branch, " ");
         if (cont.kind == .effect) {
-            if (!std.mem.eql(u8, cb, "arrived") or arrived_arm != null) {
-                const msg = std.fmt.allocPrint(allocator, "orisha/pump:run: `! {s}` doesn't parse on a run call - the pump's effect is `! arrived` (one exchange per request)", .{cb}) catch unreachable;
-                return .{ .replacement = TH.refuse(allocator, flow, msg) };
+            if (std.mem.eql(u8, cb, "arrived") and arrived_arm == null) {
+                arrived_arm = cont;
+                continue;
             }
-            arrived_arm = cont;
-            continue;
+            if (std.mem.eql(u8, cb, "frame") and frame_arm == null) {
+                frame_arm = cont;
+                continue;
+            }
+            const msg = std.fmt.allocPrint(allocator, "orisha/pump:run: `! {s}` doesn't parse on a run call - the pump's effects are `! arrived` (one exchange per request) and `! frame` (one websocket message)", .{cb}) catch unreachable;
+            return .{ .replacement = TH.refuse(allocator, flow, msg) };
         }
         if (cb.len == 0) continue;
         if (std.mem.eql(u8, cb, "stopped")) {
@@ -1429,6 +1654,49 @@ fn workerCount() usize {
                         },
                     }
 
+                    // Upgraded connection: frames, not requests — same seam as
+                    // `init|zig`'s `st.mode == .ws` block above.
+                    if (st.mode == .ws) {
+                        var ws_consumed: usize = 0;
+                        var ws_alive = true;
+                        while (ws_consumed < st.len) {
+                            const item = $mod.wsNext(st, &ws_consumed) orelse break;
+                            switch (item) {
+                                .ping => |pl| {
+                                    if (!$mod.wsSendFrame(st, 0xA, pl)) ws_alive = false;
+                                },
+                                .close => |pl| {
+                                    _ = $mod.wsSendFrame(st, 0x8, pl);
+                                    ws_alive = false;
+                                },
+                                .dead => ws_alive = false,
+                                .message => |m| {
+                                    var fx = $mod.Exchange{ .fd = fd, .st = st, .raw = m.payload, .opcode = m.op };
+                                    frame(&fx);
+                                    st.ws_msg.clearRetainingCapacity();
+                                    if (!fx.keep_alive) ws_alive = false;
+                                },
+                            }
+                            if (!ws_alive) break;
+                        }
+                        st.len = $mod.retainTail(&st.buf, st.len, ws_consumed);
+                        if (ws_alive and st.len == st.buf.len) ws_alive = false;
+                        if (!ws_alive) {
+                            $mod.releaseConn(fd);
+                            continue;
+                        }
+                        changes[0] = .{
+                            .ident = @intCast(fd),
+                            .filter = $mod.libc.EVFILT.READ,
+                            .flags = $mod.libc.EV.ADD | $mod.libc.EV.ONESHOT,
+                            .fflags = 0,
+                            .data = 0,
+                            .udata = undefined,
+                        };
+                        _ = $mod.libc.kevent(kq, &changes, 1, &no_changes, 0, null);
+                        continue;
+                    }
+
                     // Answer every COMPLETE request; keep any unfinished tail
                     // for the next read rather than parsing it as a fresh one.
                     var consumed: usize = 0;
@@ -1588,6 +1856,45 @@ fn workerCount() usize {
                             $mod.releaseConn(fd);
                             continue;
                         },
+                    }
+
+                    // Upgraded connection: frames, not requests — same seam as
+                    // the kqueue pump's `st.mode == .ws` block.
+                    if (st.mode == .ws) {
+                        var ws_consumed: usize = 0;
+                        var ws_alive = true;
+                        while (ws_consumed < st.len) {
+                            const item = $mod.wsNext(st, &ws_consumed) orelse break;
+                            switch (item) {
+                                .ping => |pl| {
+                                    if (!$mod.wsSendFrame(st, 0xA, pl)) ws_alive = false;
+                                },
+                                .close => |pl| {
+                                    _ = $mod.wsSendFrame(st, 0x8, pl);
+                                    ws_alive = false;
+                                },
+                                .dead => ws_alive = false,
+                                .message => |m| {
+                                    var fx = $mod.Exchange{ .fd = fd, .st = st, .raw = m.payload, .opcode = m.op };
+                                    frame(&fx);
+                                    st.ws_msg.clearRetainingCapacity();
+                                    if (!fx.keep_alive) ws_alive = false;
+                                },
+                            }
+                            if (!ws_alive) break;
+                        }
+                        st.len = $mod.retainTail(&st.buf, st.len, ws_consumed);
+                        if (ws_alive and st.len == st.buf.len) ws_alive = false;
+                        if (!ws_alive) {
+                            $mod.releaseConn(fd);
+                            continue;
+                        }
+                        var ws_rearm = linux.epoll_event{
+                            .events = linux.EPOLL.IN | linux.EPOLL.ONESHOT,
+                            .data = .{ .fd = fd },
+                        };
+                        _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &ws_rearm);
+                        continue;
                     }
 
                     // Same shape as the kqueue pump — see requestLen and retainTail.
@@ -1770,6 +2077,44 @@ fn workerCount() usize {
             }
             st.len += @intCast(cqe.res);
 
+            // Upgraded connection: frames, not requests — same seam as the
+            // kqueue pump's `st.mode == .ws` block; the re-arm here is the
+            // next submitted recv rather than a readiness re-arm.
+            if (st.mode == .ws) {
+                var ws_consumed: usize = 0;
+                var ws_alive = true;
+                while (ws_consumed < st.len) {
+                    const item = $mod.wsNext(st, &ws_consumed) orelse break;
+                    switch (item) {
+                        .ping => |pl| {
+                            if (!$mod.wsSendFrame(st, 0xA, pl)) ws_alive = false;
+                        },
+                        .close => |pl| {
+                            _ = $mod.wsSendFrame(st, 0x8, pl);
+                            ws_alive = false;
+                        },
+                        .dead => ws_alive = false,
+                        .message => |m| {
+                            var fx = $mod.Exchange{ .fd = fd, .st = st, .raw = m.payload, .opcode = m.op };
+                            frame(&fx);
+                            st.ws_msg.clearRetainingCapacity();
+                            if (!fx.keep_alive) ws_alive = false;
+                        },
+                    }
+                    if (!ws_alive) break;
+                }
+                st.len = $mod.retainTail(&st.buf, st.len, ws_consumed);
+                if (ws_alive and st.len == st.buf.len) ws_alive = false;
+                if (!ws_alive) {
+                    $mod.releaseConn(fd);
+                    continue;
+                }
+                _ = ring.recv(@intCast(fd), fd, .{ .buffer = st.buf[st.len..] }, 0) catch {
+                    $mod.releaseConn(fd);
+                };
+                continue;
+            }
+
             // Answer every COMPLETE request — the same helpers the other pumps
             // use, so a browser is handled identically here.
             var consumed: usize = 0;
@@ -1906,6 +2251,42 @@ fn workerCount() usize {
             live.seq = $mod.uk_seq;
             live.last_seen = now;
 
+            // Upgraded connection: frames, not requests — same seam as the
+            // kqueue pump's `st.mode == .ws` block. There is no readiness to
+            // re-arm here; the poll loop already waits on every live slot.
+            if (live.st.mode == .ws) {
+                var ws_consumed: usize = 0;
+                var ws_alive = true;
+                while (ws_consumed < live.st.len) {
+                    const item = $mod.wsNext(&live.st, &ws_consumed) orelse break;
+                    switch (item) {
+                        .ping => |pl| {
+                            if (!$mod.wsSendUk(&live.st, 0xA, pl)) ws_alive = false;
+                        },
+                        .close => |pl| {
+                            _ = $mod.wsSendUk(&live.st, 0x8, pl);
+                            ws_alive = false;
+                        },
+                        .dead => ws_alive = false,
+                        .message => |m| {
+                            var fx = $mod.Exchange{ .fd = live.st.fd, .st = &live.st, .raw = m.payload, .opcode = m.op };
+                            frame(&fx);
+                            live.st.ws_msg.clearRetainingCapacity();
+                            if (!fx.keep_alive) ws_alive = false;
+                        },
+                    }
+                    if (!ws_alive) break;
+                }
+                live.st.len = $mod.retainTail(&live.st.buf, live.st.len, ws_consumed);
+                if (ws_alive and live.st.len == live.st.buf.len) ws_alive = false;
+                if (!ws_alive) {
+                    _ = $mod.close(live.st.fd);
+                    live.st.fd = -1;
+                    live.st.len = 0;
+                }
+                continue;
+            }
+
             // Answer every COMPLETE request — see requestLen and retainTail.
             var consumed: usize = 0;
             var alive = true;
@@ -1950,6 +2331,10 @@ fn workerCount() usize {
         x.keep_alive = false;
         return .{ .broken = "write failed" };
     }
+    // A 101 answer is the handshake completing: the bytes that follow on this
+    // connection are websocket frames, so the loop must meet `wsNext`, not
+    // `requestLen`, on the next read.
+    if (head.len >= 13 and std.mem.eql(u8, head[0..13], "HTTP/1.1 101 ")) st.mode = .ws;
     // keep_alive was already resolved at arrival (the pump scans
     // `Connection: close` once when the request lands) — re-scanning the raw
     // request here was a second full pass for the same answer.
@@ -1992,8 +2377,82 @@ fn workerCount() usize {
         body_offset += @intCast(n);
     }
 
+    // Same flip as the hosted reply — see `reply|zig`.
+    if (head.len >= 13 and std.mem.eql(u8, head[0..13], "HTTP/1.1 101 ")) {
+        if (x.st) |st| st.mode = .ws;
+    }
     return .sent;
 }
+
+// The unikernel spelling of wsSendFrame — lwip's `send`, no std.posix.
+fn wsSendUk(st: *ConnState, opcode: u8, payload: []const u8) bool {
+    var hdr: [10]u8 = undefined;
+    hdr[0] = 0x80 | opcode;
+    var hlen: usize = 2;
+    if (payload.len < 126) {
+        hdr[1] = @intCast(payload.len);
+    } else if (payload.len <= 0xFFFF) {
+        hdr[1] = 126;
+        std.mem.writeInt(u16, hdr[2..4], @intCast(payload.len), .big);
+        hlen = 4;
+    } else {
+        hdr[1] = 127;
+        std.mem.writeInt(u64, hdr[2..10], payload.len, .big);
+        hlen = 10;
+    }
+    const segs = [2][]const u8{ hdr[0..hlen], payload };
+    for (segs) |seg| {
+        var offset: usize = 0;
+        while (offset < seg.len) {
+            const n = $mod.send(st.fd, seg.ptr + offset, seg.len - offset, 0);
+            if (n <= 0) return false;
+            offset += @intCast(n);
+        }
+    }
+    return true;
+}
+
+// Send one websocket frame. `opcode` absent means echo the frame being
+// answered — x.opcode carries what `frame` dispatched.
+~proc ws-send|zig {
+    const st = x.st orelse connState(@intCast(x.fd)) orelse {
+        x.keep_alive = false;
+        return;
+    };
+    const op = opcode orelse x.opcode;
+    const wire_op: u8 = if (op == 0) 0x1 else op;
+    if (!$mod.wsSendFrame(st, wire_op, payload)) x.keep_alive = false;
+}
+
+~proc ws-send|unikraft {
+    const st = x.st orelse {
+        x.keep_alive = false;
+        return;
+    };
+    const op = opcode orelse x.opcode;
+    const wire_op: u8 = if (op == 0) 0x1 else op;
+    if (!$mod.wsSendUk(st, wire_op, payload)) x.keep_alive = false;
+}
+
+// Send a close frame and end the connection when the arm returns.
+~proc ws-close|zig {
+    const st = x.st orelse connState(@intCast(x.fd)) orelse {
+        x.keep_alive = false;
+        return;
+    };
+    _ = $mod.wsSendFrame(st, 0x8, "");
+    x.keep_alive = false;
+}
+
+~proc ws-close|unikraft {
+    if (x.st) |st| _ = $mod.wsSendUk(st, 0x8, "");
+    x.keep_alive = false;
+}
+
+// The default ws-frame: a server that never upgrades never sees it, and a
+// claimant that upgrades without implementing it drops messages silently —
+// the same shape `orisha:handler`'s 404 default takes for requests.
+~proc ws-frame|zig {}
 
 // Refuse to keep the connection. The pump closes it when the arm returns.
 ~proc hang-up|zig {

@@ -104,6 +104,7 @@ serve =
     ! arrived x |> orisha/pump:raw(x): raw |> orisha:answer(raw): a |> orisha/pump:reply(x, a.head, a.body, a.date_hole)
         | sent |> orisha:release-body(a.body, allocated: a.body_allocated)
         | broken _ |> orisha:release-body(a.body, allocated: a.body_allocated)
+    ! frame f |> orisha/pump:ws-frame(f)
     | stopped s -> shutdown s
     | failed e -> failed e
 
@@ -152,6 +153,17 @@ pub tor form { req: *Request, name: string } -> ?string
 pub tor query-param { req: *Request, name: string } -> ?string
 
 // ============================================================================
+// WS-ACCEPT — the RFC 6455 handshake value
+// ============================================================================
+// base64(SHA-1(`Sec-WebSocket-Key` + the fixed GUID)) — the one part of an
+// upgrade a handler cannot spell itself. Null when the request carries no
+// key. The answer is a `status: 101` Response whose `extra_headers` spell
+// `Upgrade`/`Connection: Upgrade`/`Sec-WebSocket-Accept`; `answer` emits the
+// 101 head and the pump flips the connection to frames on the way out.
+
+pub tor ws-accept { req: *Request } -> ?string
+
+// ============================================================================
 // PLATFORM SELECTION
 // ============================================================================
 // One line per platform. The pump is what changes; serve never does.
@@ -186,7 +198,9 @@ pub tor query-param { req: *Request, name: string } -> ?string
 // it wants directly instead. See `drive|unikraft` in the companion.
 [build(unikraft)]std/build:variants {
     "orisha/pump:drive": "unikraft",
-    "orisha/pump:reply": "unikraft"
+    "orisha/pump:reply": "unikraft",
+    "orisha/pump:ws-send": "unikraft",
+    "orisha/pump:ws-close": "unikraft"
 }
 | configured _ |> _
 | skipped _ |> _

@@ -24,3 +24,12 @@ frames — calibrated by sabotage before trusted.
 Open: no cancellation (the pump cannot tell a detached thread to stop). The
 preferred future shape is a pump `outbound` event so most push loops need no
 thread at all. Threads are the general hammer.
+
+2026-10-07 — the predicted shape landed, narrower and better than named:
+`! frame` is the inbound arm and `ws-send`/`ws-close` are the outbound
+verbs, scoped to websocket connections a 101 answer upgraded. For the
+bidirectional case no thread is needed at all — a complete message arrives
+reassembled (opcode on the Exchange, control frames answered at the seam)
+and the reply writes a frame inline on the worker. The dup+spawn hammer
+remains for server-initiated pushes with no inbound trigger — SSE,
+timers, broadcasts — which `! frame` does not reach.

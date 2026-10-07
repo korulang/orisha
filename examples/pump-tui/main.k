@@ -32,9 +32,10 @@ std/pump:create(app)
 | drained |> std/io:print.ln("pump drained")
 
 orisha/pump:run(port: 3001)
-! arrived x |> lib/stats:bump() |> orisha/pump:reply(x, head: "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 42\r\nConnection: close\r\n\r\nhello from a pump shared with a vaxis TUI\n", body: "")
+! arrived x |> lib/stats:bump() |> orisha/pump:reply(x, head: "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 42\r\nConnection: close\r\n\r\nhello from a pump shared with a vaxis TUI\n", body: "", date_hole: 0)
     | sent |> _
     | broken _ |> _
+! frame f |> orisha/pump:ws-frame(f)
 | failed e |> std/io:print.ln("orisha failed: {{ e:s }}")
 | stopped |> std/io:print.ln("orisha stopped")
 
