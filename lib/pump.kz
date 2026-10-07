@@ -2418,6 +2418,7 @@ fn workerCount() usize {
 // already holds a whole rendered response passes it as `head` with an empty
 // `body`, which is what a pre-rendered static route does.
 ~proc reply|zig {
+    if (hang) x.keep_alive = false;
     const st = x.st orelse connState(@intCast(x.fd)) orelse {
         x.keep_alive = false;
         return .{ .broken = "write failed" };
@@ -2436,6 +2437,10 @@ fn workerCount() usize {
         if (body.len > 0) {
             if (!wsSendFrame(st, 0x1, body)) x.keep_alive = false;
         }
+        // RFC 6455: a close frame's payload opens with the 2-byte status —
+        // empty would wire as 1005 (no status), not the 1000 a refused
+        // protocol upgrade must send.
+        if (!x.keep_alive) _ = wsSendFrame(st, 0x8, "\x03\xe8");
     } else {
         if (!writevAllConn(st, head, body, date_hole)) {
             x.keep_alive = false;
@@ -2455,6 +2460,7 @@ fn workerCount() usize {
 // no implementation on a freestanding target; `send` is the same loop over the
 // socket symbol the pump already uses.
 ~proc reply|unikraft {
+    if (hang) x.keep_alive = false;
     // No scatter write here either — a holed head goes out as three sends:
     // up to the insertion point, the Date line, the rest.
     const segs = if (date_hole != 0)
@@ -2482,6 +2488,7 @@ fn workerCount() usize {
             if (body.len > 0) {
                 if (!$mod.wsSendUk(st, 0x1, body)) x.keep_alive = false;
             }
+            if (!x.keep_alive) _ = $mod.wsSendUk(st, 0x8, "");
         }
     } else {
         var body_offset: usize = 0;
@@ -2553,12 +2560,14 @@ fn wsSendUk(st: *ConnState, opcode: u8, payload: []const u8) bool {
         x.keep_alive = false;
         return;
     };
-    _ = $mod.wsSendFrame(st, 0x8, "");
+    // 0x03e8 = 1000, normal closure — the code a server-initiated teardown
+    // owes the peer (an empty payload wires as 1005 "no status").
+    _ = $mod.wsSendFrame(st, 0x8, "\x03\xe8");
     x.keep_alive = false;
 }
 
 ~proc ws-close|unikraft {
-    if (x.st) |st| _ = $mod.wsSendUk(st, 0x8, "");
+    if (x.st) |st| _ = $mod.wsSendUk(st, 0x8, "\x03\xe8");
     x.keep_alive = false;
 }
 

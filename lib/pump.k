@@ -112,9 +112,14 @@ pub tor deinit {}
 // ============================================================================
 // `head` and `body` go out in that order; a caller that already holds a whole
 // rendered response passes it as `head` with an empty `body`, which is what a
-// pre-rendered static route does.
+// pre-rendered static route does. `hang` is the handler's `Response.close`
+// carried through `answer` — named for `hang-up` because a bare `close`
+// shadows libc's own decl inside the emitted module: the reply goes out and
+// the connection does not stay — on a 101 the body lands as the first frame,
+// a close frame follows, and the pump reaps, so a protocol can refuse a
+// socket cleanly.
 
-pub tor reply { x: *Exchange, head: string, body: string, date_hole: usize }
+pub tor reply { x: *Exchange, head: string, body: string, date_hole: usize, hang: bool }
 | sent
 | broken string
 

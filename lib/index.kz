@@ -50,6 +50,10 @@ pub const Request = struct {
     // from the request bytes. `header`/`cookie` scan it lazily on demand, so
     // a route that never asks pays one slice store and nothing else.
     headers: ?[]const u8 = null,
+    // The descriptor the request arrived on — the same integer `pump:fileno`
+    // reports and `ws-send-fd` addresses. 0 on transports with no descriptor
+    // (the wasm host builds its Request itself and passes none).
+    fd: usize = 0,
 
     // For param extraction by router
     allocator: std.mem.Allocator,
@@ -249,6 +253,11 @@ pub const Response = struct {
     // Default false so existing `{ status, body, content_type }` produces stay
     // honest — they do not own the bytes.
     body_allocated: bool = false,
+    // `close: true` answers then drops the connection — the handler's half of
+    // `pump:hang-up`, which a Response can carry because the handler never
+    // sees the Exchange. On a 101 it means "frame the body, send a close
+    // frame, hang up" — Action Cable's reject-unauthorized reads exactly so.
+    close: bool = false,
 };
 
 // The header is built into a buffer that outlives the frame, because `answer`
@@ -573,6 +582,7 @@ const RESPONSE_500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\
         .accept_encoding = accept_encoding,
         .if_none_match = client_etag,
         .headers = headers_block,
+        .fd = fd,
         .allocator = req_allocator,
     };
 
@@ -589,7 +599,7 @@ const RESPONSE_500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\
         // `date_hole` is that insertion offset; 0 means "head is already
         // complete" and every non-baked head takes it.
         const hole = if (std.mem.indexOfScalar(u8, res.body, '\r')) |cr| cr + 2 else 0;
-        return .{ .head = res.body, .body = "", .body_allocated = false, .date_hole = hole };
+        return .{ .head = res.body, .body = "", .body_allocated = false, .date_hole = hole, .close = res.close };
     }
 
     // `content_type: null` means NO Content-Type header — a bare redirect or
@@ -612,7 +622,7 @@ const RESPONSE_500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\
     const extras: []const u8 = if (res.extra_headers) |raw_extras| blk: {
         if (!extraHeadersWellFormed(raw_extras)) {
             if (res.body_allocated) koru_allocator().free(res.body);
-            return .{ .head = RESPONSE_500, .body = "", .body_allocated = false, .date_hole = 0 };
+            return .{ .head = RESPONSE_500, .body = "", .body_allocated = false, .date_hole = 0, .close = res.close };
         }
         break :blk raw_extras;
     } else "";
@@ -635,9 +645,9 @@ const RESPONSE_500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\
             .{ extras, &date_buf },
         ) catch {
             if (res.body_allocated) koru_allocator().free(res.body);
-            return .{ .head = RESPONSE_500, .body = "", .body_allocated = false, .date_hole = 0 };
+            return .{ .head = RESPONSE_500, .body = "", .body_allocated = false, .date_hole = 0, .close = res.close };
         };
-        return .{ .head = head101, .body = res.body, .body_allocated = res.body_allocated, .date_hole = 0 };
+        return .{ .head = head101, .body = res.body, .body_allocated = res.body_allocated, .date_hole = 0, .close = res.close };
     }
 
     // A bufPrint failure answers null now, not the canned 500, so the leg
@@ -669,15 +679,23 @@ const RESPONSE_500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\
 
     const head_slice = head orelse {
         if (res.body_allocated) koru_allocator().free(res.body);
-        return .{ .head = RESPONSE_500, .body = "", .body_allocated = false, .date_hole = 0 };
+        return .{ .head = RESPONSE_500, .body = "", .body_allocated = false, .date_hole = 0, .close = res.close };
     };
-    return .{ .head = head_slice, .body = res.body, .body_allocated = res.body_allocated, .date_hole = 0 };
+    return .{ .head = head_slice, .body = res.body, .body_allocated = res.body_allocated, .date_hole = 0, .close = res.close };
 }
 
 ~proc release-body|zig {
     if (allocated) {
         koru_allocator().free(body);
     }
+}
+
+// The descriptor the request arrived on — the handler's half of
+// `pump:fileno`. Names the connection so a route can register it for
+// `ws-send-fd` pushes or ask `ws-shut`-style teardown without ever seeing
+// the Exchange itself.
+~proc fd|zig {
+    return req.fd;
 }
 
 // The lazy read over `req.headers`: scan the block only when a handler asks.

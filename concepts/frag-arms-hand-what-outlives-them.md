@@ -43,3 +43,12 @@ a per-connection mutex serializes inbound-arm replies against
 fd-addressed sends, and release waits on that mutex so no send meets
 freed state. For websocket protocols the detached thread is now the
 exception, not the shape.
+
+2026-10-07 — the handler can now name and refuse its own connection.
+`Request.fd` carries the descriptor `answer` received and `orisha:fd`
+reads it, so an upgrade route can register the fd for later `ws-send-fd`
+pushes without ever seeing the Exchange. `Response.close` rides the
+answer record into `reply`'s new `hang` parameter: the reply goes out
+and the pump reaps — on a 101 that means handshake, first frame, close
+frame (1000, not the empty payload that wires as 1005), teardown. A
+protocol can refuse a socket cleanly instead of hanging it half-open.
