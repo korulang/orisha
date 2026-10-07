@@ -137,7 +137,11 @@ fn requestLen(buf: []const u8) ?usize {
 // and what it renders depends on where the split happened to land. That is the
 // "sometimes it works" shape.
 const REQUEST_BUFFER = 16 * 1024;
-const MAX_TRACKED_FD = 4096;
+// The fd table is indexed by descriptor value, so the bound must cover the
+// socket numbers a burst actually issues — the harness runs profiles at
+// 16384 conns with nofile=1048576, and every fd past the old 4096 cap was
+// silently close()d at registration.
+const MAX_TRACKED_FD = 1 << 20;
 
 // One connection, and everything reading it needs: the socket, the bytes held
 // so far, and how many of them there are.
@@ -204,6 +208,11 @@ pub const ConnState = struct {
     // later answer writes can overtake it.
     pending: std.ArrayListUnmanaged(u8) = .{},
     pending_off: usize = 0,
+    // Dispatch-loop batching: while the request loop runs, replies append to
+    // pending WITHOUT flushing — a pipelined batch of N answers leaves in one
+    // write instead of N writev syscalls. Owner-thread only; ws-mode appends
+    // serialize through ws_mu because ws-send-fd may write from a pusher.
+    batching: bool = false,
     // A closing answer (Connection: close, a ws close frame, a refused
     // upgrade) landed while pending still holds bytes. The close must wait
     // for the drain — closing early would cut the response mid-flight.
@@ -337,6 +346,25 @@ fn flushPending(st: *ConnState) Flush {
     return .drained;
 }
 
+// Batch append: queue without flushing. Over the cap the socket drains
+// inline first — a full queue is the socket's problem, not the app's.
+// ws-mode conns append under ws_mu: ws-send-fd writes can race the owner's
+// post-upgrade replies on the shared ArrayList.
+fn appendPending(st: *ConnState, segments: []const []const u8) bool {
+    const lock_it = st.mode == .ws;
+    if (lock_it) st.ws_mu.lock();
+    defer if (lock_it) st.ws_mu.unlock();
+    var need: usize = 0;
+    for (segments) |seg| need += seg.len;
+    if (st.pending.items.len + need > MAX_PENDING) {
+        if (flushPending(st) == .dead) return false;
+        if (st.pending.items.len + need > MAX_PENDING) return false;
+    }
+    st.pending.ensureUnusedCapacity(std.heap.c_allocator, need) catch return false;
+    for (segments) |seg| st.pending.appendSliceAssumeCapacity(seg);
+    return true;
+}
+
 // Append an ordered segment to the queue and try to drain — the shape every
 // write takes when the queue is already holding bytes or the cipher needs
 // one contiguous buffer. `false` means dead, never merely unwritten.
@@ -381,6 +409,7 @@ fn tlsWriteOrQueue(st: *ConnState, segments: []const []const u8) bool {
 }
 
 fn writeAllConn(st: *ConnState, data: []const u8) bool {
+    if (st.batching) return appendPending(st, &.{data});
     if (HAS_OPENSSL) {
         if (st.ssl != null) {
             return tlsWriteOrQueue(st, &.{data});
@@ -420,20 +449,17 @@ fn writeAllOrQueue(st: *ConnState, data: []const u8) bool {
 // orisha module's per-second threadlocal buffer: a lookup, not a format.
 fn writevAllConn(st: *ConnState, head: []const u8, body: []const u8, date_hole: usize) bool {
     const date_line: []const u8 = if (date_hole != 0) @import("root").koru_orisha.httpDateLine() else "";
+    const segs: [4][]const u8 = if (date_hole != 0)
+        .{ head[0..date_hole], date_line, head[date_hole..], body }
+    else
+        .{ head, body, "", "" };
+    if (st.batching) return appendPending(st, &segs);
     if (HAS_OPENSSL) {
         if (st.ssl != null) {
-            const segs = if (date_hole != 0)
-                [4][]const u8{ head[0..date_hole], date_line, head[date_hole..], body }
-            else
-                [4][]const u8{ head, body, "", "" };
             return tlsWriteOrQueue(st, &segs);
         }
     }
     if (pendingLen(st) > 0) {
-        const segs = if (date_hole != 0)
-            [4][]const u8{ head[0..date_hole], date_line, head[date_hole..], body }
-        else
-            [4][]const u8{ head, body, "", "" };
         return queueAndFlush(st, &segs);
     }
     var iov = [4]posix.iovec_const{
@@ -463,14 +489,14 @@ fn writevAllConn(st: *ConnState, head: []const u8, body: []const u8, date_hole: 
             error.WouldBlock => {
                 // The socket is full — the unwritten iovec tail becomes
                 // pending bytes and a write-ready event finishes the send.
-                var segs: [4][]const u8 = undefined;
+                var tail_segs: [4][]const u8 = undefined;
                 var seg_count: usize = 0;
                 for (iov[idx..iov_count]) |v| {
                     if (v.len == 0) continue;
-                    segs[seg_count] = v.base[0..v.len];
+                    tail_segs[seg_count] = v.base[0..v.len];
                     seg_count += 1;
                 }
-                return queueAndFlush(st, segs[0..seg_count]);
+                return queueAndFlush(st, tail_segs[0..seg_count]);
             },
             else => return false,
         };
@@ -1181,7 +1207,7 @@ fn openListener(port: u16) ?std.net.Server {
     const address = std.net.Address.parseIp("0.0.0.0", port) catch return null;
     return address.listen(.{
         .reuse_address = true,
-        .kernel_backlog = 512,
+        .kernel_backlog = 16384,
     }) catch null;
 }
 
@@ -1433,6 +1459,9 @@ fn workerCount() usize {
 
                 // Answer every COMPLETE request; keep any unfinished tail
                 // for the next read rather than parsing it as a fresh one.
+                // Replies batch in pending — one flush per read event, not
+                // one syscall per answer.
+                st.batching = true;
                 var consumed: usize = 0;
                 var alive = true;
                 while (consumed < st.len) {
@@ -1446,6 +1475,8 @@ fn workerCount() usize {
                         break;
                     }
                 }
+                st.batching = false;
+                _ = $mod.flushPending(st);
                 st.len = $mod.retainTail(&st.buf, st.len, consumed);
 
                 // Headers that never end are not a request this server can answer.
@@ -2070,6 +2101,9 @@ fn workerCount() usize {
 
                     // Answer every COMPLETE request; keep any unfinished tail
                     // for the next read rather than parsing it as a fresh one.
+                    // Replies batch in pending — one flush per read event, not
+                    // one syscall per answer.
+                    st.batching = true;
                     var consumed: usize = 0;
                     var alive = true;
                     while (consumed < st.len) {
@@ -2083,6 +2117,8 @@ fn workerCount() usize {
                             break;
                         }
                     }
+                    st.batching = false;
+                    _ = $mod.flushPending(st);
                     st.len = $mod.retainTail(&st.buf, st.len, consumed);
 
                     // Headers that never end are not a request this server can answer.
@@ -2345,6 +2381,8 @@ fn workerCount() usize {
                     }
 
                     // Same shape as the kqueue pump — see requestLen and retainTail.
+                    // Replies batch in pending — one flush per read event.
+                    st.batching = true;
                     var consumed: usize = 0;
                     var alive = true;
                     while (consumed < st.len) {
@@ -2358,6 +2396,8 @@ fn workerCount() usize {
                             break;
                         }
                     }
+                    st.batching = false;
+                    _ = $mod.flushPending(st);
                     st.len = $mod.retainTail(&st.buf, st.len, consumed);
                     if (alive and st.len == st.buf.len) alive = false;
 
@@ -2582,6 +2622,8 @@ fn workerCount() usize {
 
             // Answer every COMPLETE request — the same helpers the other pumps
             // use, so a browser is handled identically here.
+            // Replies batch in pending — one flush per read event.
+            st.batching = true;
             var consumed: usize = 0;
             var alive = true;
             while (consumed < st.len) {
@@ -2595,6 +2637,8 @@ fn workerCount() usize {
                     break;
                 }
             }
+            st.batching = false;
+            _ = $mod.flushPending(st);
             st.len = $mod.retainTail(&st.buf, st.len, consumed);
             if (alive and st.len == st.buf.len) alive = false;
 
@@ -2803,6 +2847,11 @@ fn workerCount() usize {
             return .{ .broken = "write failed" };
         }
         st.mode = .ws;
+        // Frames must not join a still-batching queue: wsSendFrame holds ws_mu,
+        // and appendPending's ws-mode guard would try to take it again. The
+        // head is flushed now — order on the wire is head, then this frame.
+        st.batching = false;
+        _ = flushPending(st);
         if (body.len > 0) {
             if (!wsSendFrame(st, 0x1, body)) x.keep_alive = false;
         }
