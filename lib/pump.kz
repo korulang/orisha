@@ -192,6 +192,27 @@ pub const ConnState = struct {
     // own fixed buffer so a ping mid-fragment never joins the message.
     ws_ctrl: [125]u8 = undefined,
     ws_ctrl_len: usize = 0,
+    // TLS handshake still in flight. The fd registered with the reactor
+    // BEFORE SSL_accept finished — the owning worker steps it once per
+    // readiness event, and no bytes are framed as a request until it clears.
+    // This replaces a single accept thread doing every SSL_accept
+    // synchronously, which serialised all handshake crypto onto one core.
+    tls_hs: bool = false,
+    // Output accepted from the app faster than the socket took it. Writes
+    // append at the tail, a readiness-for-write event drains from
+    // pending_off, and the queue keeps ordering without a copy: nothing a
+    // later answer writes can overtake it.
+    pending: std.ArrayListUnmanaged(u8) = .{},
+    pending_off: usize = 0,
+    // A closing answer (Connection: close, a ws close frame, a refused
+    // upgrade) landed while pending still holds bytes. The close must wait
+    // for the drain — closing early would cut the response mid-flight.
+    close_when_drained: bool = false,
+    // The readiness queue this conn is armed on (a worker's kqueue, or the
+    // shared epoll fd) — set at registration. A `ws-send-fd` write from a
+    // pusher thread that stalls must re-arm write readiness on the owner,
+    // or the queued tail would wait for traffic that may never come.
+    owner_q: i32 = -1,
 };
 
 var conn_states: [MAX_TRACKED_FD]?*ConnState = .{null} ** MAX_TRACKED_FD;
@@ -265,6 +286,7 @@ fn closeConn(st: *ConnState) void {
         st.fd = -1;
     }
     st.ws_msg.deinit(std.heap.c_allocator);
+    st.pending.deinit(std.heap.c_allocator);
     st.len = 0;
 }
 
@@ -274,20 +296,123 @@ fn shutdownConn(st: *ConnState) void {
     }
 }
 
-fn writeAllConn(st: *ConnState, data: []const u8) bool {
-    if (HAS_OPENSSL) {
-        if (st.ssl) |tls| {
-            const mod = @import("root").koru_koru.koru_openssl;
-            const s = tls.ssl orelse return false;
-            return mod.sslWriteAll(s, st.fd, data, std.heap.page_allocator);
+// A stalled peer must not stall the worker. `pending` is the answer a write
+// couldn't deliver: bytes land there ordered, a readiness-for-write event
+// drains them, and the reactor keeps moving. Above MAX_PENDING the peer is
+// not slow, it is gone — the connection dies rather than buffering forever.
+const MAX_PENDING: usize = 1 << 20;
+
+const Flush = enum { drained, stalled, dead };
+
+fn pendingLen(st: *ConnState) usize {
+    return st.pending.items.len - st.pending_off;
+}
+
+// Push what the socket will take right now, no waiting. `stalled` leaves the
+// tail in pending for a write-ready event; the rearm that follows every
+// dispatch is what asks the reactor for it.
+fn flushPending(st: *ConnState) Flush {
+    while (st.pending_off < st.pending.items.len) {
+        if (HAS_OPENSSL) {
+            if (st.ssl) |tls| {
+                const mod = @import("root").koru_koru.koru_openssl;
+                const s = tls.ssl orelse return .dead;
+                switch (mod.sslWriteSome(s, st.pending.items[st.pending_off..])) {
+                    .wrote => |n| st.pending_off += n,
+                    .want_read, .want_write => return .stalled,
+                    .failed => return .dead,
+                }
+                continue;
+            }
+        }
+        const n = posix.write(@intCast(st.fd), st.pending.items[st.pending_off..]) catch |err| switch (err) {
+            error.WouldBlock => return .stalled,
+            else => return .dead,
+        };
+        if (n == 0) return .dead;
+        st.pending_off += n;
+    }
+    st.pending.clearRetainingCapacity();
+    st.pending_off = 0;
+    return .drained;
+}
+
+// Append an ordered segment to the queue and try to drain — the shape every
+// write takes when the queue is already holding bytes or the cipher needs
+// one contiguous buffer. `false` means dead, never merely unwritten.
+fn queueAndFlush(st: *ConnState, segments: []const []const u8) bool {
+    var need: usize = 0;
+    for (segments) |seg| need += seg.len;
+    if (st.pending.items.len + need > MAX_PENDING) return false;
+    st.pending.ensureUnusedCapacity(std.heap.c_allocator, need) catch return false;
+    for (segments) |seg| st.pending.appendSliceAssumeCapacity(seg);
+    return flushPending(st) != .dead;
+}
+
+// TLS write path: hand each segment to SSL_write directly and only queue what
+// the cipher refuses — the common case never touches `pending`, so a response
+// does not pay an allocation + copy before encryption. Ordering is the queue's
+// job once it holds bytes, so a stalled conn falls back to queueAndFlush.
+fn tlsWriteOrQueue(st: *ConnState, segments: []const []const u8) bool {
+    const mod = @import("root").koru_koru.koru_openssl;
+    const s = st.ssl.?.ssl orelse return false;
+    if (pendingLen(st) > 0) return queueAndFlush(st, segments);
+    for (segments, 0..) |seg, si| {
+        var off: usize = 0;
+        while (off < seg.len) {
+            switch (mod.sslWriteSome(s, seg[off..])) {
+                .wrote => |n| off += n,
+                .want_read, .want_write => {
+                    // Queue the unwritten remainder — this segment's tail plus
+                    // every segment after it.
+                    var need: usize = seg.len - off;
+                    for (segments[si + 1 ..]) |rest| need += rest.len;
+                    if (st.pending.items.len + need > MAX_PENDING) return false;
+                    st.pending.ensureUnusedCapacity(std.heap.c_allocator, need) catch return false;
+                    st.pending.appendSliceAssumeCapacity(seg[off..]);
+                    for (segments[si + 1 ..]) |rest| st.pending.appendSliceAssumeCapacity(rest);
+                    return true;
+                },
+                .failed => return false,
+            }
         }
     }
-    return writeAll(@intCast(st.fd), data);
+    return true;
+}
+
+fn writeAllConn(st: *ConnState, data: []const u8) bool {
+    if (HAS_OPENSSL) {
+        if (st.ssl != null) {
+            return tlsWriteOrQueue(st, &.{data});
+        }
+    }
+    if (pendingLen(st) > 0) return queueAndFlush(st, &.{data});
+    return writeAllOrQueue(st, data);
+}
+
+// Cleartext fast path: write straight through, and only when the kernel
+// refuses mid-write does the remainder become pending bytes. Keeps the
+// no-stall case allocation-free.
+fn writeAllOrQueue(st: *ConnState, data: []const u8) bool {
+    var offset: usize = 0;
+    while (offset < data.len) {
+        const n = posix.write(@intCast(st.fd), data[offset..]) catch |err| switch (err) {
+            error.WouldBlock => {
+                const segs = [_][]const u8{data[offset..]};
+                return queueAndFlush(st, &segs);
+            },
+            else => return false,
+        };
+        if (n == 0) return false;
+        offset += @intCast(n);
+    }
+    return true;
 }
 
 // head+body in ONE syscall — writev gathers both without a copy. TLS is a
-// stream cipher with no scatter write, so the ssl leg keeps two sslWriteAll
-// calls; cleartext (the benchmark path) goes out as a single segment.
+// stream cipher with no scatter write: the ssl leg stages head+body into
+// pending as ONE buffer, so a response leaves as a single TLS record instead
+// of four sslWriteAll calls each paying a record of crypto.
 //
 // `date_hole` is where a `Date:` line belongs inside `head` — baked static
 // responses are const rodata and cannot be patched, so the line goes out as a
@@ -296,18 +421,20 @@ fn writeAllConn(st: *ConnState, data: []const u8) bool {
 fn writevAllConn(st: *ConnState, head: []const u8, body: []const u8, date_hole: usize) bool {
     const date_line: []const u8 = if (date_hole != 0) @import("root").koru_orisha.httpDateLine() else "";
     if (HAS_OPENSSL) {
-        if (st.ssl) |tls| {
-            const mod = @import("root").koru_koru.koru_openssl;
-            const s = tls.ssl orelse return false;
-            const ok_head = if (date_hole != 0)
-                mod.sslWriteAll(s, st.fd, head[0..date_hole], std.heap.page_allocator) and
-                    mod.sslWriteAll(s, st.fd, date_line, std.heap.page_allocator) and
-                    mod.sslWriteAll(s, st.fd, head[date_hole..], std.heap.page_allocator)
+        if (st.ssl != null) {
+            const segs = if (date_hole != 0)
+                [4][]const u8{ head[0..date_hole], date_line, head[date_hole..], body }
             else
-                mod.sslWriteAll(s, st.fd, head, std.heap.page_allocator);
-            return ok_head and
-                (body.len == 0 or mod.sslWriteAll(s, st.fd, body, std.heap.page_allocator));
+                [4][]const u8{ head, body, "", "" };
+            return tlsWriteOrQueue(st, &segs);
         }
+    }
+    if (pendingLen(st) > 0) {
+        const segs = if (date_hole != 0)
+            [4][]const u8{ head[0..date_hole], date_line, head[date_hole..], body }
+        else
+            [4][]const u8{ head, body, "", "" };
+        return queueAndFlush(st, &segs);
     }
     var iov = [4]posix.iovec_const{
         .{ .base = head.ptr, .len = head.len },
@@ -334,11 +461,16 @@ fn writevAllConn(st: *ConnState, head: []const u8, body: []const u8, date_hole: 
     while (total > 0) {
         const n = posix.writev(@intCast(st.fd), iov[idx..][0 .. iov_count - idx]) catch |err| switch (err) {
             error.WouldBlock => {
-                var pfd = [_]posix.pollfd{.{ .fd = @intCast(st.fd), .events = posix.POLL.OUT, .revents = 0 }};
-                const ready = posix.poll(&pfd, WRITE_WAIT_MS) catch return false;
-                if (ready == 0) return false;
-                if (pfd[0].revents & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) return false;
-                continue;
+                // The socket is full — the unwritten iovec tail becomes
+                // pending bytes and a write-ready event finishes the send.
+                var segs: [4][]const u8 = undefined;
+                var seg_count: usize = 0;
+                for (iov[idx..iov_count]) |v| {
+                    if (v.len == 0) continue;
+                    segs[seg_count] = v.base[0..v.len];
+                    seg_count += 1;
+                }
+                return queueAndFlush(st, segs[0..seg_count]);
             },
             else => return false,
         };
@@ -664,7 +796,28 @@ fn wsSendFd(fd: usize, opcode: u8, payload: []const u8) bool {
     st.ws_mu.lock();
     conn_states_mu.unlock();
     defer st.ws_mu.unlock();
-    return wsSendFrameRaw(st, opcode, payload);
+    const ok = wsSendFrameRaw(st, opcode, payload);
+    // A stalled queue written from off the owning worker needs the owner's
+    // write-readiness armed explicitly — nobody else will.
+    if (pendingLen(st) > 0) armOwnerWrite(st);
+    return ok;
+}
+
+// Re-arm write readiness on whatever reactor owns this conn — used by
+// cross-thread sends (ws-send-fd) that left bytes in the queue. The pump is
+// comptime-selected per binary, so `owner_q` means exactly one thing.
+fn armOwnerWrite(st: *ConnState) void {
+    if (st.owner_q < 0) return;
+    if (@import("builtin").os.tag == .linux) {
+        const linux = std.os.linux;
+        var wait = linux.epoll_event{
+            .events = linux.EPOLL.IN | linux.EPOLL.OUT | linux.EPOLL.ONESHOT,
+            .data = .{ .fd = st.fd },
+        };
+        _ = linux.epoll_ctl(st.owner_q, linux.EPOLL.CTL_MOD, st.fd, &wait);
+    } else {
+        armKqueueFilter(st.owner_q, st.fd, libc.EVFILT.WRITE);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -835,12 +988,12 @@ fn ukAdmit(incoming: c_int) ?c_int {
     return if (evicted_ws) evicted_fd else null;
 }
 
-fn armKqueueRead(kq: i32, fd: posix.fd_t) void {
+fn armKqueueFilter(kq: i32, fd: posix.fd_t, filter: i16) void {
     var changes: [1]libc.Kevent = undefined;
     var none: [0]libc.Kevent = undefined;
     changes[0] = .{
         .ident = @intCast(fd),
-        .filter = libc.EVFILT.READ,
+        .filter = filter,
         .flags = libc.EV.ADD | libc.EV.ONESHOT,
         .fflags = 0,
         .data = 0,
@@ -849,12 +1002,54 @@ fn armKqueueRead(kq: i32, fd: posix.fd_t) void {
     _ = libc.kevent(kq, &changes, 1, &none, 0, null);
 }
 
-fn acceptTlsHandshake(client_fd: c_int) ?*ServerTls {
+fn armKqueueRead(kq: i32, fd: posix.fd_t) void {
+    armKqueueFilter(kq, fd, libc.EVFILT.READ);
+}
+
+// The kqueue spelling of the same mask epollMask builds: a closing conn asks
+// only to drain, a queued-up conn adds EVFILT_WRITE, a live conn keeps
+// reading. Two filters are two change entries — there is no combined event.
+fn kqueueRearm(kq: i32, fd: posix.fd_t, st: *ConnState) void {
+    var changes: [2]libc.Kevent = undefined;
+    var count: usize = 0;
+    if (!st.close_when_drained) {
+        changes[count] = .{
+            .ident = @intCast(fd),
+            .filter = libc.EVFILT.READ,
+            .flags = libc.EV.ADD | libc.EV.ONESHOT,
+            .fflags = 0,
+            .data = 0,
+            .udata = undefined,
+        };
+        count += 1;
+    }
+    if (st.pending_off < st.pending.items.len) {
+        changes[count] = .{
+            .ident = @intCast(fd),
+            .filter = libc.EVFILT.WRITE,
+            .flags = libc.EV.ADD | libc.EV.ONESHOT,
+            .fflags = 0,
+            .data = 0,
+            .udata = undefined,
+        };
+        count += 1;
+    }
+    if (count == 0) return;
+    var none: [0]libc.Kevent = undefined;
+    _ = libc.kevent(kq, &changes, @intCast(count), &none, 0, null);
+}
+
+// Create the SSL and bind the descriptor — nothing more. The handshake
+// itself is deliberately NOT here: SSL_accept drives out of the owning
+// worker's event loop (driveTlsHandshake, one step per readiness event), so
+// the crypto of a thousand simultaneous handshakes spreads across every
+// worker instead of queueing behind one accept thread.
+fn beginTlsHandshake(client_fd: c_int) ?*ServerTls {
     if (HAS_OPENSSL) {
         const openssl = @import("root").koru_koru.koru_openssl;
         const ctx = tls_server_ctx orelse return null;
-        const accepted = openssl.acceptServerSsl(ctx, client_fd, std.heap.page_allocator);
-        return switch (accepted) {
+        const begun = openssl.acceptBegin(ctx, client_fd, std.heap.page_allocator);
+        return switch (begun) {
             .ok => |ssl| blk: {
                 // The pump wraps the raw handle in the package's Tls so
                 // `ConnState.ssl` names what it is — an open TLS connection.
@@ -881,6 +1076,28 @@ fn acceptTlsHandshake(client_fd: c_int) ?*ServerTls {
     return null;
 }
 
+const TlsStep = enum { ready, want_read, want_write, failed };
+
+// One non-blocking SSL_accept step. `want_*` names the readiness the caller
+// must re-arm; `failed` is a dead connection, already queue-drained.
+fn driveTlsHandshake(st: *ConnState) TlsStep {
+    if (HAS_OPENSSL) {
+        const openssl = @import("root").koru_koru.koru_openssl;
+        if (st.ssl) |tls| {
+            const s = tls.ssl orelse return .failed;
+            return switch (openssl.driveAccept(s)) {
+                .ready => .ready,
+                .want_read => .want_read,
+                .want_write => .want_write,
+                .failed => .failed,
+            };
+        }
+    } else {
+        std.mem.doNotOptimizeAway(st);
+    }
+    return .failed;
+}
+
 fn registerClient(client_fd: posix.fd_t, ssl: ?*ServerTls, kq: i32) void {
     disableNagle(client_fd);
     markNonBlocking(client_fd);
@@ -896,6 +1113,8 @@ fn registerClient(client_fd: posix.fd_t, ssl: ?*ServerTls, kq: i32) void {
         return;
     };
     st.ssl = ssl;
+    st.tls_hs = ssl != null;
+    st.owner_q = kq;
     armKqueueRead(kq, client_fd);
 }
 
@@ -915,11 +1134,24 @@ fn registerClientEpoll(client_fd: posix.fd_t, ssl: ?*ServerTls, epfd: i32) void 
         return;
     };
     st.ssl = ssl;
+    st.tls_hs = ssl != null;
+    st.owner_q = epfd;
     var client_event = linux.epoll_event{
         .events = linux.EPOLL.IN | linux.EPOLL.ONESHOT,
         .data = .{ .fd = client_fd },
     };
     _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_ADD, client_fd, &client_event);
+}
+
+// The readiness a conn wants next, as epoll bits: a closing conn asks only
+// to drain, a queued-up conn asks for write-ready as well as reads, and a
+// live conn keeps reading. ONESHOT does the once-per-worker handoff.
+fn epollMask(st: *ConnState) u32 {
+    const linux = std.os.linux;
+    var mask: u32 = linux.EPOLL.ONESHOT;
+    if (!st.close_when_drained) mask |= linux.EPOLL.IN;
+    if (st.pending_off < st.pending.items.len) mask |= linux.EPOLL.OUT;
+    return mask;
 }
 
 // ---------------------------------------------------------------------------
@@ -964,46 +1196,24 @@ fn disableNagle(fd: posix.fd_t) void {
 }
 
 // Write the whole thing, and treat "would block" as what it is — a request to
-// wait, not a failure.
+// come back later, not a failure and not a license to sleep.
 //
 // Every accepted connection is non-blocking (markNonBlocking, below). So once a
 // response is bigger than the kernel's send buffer, `write` stops accepting and
 // says WouldBlock. Catching that alongside real errors and returning false — as
 // this did until 2026-08-10 — abandons the response part-written and closes the
 // connection, while the headers have already promised the full Content-Length.
+// Nothing about that looks like a failure from the outside: measured against
+// korulang.org, one 1.5 MB image returned 327093, 1561984, 1348077, 768057 and
+// 498501 bytes on five consecutive requests. A browser renders half an image,
+// and a truncated JavaScript module simply fails to import.
 //
-// Nothing about that looks like a failure from the outside. Small responses fit
-// in one buffer and always arrived, so the bug was invisible until something
-// large went through: measured against korulang.org, one 1.5 MB image returned
-// 327093, 1561984, 1348077, 768057 and 498501 bytes on five consecutive
-// requests. A browser renders half an image, and a truncated JavaScript module
-// simply fails to import.
-fn writeAll(fd: posix.fd_t, data: []const u8) bool {
-    var offset: usize = 0;
-    while (offset < data.len) {
-        const n = posix.write(fd, data[offset..]) catch |err| switch (err) {
-            error.WouldBlock => {
-                // Wait for the socket to drain, then carry on from the same
-                // offset. A peer that never drains hits the timeout and the
-                // connection is genuinely broken.
-                var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
-                const ready = posix.poll(&pfd, WRITE_WAIT_MS) catch return false;
-                if (ready == 0) return false;
-                if (pfd[0].revents & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) return false;
-                continue;
-            },
-            else => return false,
-        };
-        if (n == 0) return false;
-        offset += @intCast(n);
-    }
-    return true;
-}
-
-// How long to wait for a stalled peer to drain before calling the connection
-// broken. Long enough that a slow link finishes a large asset, short enough
-// that a dead peer cannot pin the worker.
-const WRITE_WAIT_MS: i32 = 10_000;
+// The first fix waited — `poll` inside the write loop, up to WRITE_WAIT_MS.
+// That made a stalled peer stall its whole worker: every other connection on
+// it froze behind one full socket buffer. The second fix is the honest one:
+// unwritten bytes go into `st.pending` and a write-ready event drains them
+// (queueAndFlush/flushPending, above), so a slow peer costs the worker memory
+// — capped at MAX_PENDING — instead of time.
 
 // ---------------------------------------------------------------------------
 // How many loops a hosted pump runs.
@@ -1100,7 +1310,6 @@ fn workerCount() usize {
     // each on its own kqueue, each seeing only the descriptors handed to it.
     const Worker = struct {
     fn loop(kq: i32) void {
-        var changes: [1]$mod.libc.Kevent = undefined;
         var no_changes: [0]$mod.libc.Kevent = undefined;
         var events: [$mod.MAX_EVENTS]$mod.libc.Kevent = undefined;
 
@@ -1116,20 +1325,61 @@ fn workerCount() usize {
                     continue;
                 };
 
+                // The conn registers before its handshake finishes — step it
+                // once per readiness event so a thousand concurrent
+                // handshakes spread over every worker, and trust no bytes as
+                // requests until the cipher is up.
+                if (st.tls_hs) {
+                    switch ($mod.driveTlsHandshake(st)) {
+                        .ready => st.tls_hs = false,
+                        .want_read => {
+                            $mod.armKqueueFilter(kq, fd, $mod.libc.EVFILT.READ);
+                            continue;
+                        },
+                        .want_write => {
+                            $mod.armKqueueFilter(kq, fd, $mod.libc.EVFILT.WRITE);
+                            continue;
+                        },
+                        .failed => {
+                            $mod.releaseConn(fd);
+                            continue;
+                        },
+                    }
+                }
+
+                // Write-ready drains whatever earlier sends could not
+                // deliver; a conn closing behind a queue ends here.
+                if (event.filter == $mod.libc.EVFILT.WRITE) {
+                    switch ($mod.flushPending(st)) {
+                        .dead => {
+                            if ($mod.connIsWs(fd)) closed(@intCast(fd));
+                            $mod.releaseConn(fd);
+                            continue;
+                        },
+                        .stalled => {
+                            $mod.kqueueRearm(kq, fd, st);
+                            continue;
+                        },
+                        .drained => {
+                            if (st.close_when_drained) {
+                                if ($mod.connIsWs(fd)) closed(@intCast(fd));
+                                $mod.releaseConn(fd);
+                                continue;
+                            }
+                        },
+                    }
+                    // A WRITE event carries no request bytes — back to read
+                    // readiness for the next one.
+                    $mod.armKqueueFilter(kq, fd, $mod.libc.EVFILT.READ);
+                    continue;
+                }
+
                 switch ($mod.fill_event.handler(.{ .st = st })) {
                     .more => {},
                     // Nothing new to frame, but the connection is alive.
                     // Re-arm and wait rather than closing it.
                     .idle => {
-                        changes[0] = .{
-                            .ident = @intCast(fd),
-                            .filter = $mod.libc.EVFILT.READ,
-                            .flags = $mod.libc.EV.ADD | $mod.libc.EV.ONESHOT,
-                            .fflags = 0,
-                            .data = 0,
-                            .udata = undefined,
-                        };
-                        _ = $mod.libc.kevent(kq, &changes, 1, &no_changes, 0, null);
+                        $mod.kqueueRearm(kq, fd, st);
                         continue;
                     },
                     .gone => {
@@ -1168,19 +1418,16 @@ fn workerCount() usize {
                     st.len = $mod.retainTail(&st.buf, st.len, ws_consumed);
                     if (ws_alive and st.len == st.buf.len) ws_alive = false;
                     if (!ws_alive) {
+                        if ($mod.pendingLen(st) > 0) {
+                            st.close_when_drained = true;
+                            $mod.armKqueueFilter(kq, fd, $mod.libc.EVFILT.WRITE);
+                            continue;
+                        }
                         if ($mod.connIsWs(fd)) closed(@intCast(fd));
                         $mod.releaseConn(fd);
                         continue;
                     }
-                    changes[0] = .{
-                        .ident = @intCast(fd),
-                        .filter = $mod.libc.EVFILT.READ,
-                        .flags = $mod.libc.EV.ADD | $mod.libc.EV.ONESHOT,
-                        .fflags = 0,
-                        .data = 0,
-                        .udata = undefined,
-                    };
-                    _ = $mod.libc.kevent(kq, &changes, 1, &no_changes, 0, null);
+                    $mod.kqueueRearm(kq, fd, st);
                     continue;
                 }
 
@@ -1205,21 +1452,18 @@ fn workerCount() usize {
                 if (alive and st.len == st.buf.len) alive = false;
 
                 if (!alive) {
+                    if ($mod.pendingLen(st) > 0) {
+                        st.close_when_drained = true;
+                        $mod.armKqueueFilter(kq, fd, $mod.libc.EVFILT.WRITE);
+                        continue;
+                    }
                     if ($mod.connIsWs(fd)) closed(@intCast(fd));
                     $mod.releaseConn(fd);
                     continue;
                 }
 
                 // ONESHOT disarms on delivery — re-arm for the next request.
-                changes[0] = .{
-                    .ident = @intCast(fd),
-                    .filter = $mod.libc.EVFILT.READ,
-                    .flags = $mod.libc.EV.ADD | $mod.libc.EV.ONESHOT,
-                    .fflags = 0,
-                    .data = 0,
-                    .udata = undefined,
-                };
-                _ = $mod.libc.kevent(kq, &changes, 1, &no_changes, 0, null);
+                $mod.kqueueRearm(kq, fd, st);
             }
         }
     }
@@ -1244,7 +1488,9 @@ fn workerCount() usize {
             while (true) {
                 const conn = tls_listener.accept() catch continue;
                 const client_fd = conn.stream.handle;
-                const ssl = $mod.acceptTlsHandshake(@intCast(client_fd)) orelse continue;
+                // Only the SSL object is made here — the handshake runs in
+                // the worker loop, one step per readiness event.
+                const ssl = $mod.beginTlsHandshake(@intCast(client_fd)) orelse continue;
                 const worker = next_ptr.*;
                 next_ptr.* = (next_ptr.* + 1) % n;
                 $mod.registerClient(client_fd, ssl, kqs_ptr[worker]);
@@ -1702,7 +1948,6 @@ fn workerCount() usize {
     // each seeing only the descriptors handed to it.
     const Worker = struct {
         fn loop(kq: i32) void {
-            var changes: [1]$mod.libc.Kevent = undefined;
             var no_changes: [0]$mod.libc.Kevent = undefined;
             var events: [$mod.MAX_EVENTS]$mod.libc.Kevent = undefined;
 
@@ -1718,20 +1963,61 @@ fn workerCount() usize {
                         continue;
                     };
 
+                    // The conn registers before its handshake finishes —
+                    // step it once per readiness event so a thousand
+                    // concurrent handshakes spread over every worker, and
+                    // trust no bytes as requests until the cipher is up.
+                    if (st.tls_hs) {
+                        switch ($mod.driveTlsHandshake(st)) {
+                            .ready => st.tls_hs = false,
+                            .want_read => {
+                                $mod.armKqueueFilter(kq, fd, $mod.libc.EVFILT.READ);
+                                continue;
+                            },
+                            .want_write => {
+                                $mod.armKqueueFilter(kq, fd, $mod.libc.EVFILT.WRITE);
+                                continue;
+                            },
+                            .failed => {
+                                $mod.releaseConn(fd);
+                                continue;
+                            },
+                        }
+                    }
+
+                    // Write-ready drains whatever earlier sends could not
+                    // deliver; a conn closing behind a queue ends here.
+                    if (event.filter == $mod.libc.EVFILT.WRITE) {
+                        switch ($mod.flushPending(st)) {
+                            .dead => {
+                                if ($mod.connIsWs(fd)) closed(@intCast(fd));
+                                $mod.releaseConn(fd);
+                                continue;
+                            },
+                            .stalled => {
+                                $mod.kqueueRearm(kq, fd, st);
+                                continue;
+                            },
+                            .drained => {
+                                if (st.close_when_drained) {
+                                    if ($mod.connIsWs(fd)) closed(@intCast(fd));
+                                    $mod.releaseConn(fd);
+                                    continue;
+                                }
+                            },
+                        }
+                        // A WRITE event carries no request bytes — back to
+                        // read readiness for the next one.
+                        $mod.armKqueueFilter(kq, fd, $mod.libc.EVFILT.READ);
+                        continue;
+                    }
+
                     switch ($mod.fill_event.handler(.{ .st = st })) {
                         .more => {},
                         // Nothing new to frame, but the connection is alive.
                         // Re-arm and wait rather than closing it.
                         .idle => {
-                            changes[0] = .{
-                                .ident = @intCast(fd),
-                                .filter = $mod.libc.EVFILT.READ,
-                                .flags = $mod.libc.EV.ADD | $mod.libc.EV.ONESHOT,
-                                .fflags = 0,
-                                .data = 0,
-                                .udata = undefined,
-                            };
-                            _ = $mod.libc.kevent(kq, &changes, 1, &no_changes, 0, null);
+                            $mod.kqueueRearm(kq, fd, st);
                             continue;
                         },
                         .gone => {
@@ -1769,19 +2055,16 @@ fn workerCount() usize {
                         st.len = $mod.retainTail(&st.buf, st.len, ws_consumed);
                         if (ws_alive and st.len == st.buf.len) ws_alive = false;
                         if (!ws_alive) {
+                            if ($mod.pendingLen(st) > 0) {
+                                st.close_when_drained = true;
+                                $mod.armKqueueFilter(kq, fd, $mod.libc.EVFILT.WRITE);
+                                continue;
+                            }
                             if ($mod.connIsWs(fd)) closed(@intCast(fd));
                             $mod.releaseConn(fd);
                             continue;
                         }
-                        changes[0] = .{
-                            .ident = @intCast(fd),
-                            .filter = $mod.libc.EVFILT.READ,
-                            .flags = $mod.libc.EV.ADD | $mod.libc.EV.ONESHOT,
-                            .fflags = 0,
-                            .data = 0,
-                            .udata = undefined,
-                        };
-                        _ = $mod.libc.kevent(kq, &changes, 1, &no_changes, 0, null);
+                        $mod.kqueueRearm(kq, fd, st);
                         continue;
                     }
 
@@ -1806,21 +2089,20 @@ fn workerCount() usize {
                     if (alive and st.len == st.buf.len) alive = false;
 
                     if (!alive) {
+                        // A closing answer still in the queue drains first —
+                        // releasing here would cut it mid-flight.
+                        if ($mod.pendingLen(st) > 0) {
+                            st.close_when_drained = true;
+                            $mod.armKqueueFilter(kq, fd, $mod.libc.EVFILT.WRITE);
+                            continue;
+                        }
                         if ($mod.connIsWs(fd)) closed(@intCast(fd));
                         $mod.releaseConn(fd);
                         continue;
                     }
 
                     // ONESHOT disarms on delivery — re-arm for the next request.
-                    changes[0] = .{
-                        .ident = @intCast(fd),
-                        .filter = $mod.libc.EVFILT.READ,
-                        .flags = $mod.libc.EV.ADD | $mod.libc.EV.ONESHOT,
-                        .fflags = 0,
-                        .data = 0,
-                        .udata = undefined,
-                    };
-                    _ = $mod.libc.kevent(kq, &changes, 1, &no_changes, 0, null);
+                    $mod.kqueueRearm(kq, fd, st);
                 }
             }
         }
@@ -1841,7 +2123,9 @@ fn workerCount() usize {
                 while (true) {
                     const conn = tls_listener.accept() catch continue;
                     const client_fd = conn.stream.handle;
-                    const ssl = $mod.acceptTlsHandshake(@intCast(client_fd)) orelse continue;
+                    // Only the SSL object is made here — the handshake runs
+                    // in the worker loop, one step per readiness event.
+                    const ssl = $mod.beginTlsHandshake(@intCast(client_fd)) orelse continue;
                     const worker = next_ptr.*;
                     next_ptr.* = (next_ptr.* + 1) % n;
                     $mod.registerClient(client_fd, ssl, kqs_ptr[worker]);
@@ -1931,11 +2215,74 @@ fn workerCount() usize {
                         continue;
                     };
 
+                    // The conn registers before its handshake finishes —
+                    // step it once per readiness event so a thousand
+                    // concurrent handshakes spread over every worker, and
+                    // trust no bytes as requests until the cipher is up.
+                    if (st.tls_hs) {
+                        switch ($mod.driveTlsHandshake(st)) {
+                            .ready => st.tls_hs = false,
+                            // Arm only the direction the cipher asked for: a
+                            // want_read conn re-armed IN|OUT refires instantly
+                            // (OUT is level-true on any writable socket), and a
+                            // thousand handshakes doing that drown the real
+                            // readiness events in futile SSL_accept calls.
+                            .want_read, .want_write => |w| {
+                                const dir: u32 = if (w == .want_read) linux.EPOLL.IN else linux.EPOLL.OUT;
+                                var wait = linux.epoll_event{
+                                    .events = dir | linux.EPOLL.ONESHOT,
+                                    .data = .{ .fd = fd },
+                                };
+                                _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &wait);
+                                continue;
+                            },
+                            .failed => {
+                                $mod.releaseConn(fd);
+                                continue;
+                            },
+                        }
+                    }
+
+                    // Write-ready drains whatever earlier sends could not
+                    // deliver; a conn closing behind a queue ends here.
+                    if (event.events & linux.EPOLL.OUT != 0) {
+                        switch ($mod.flushPending(st)) {
+                            .dead => {
+                                if ($mod.connIsWs(fd)) closed(@intCast(fd));
+                                $mod.releaseConn(fd);
+                                continue;
+                            },
+                            .stalled => {
+                                var wait = linux.epoll_event{
+                                    .events = $mod.epollMask(st),
+                                    .data = .{ .fd = fd },
+                                };
+                                _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &wait);
+                                continue;
+                            },
+                            .drained => {
+                                if (st.close_when_drained) {
+                                    if ($mod.connIsWs(fd)) closed(@intCast(fd));
+                                    $mod.releaseConn(fd);
+                                    continue;
+                                }
+                            },
+                        }
+                        if (event.events & linux.EPOLL.IN == 0) {
+                            var wait = linux.epoll_event{
+                                .events = linux.EPOLL.IN | linux.EPOLL.ONESHOT,
+                                .data = .{ .fd = fd },
+                            };
+                            _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &wait);
+                            continue;
+                        }
+                    }
+
                     switch ($mod.fill_event.handler(.{ .st = st })) {
                         .more => {},
                         .idle => {
                             var wait = linux.epoll_event{
-                                .events = linux.EPOLL.IN | linux.EPOLL.ONESHOT,
+                                .events = $mod.epollMask(st),
                                 .data = .{ .fd = fd },
                             };
                             _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &wait);
@@ -1976,12 +2323,21 @@ fn workerCount() usize {
                         st.len = $mod.retainTail(&st.buf, st.len, ws_consumed);
                         if (ws_alive and st.len == st.buf.len) ws_alive = false;
                         if (!ws_alive) {
+                            if ($mod.pendingLen(st) > 0) {
+                                st.close_when_drained = true;
+                                var wait = linux.epoll_event{
+                                    .events = linux.EPOLL.OUT | linux.EPOLL.ONESHOT,
+                                    .data = .{ .fd = fd },
+                                };
+                                _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &wait);
+                                continue;
+                            }
                             if ($mod.connIsWs(fd)) closed(@intCast(fd));
                             $mod.releaseConn(fd);
                             continue;
                         }
                         var ws_rearm = linux.epoll_event{
-                            .events = linux.EPOLL.IN | linux.EPOLL.ONESHOT,
+                            .events = $mod.epollMask(st),
                             .data = .{ .fd = fd },
                         };
                         _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &ws_rearm);
@@ -2006,13 +2362,24 @@ fn workerCount() usize {
                     if (alive and st.len == st.buf.len) alive = false;
 
                     if (!alive) {
+                        // A closing answer still in the queue drains first —
+                        // releasing here would cut it mid-flight.
+                        if ($mod.pendingLen(st) > 0) {
+                            st.close_when_drained = true;
+                            var wait = linux.epoll_event{
+                                .events = linux.EPOLL.OUT | linux.EPOLL.ONESHOT,
+                                .data = .{ .fd = fd },
+                            };
+                            _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &wait);
+                            continue;
+                        }
                         if ($mod.connIsWs(fd)) closed(@intCast(fd));
                         $mod.releaseConn(fd);
                         continue;
                     }
 
                     var rearm = linux.epoll_event{
-                        .events = linux.EPOLL.IN | linux.EPOLL.ONESHOT,
+                        .events = $mod.epollMask(st),
                         .data = .{ .fd = fd },
                     };
                     _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &rearm);
@@ -2037,7 +2404,9 @@ fn workerCount() usize {
                 while (true) {
                     const conn = tls_listener.accept() catch continue;
                     const client_fd = conn.stream.handle;
-                    const ssl = $mod.acceptTlsHandshake(@intCast(client_fd)) orelse continue;
+                    // Only the SSL object is made here — the handshake runs
+                    // in the worker loop, one step per readiness event.
+                    const ssl = $mod.beginTlsHandshake(@intCast(client_fd)) orelse continue;
                     $mod.registerClientEpoll(client_fd, ssl, epfd);
                 }
             }
@@ -2451,7 +2820,14 @@ fn workerCount() usize {
     // `Connection: close` once when the request lands) — re-scanning the raw
     // request here was a second full pass for the same answer.
     if (!x.keep_alive) {
-        $mod.shutdownConn(st);
+        // A FIN before the queue drains would cut the response mid-flight —
+        // when bytes are still pending, mark the conn and let the
+        // write-ready event do the closing instead.
+        if (pendingLen(st) > 0) {
+            st.close_when_drained = true;
+        } else {
+            $mod.shutdownConn(st);
+        }
     }
     return .sent;
 }
