@@ -222,6 +222,18 @@ pub const ConnState = struct {
     // pusher thread that stalls must re-arm write readiness on the owner,
     // or the queued tail would wait for traffic that may never come.
     owner_q: i32 = -1,
+    // io_uring pump bookkeeping — inert on every other pump. owner_ring marks
+    // a ring-owned conn (opaque so this struct still compiles off-Linux).
+    // send_buf is staged output a send SQE can own outright: while a send is
+    // in flight the kernel owns [0..send_len) and the buffer must not move,
+    // so bytes written mid-flight queue in `pending` and drain into the tail
+    // when the CQE lands. Half-duplex: at most one SQE outstanding per conn.
+    owner_ring: ?*anyopaque = null,
+    send_buf: []u8 = &.{},
+    send_staged: usize = 0,
+    send_off: usize = 0,
+    send_len: usize = 0,
+    ring_dead: bool = false,
 };
 
 var conn_states: [MAX_TRACKED_FD]?*ConnState = .{null} ** MAX_TRACKED_FD;
@@ -296,6 +308,10 @@ fn closeConn(st: *ConnState) void {
     }
     st.ws_msg.deinit(std.heap.c_allocator);
     st.pending.deinit(std.heap.c_allocator);
+    if (st.send_buf.len > 0) {
+        std.heap.c_allocator.free(st.send_buf);
+        st.send_buf = &.{};
+    }
     st.len = 0;
 }
 
@@ -356,6 +372,32 @@ fn appendPending(st: *ConnState, segments: []const []const u8) bool {
     defer if (lock_it) st.ws_mu.unlock();
     var need: usize = 0;
     for (segments) |seg| need += seg.len;
+    if (st.owner_ring != null) {
+        // Ring conns never flush inline — output is the next send SQE's job.
+        // No send in flight means send_buf is unpinned and can grow under us;
+        // with one in flight the kernel owns it, so bytes queue in pending
+        // instead. ws conns always take the pending leg: a foreign pusher
+        // shares only that region under ws_mu, never the buffer a submit is
+        // about to pin.
+        if (st.send_len == 0 and st.mode != .ws) {
+            if (st.send_staged + need > MAX_PENDING) return false;
+            if (st.send_buf.len < st.send_staged + need) {
+                const nb = std.heap.c_allocator.alloc(u8, st.send_staged + need) catch return false;
+                @memcpy(nb[0..st.send_staged], st.send_buf[0..st.send_staged]);
+                if (st.send_buf.len > 0) std.heap.c_allocator.free(st.send_buf);
+                st.send_buf = nb;
+            }
+            for (segments) |seg| {
+                @memcpy(st.send_buf[st.send_staged..][0..seg.len], seg);
+                st.send_staged += seg.len;
+            }
+            return true;
+        }
+        if (pendingLen(st) + need > MAX_PENDING) return false;
+        st.pending.ensureUnusedCapacity(std.heap.c_allocator, need) catch return false;
+        for (segments) |seg| st.pending.appendSliceAssumeCapacity(seg);
+        return true;
+    }
     if (st.pending.items.len + need > MAX_PENDING) {
         if (flushPending(st) == .dead) return false;
         if (st.pending.items.len + need > MAX_PENDING) return false;
@@ -409,7 +451,7 @@ fn tlsWriteOrQueue(st: *ConnState, segments: []const []const u8) bool {
 }
 
 fn writeAllConn(st: *ConnState, data: []const u8) bool {
-    if (st.batching) return appendPending(st, &.{data});
+    if (st.batching or st.owner_ring != null) return appendPending(st, &.{data});
     if (HAS_OPENSSL) {
         if (st.ssl != null) {
             return tlsWriteOrQueue(st, &.{data});
@@ -453,7 +495,7 @@ fn writevAllConn(st: *ConnState, head: []const u8, body: []const u8, date_hole: 
         .{ head[0..date_hole], date_line, head[date_hole..], body }
     else
         .{ head, body, "", "" };
-    if (st.batching) return appendPending(st, &segs);
+    if (st.batching or st.owner_ring != null) return appendPending(st, &segs);
     if (HAS_OPENSSL) {
         if (st.ssl != null) {
             return tlsWriteOrQueue(st, &segs);
@@ -1211,6 +1253,22 @@ fn openListener(port: u16) ?std.net.Server {
     }) catch null;
 }
 
+// One listener per ring worker: SO_REUSEPORT lets every worker bind the same
+// port and the kernel hashes each incoming connection to a single queue — no
+// accept thread, no handoff. This is the shape zix's URING engine uses, and
+// it is why its accept path costs nothing under a connect storm.
+fn openReusePortListener(port: u16) ?posix.fd_t {
+    const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch return null;
+    errdefer posix.close(fd);
+    const yes: c_int = 1;
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&yes)) catch return null;
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, std.mem.asBytes(&yes)) catch {};
+    const addr = std.net.Address.parseIp("0.0.0.0", port) catch return null;
+    posix.bind(fd, &addr.any, addr.getOsSockLen()) catch return null;
+    posix.listen(fd, 16384) catch return null;
+    return fd;
+}
+
 fn markNonBlocking(fd: posix.fd_t) void {
     const flags = posix.fcntl(fd, posix.F.GETFL, 0) catch 0;
     _ = posix.fcntl(fd, posix.F.SETFL, flags | O_NONBLOCK) catch {};
@@ -1256,7 +1314,7 @@ fn disableNagle(fd: posix.fd_t) void {
 // thread owns. The one genuinely shared thing in a request's path — the buffer
 // the response header is built into — is `threadlocal` in the companion, and
 // was the ONLY thing that had to change above this file.
-const MAX_WORKERS = 16;
+const MAX_WORKERS = 128;
 
 fn workerCount() usize {
     const n = std.Thread.getCpuCount() catch return 1;
@@ -2511,78 +2569,164 @@ fn workerCount() usize {
     $mod.ignoreSigpipe();
 
     const linux = std.os.linux;
+    const n_workers = $mod.workerCount();
 
-    const server = $mod.openListener(port) orelse return .{ .failed = "Failed to listen" };
-    const listen_fd = server.stream.handle;
-
-    // Say which io_uring is missing, because there are two very different
-    // reasons and they need opposite responses. A kernel older than 5.1 has no
-    // io_uring at all. A modern kernel inside a container usually HAS it and is
-    // being refused by the sandbox: Docker's default seccomp profile blocks
-    // io_uring_setup, so `uname -r` says 6.12 while the call still fails.
+    // Shared-nothing fleet: one ring + one SO_REUSEPORT listener per worker —
+    // no accept thread, no readiness handoff; a connection lives its whole
+    // life on the worker whose listener took it. user_data carries the
+    // *ConnState tagged in the low bits, so a completion never touches the
+    // connection table or its mutex.
     //
-    // Measured 2026-08-11: this reported "needs Linux 5.1 or later" on a 6.12
-    // kernel, which is a diagnostic pointing at the wrong cause — the fix was
-    // `--security-opt seccomp=unconfined`, not an upgrade.
-    var ring = linux.IoUring.init($mod.URING_ENTRIES, 0) catch |err| {
-        const why = switch (err) {
-            error.PermissionDenied, error.SystemOutdated => "io_uring refused: the kernel has it but something is blocking io_uring_setup — a container seccomp profile is the usual cause (try --security-opt seccomp=unconfined), or the kernel predates 5.1",
-            error.SystemResources => "io_uring unavailable: not enough locked memory for the ring — raise RLIMIT_MEMLOCK",
-            else => "io_uring unavailable — io_uring_setup failed",
-        };
-        return .{ .failed = why };
-    };
+    // Per connection at most one SQE is in flight (half-duplex): recv, or a
+    // send over send_buf. Replies stage into send_buf between completions and
+    // leave as ONE send SQE per readable batch — a 16-deep pipeline pays one
+    // send, not sixteen writes. Bytes written while a send is in flight queue
+    // in `pending` — send_buf is kernel-owned until its CQE lands — and drain
+    // into the tail at the next submission boundary. Teardown only ever runs
+    // inside a CQE, so a conn is never freed while the kernel still holds a
+    // reference to it.
 
-    _ = ring.accept($mod.URING_ACCEPT, listen_fd, null, null, 0) catch
-        return .{ .failed = "io_uring accept" };
+    const W = struct {
+        const TAG_SEND: u64 = 1;
+        const CQE_BATCH = 512;
+        const SUBMIT_STRIDE = 16; // push staged SQEs every N completions in a deep batch
 
-    std.debug.print("Orisha listening on http://0.0.0.0:{}\n", .{port});
-    std.debug.print("Pump: io_uring, keep-alive, TCP_NODELAY\n", .{});
+        ring: linux.IoUring,
+        listen_fd: $mod.posix.fd_t,
 
-    var cqes: [$mod.MAX_EVENTS]linux.io_uring_cqe = undefined;
+        fn udSend(st: *$mod.ConnState) u64 {
+            return @intFromPtr(st) | TAG_SEND;
+        }
 
-    while (true) {
-        _ = ring.submit_and_wait(1) catch continue;
-        const ready = ring.copy_cqes(&cqes, 1) catch continue;
+        fn cqeConn(ud: u64) *$mod.ConnState {
+            return @ptrFromInt(@as(usize, @intCast(ud & ~@as(u64, 3))));
+        }
 
-        for (cqes[0..ready]) |cqe| {
-            if (cqe.user_data == $mod.URING_ACCEPT) {
-                // Re-arm FIRST. A burst of connections is otherwise serialised
-                // behind whatever this one turns into.
-                _ = ring.accept($mod.URING_ACCEPT, listen_fd, null, null, 0) catch {};
-                if (cqe.res < 0) continue;
+        fn teardown(w: *@This(), st: *$mod.ConnState) void {
+            // Callers promise no SQE is in flight for this conn — the only
+            // teardown sites are CQEs (op consumed) and prep failures (op
+            // never queued), which is what makes the free safe.
+            _ = w;
+            if ($mod.connIsWs(st.fd)) closed(@intCast(st.fd));
+            $mod.releaseConn(st.fd);
+        }
 
-                const client_fd: $mod.posix.fd_t = @intCast(cqe.res);
-                $mod.disableNagle(client_fd);
+        fn submitRecv(w: *@This(), st: *$mod.ConnState) bool {
+            _ = w.ring.recv(@intFromPtr(st), st.fd, .{ .buffer = st.buf[st.len..] }, 0) catch {
+                _ = w.ring.submit() catch {};
+                _ = w.ring.recv(@intFromPtr(st), st.fd, .{ .buffer = st.buf[st.len..] }, 0) catch return false;
+            };
+            return true;
+        }
 
-                const fresh = $mod.connState(client_fd) orelse {
-                    $mod.posix.close(client_fd);
-                    continue;
-                };
-                fresh.len = 0;
-                // The buffer lives in the connection's own state, which is
-                // heap-stable — the kernel writes into it before we are told.
-                _ = ring.recv(@intCast(client_fd), client_fd, .{ .buffer = fresh.buf[0..] }, 0) catch {
-                    // releaseConn closes the fd — a second close is EBADF.
-                    if ($mod.connIsWs(client_fd)) closed(@intCast(client_fd));
-                    $mod.releaseConn(client_fd);
-                };
-                continue;
+        fn submitSend(w: *@This(), st: *$mod.ConnState) bool {
+            _ = w.ring.send(udSend(st), st.fd, st.send_buf[st.send_off..st.send_len], linux.MSG.NOSIGNAL) catch {
+                _ = w.ring.submit() catch {};
+                _ = w.ring.send(udSend(st), st.fd, st.send_buf[st.send_off..st.send_len], linux.MSG.NOSIGNAL) catch return false;
+            };
+            return true;
+        }
+
+        // The one place a conn's next SQE is chosen. Staged output always
+        // outranks new reads: a burst of pipelined replies coalesces into one
+        // send, and a conn answered `keep_alive = false` still flushes its
+        // last response before the fd drops.
+        fn advance(w: *@This(), st: *$mod.ConnState) void {
+            if (st.send_len != 0) return;
+            const pn = $mod.pendingLen(st);
+            if (pn > 0) {
+                if (st.mode == .ws) st.ws_mu.lock();
+                const room = st.send_staged + pn;
+                if (st.send_buf.len < room) {
+                    const nb = std.heap.c_allocator.alloc(u8, room) catch {
+                        if (st.mode == .ws) st.ws_mu.unlock();
+                        w.teardown(st);
+                        return;
+                    };
+                    @memcpy(nb[0..st.send_staged], st.send_buf[0..st.send_staged]);
+                    if (st.send_buf.len > 0) std.heap.c_allocator.free(st.send_buf);
+                    st.send_buf = nb;
+                }
+                @memcpy(st.send_buf[st.send_staged..][0..pn], st.pending.items[st.pending_off..]);
+                st.send_staged += pn;
+                st.pending.clearRetainingCapacity();
+                st.pending_off = 0;
+                if (st.mode == .ws) st.ws_mu.unlock();
+            }
+            if (st.send_staged > 0) {
+                st.send_off = 0;
+                st.send_len = st.send_staged;
+                st.send_staged = 0;
+                if (!w.submitSend(st)) {
+                    st.send_len = 0;
+                    w.teardown(st);
+                }
+                return;
+            }
+            if (st.ring_dead or st.len == st.buf.len) {
+                w.teardown(st);
+                return;
+            }
+            if (!w.submitRecv(st)) w.teardown(st);
+        }
+
+        fn handleCqe(w: *@This(), cqe: linux.io_uring_cqe) void {
+            const ud = cqe.user_data;
+            if (ud == $mod.URING_ACCEPT) {
+                // Multishot: this one SQE reaps the whole connect storm.
+                // F_MORE cleared means the op retired — re-arm it once.
+                if (cqe.res >= 0) {
+                    const cfd: $mod.posix.fd_t = @intCast(cqe.res);
+                    $mod.disableNagle(cfd);
+                    if ($mod.connState(cfd)) |st| {
+                        st.len = 0;
+                        st.owner_ring = @ptrCast(w);
+                        // The recv buffer lives in the conn's own heap state —
+                        // the kernel writes into it before we are told.
+                        if (!w.submitRecv(st)) w.teardown(st);
+                    } else {
+                        $mod.posix.close(cfd);
+                    }
+                }
+                if (cqe.flags & linux.IORING_CQE_F_MORE == 0) {
+                    _ = w.ring.accept_multishot($mod.URING_ACCEPT, w.listen_fd, null, null, 0) catch {};
+                }
+                return;
             }
 
-            const fd: $mod.posix.fd_t = @intCast(cqe.user_data);
-            const st = $mod.connState(fd) orelse continue;
+            const st = cqeConn(ud);
+            if (ud & TAG_SEND != 0) {
+                if (cqe.res <= 0) {
+                    st.send_len = 0;
+                    w.teardown(st);
+                    return;
+                }
+                st.send_off += @intCast(cqe.res);
+                if (st.send_off < st.send_len) {
+                    // Partial send — resubmit the remainder, still in flight.
+                    if (!w.submitSend(st)) {
+                        st.send_len = 0;
+                        w.teardown(st);
+                    }
+                    return;
+                }
+                st.send_len = 0;
+                st.send_off = 0;
+                w.advance(st);
+                return;
+            }
 
-            if (cqe.res <= 0) {
-                if ($mod.connIsWs(fd)) closed(@intCast(fd));
-                $mod.releaseConn(fd);
-                continue;
+            // recv completion — the bytes are already in st.buf, the count
+            // arrives in cqe.res.
+            if (cqe.res <= 0 or st.ring_dead) {
+                w.teardown(st);
+                return;
             }
             st.len += @intCast(cqe.res);
 
             // Upgraded connection: frames, not requests — same seam as the
-            // kqueue pump's `st.mode == .ws` block; the re-arm here is the
-            // next submitted recv rather than a readiness re-arm.
+            // kqueue pump's `st.mode == .ws` block; the re-arm is the next
+            // submitted SQE rather than a readiness re-arm.
             if (st.mode == .ws) {
                 var ws_consumed: usize = 0;
                 var ws_alive = true;
@@ -2598,7 +2742,7 @@ fn workerCount() usize {
                         },
                         .dead => ws_alive = false,
                         .message => |m| {
-                            var fx = $mod.Exchange{ .fd = fd, .st = st, .raw = m.payload, .opcode = m.op };
+                            var fx = $mod.Exchange{ .fd = st.fd, .st = st, .raw = m.payload, .opcode = m.op };
                             frame(&fx);
                             st.ws_msg.clearRetainingCapacity();
                             if (!fx.keep_alive) ws_alive = false;
@@ -2608,27 +2752,20 @@ fn workerCount() usize {
                 }
                 st.len = $mod.retainTail(&st.buf, st.len, ws_consumed);
                 if (ws_alive and st.len == st.buf.len) ws_alive = false;
-                if (!ws_alive) {
-                    if ($mod.connIsWs(fd)) closed(@intCast(fd));
-                    $mod.releaseConn(fd);
-                    continue;
-                }
-                _ = ring.recv(@intCast(fd), fd, .{ .buffer = st.buf[st.len..] }, 0) catch {
-                    if ($mod.connIsWs(fd)) closed(@intCast(fd));
-                    $mod.releaseConn(fd);
-                };
-                continue;
+                if (!ws_alive) st.ring_dead = true;
+                w.advance(st);
+                return;
             }
 
             // Answer every COMPLETE request — the same helpers the other pumps
-            // use, so a browser is handled identically here.
-            // Replies batch in pending — one flush per read event.
+            // use, so a browser is handled identically here. Replies stage in
+            // send_buf and leave as one send SQE per readable batch.
             st.batching = true;
             var consumed: usize = 0;
             var alive = true;
             while (consumed < st.len) {
                 const take = $mod.requestLen(st.buf[consumed..st.len]) orelse break;
-                var exchange = $mod.Exchange{ .fd = fd, .st = st, .raw = st.buf[consumed .. consumed + take] };
+                var exchange = $mod.Exchange{ .fd = st.fd, .st = st, .raw = st.buf[consumed .. consumed + take] };
                 if ($mod.requestWantsClose(exchange.raw)) exchange.keep_alive = false;
                 arrived(&exchange);
                 consumed += take;
@@ -2638,23 +2775,55 @@ fn workerCount() usize {
                 }
             }
             st.batching = false;
-            _ = $mod.flushPending(st);
             st.len = $mod.retainTail(&st.buf, st.len, consumed);
             if (alive and st.len == st.buf.len) alive = false;
-
-            if (!alive) {
-                if ($mod.connIsWs(fd)) closed(@intCast(fd));
-                $mod.releaseConn(fd);
-                continue;
-            }
-
-            // Ask for the next bytes, appending to whatever is unfinished.
-            _ = ring.recv(@intCast(fd), fd, .{ .buffer = st.buf[st.len..] }, 0) catch {
-                if ($mod.connIsWs(fd)) closed(@intCast(fd));
-                $mod.releaseConn(fd);
-            };
+            if (!alive) st.ring_dead = true;
+            w.advance(st);
         }
+
+        fn run(port_: u16) void {
+            // Ring + listener are created on the worker thread itself —
+            // SINGLE_ISSUER wants the ring owned by the thread that drives it.
+            const ring = linux.IoUring.init($mod.URING_ENTRIES, linux.IORING_SETUP_SINGLE_ISSUER | linux.IORING_SETUP_DEFER_TASKRUN) catch
+                linux.IoUring.init($mod.URING_ENTRIES, 0) catch {
+                    // Say which io_uring is missing, because there are two very
+                    // different reasons and they need opposite responses: an old
+                    // kernel, or a container seccomp profile blocking
+                    // io_uring_setup on a modern one.
+                    std.debug.print("Pump: io_uring refused — io_uring_setup failed (seccomp? try --security-opt seccomp=unconfined; kernel <5.1?; RLIMIT_MEMLOCK?)\n", .{});
+                    return;
+                };
+            const listen_fd = $mod.openReusePortListener(port_) orelse {
+                std.debug.print("Pump: io_uring worker failed to listen on :{}\n", .{port_});
+                return;
+            };
+            var w = @This(){ .ring = ring, .listen_fd = listen_fd };
+            _ = w.ring.accept_multishot($mod.URING_ACCEPT, listen_fd, null, null, 0) catch {
+                std.debug.print("Pump: io_uring accept arm failed\n", .{});
+                return;
+            };
+
+            var cqes: [CQE_BATCH]linux.io_uring_cqe = undefined;
+            while (true) {
+                _ = w.ring.submit_and_wait(1) catch continue;
+                const got = w.ring.copy_cqes(&cqes, 0) catch continue;
+                var i: usize = 0;
+                for (cqes[0..got]) |cqe| {
+                    i += 1;
+                    if (i % SUBMIT_STRIDE == 0) _ = w.ring.submit() catch {};
+                    w.handleCqe(cqe);
+                }
+            }
+        }
+    };
+
+    var spawned: usize = 0;
+    while (spawned + 1 < n_workers) : (spawned += 1) {
+        _ = std.Thread.spawn(.{}, W.run, .{port}) catch break;
     }
+    std.debug.print("Orisha listening on http://0.0.0.0:{}\n", .{port});
+    std.debug.print("Pump: io_uring, {} workers (ring + listener each), keep-alive, TCP_NODELAY\n", .{spawned + 1});
+    W.run(port);
 
     return .{ .stopped = "Server stopped" };
 }
