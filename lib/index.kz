@@ -623,9 +623,11 @@ const RESPONSE_500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\
     const head_out: []u8 = if (extras.len == 0) header_buf[0..] else header_buf_wide[0..];
 
     // 101 is a handshake, not a response: no Content-Length, no managed
-    // `Connection` (the handler spells `Connection: Upgrade` in extras), and
-    // no body. The pump watches the head's status on the way out and flips
-    // the connection to websocket frames.
+    // `Connection` (the handler spells `Connection: Upgrade` in extras). The
+    // body passes through — on the wire it is not an HTTP body at all but the
+    // connection's FIRST WEBSOCKET FRAME, which `reply` frames and sends
+    // right after the handshake bytes. That is how a protocol that must speak
+    // first (Action Cable's `welcome`) can: the upgrade answer carries it.
     if (res.status == 101) {
         const head101 = std.fmt.bufPrint(
             head_out,
@@ -635,8 +637,7 @@ const RESPONSE_500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\
             if (res.body_allocated) koru_allocator().free(res.body);
             return .{ .head = RESPONSE_500, .body = "", .body_allocated = false, .date_hole = 0 };
         };
-        if (res.body_allocated) koru_allocator().free(res.body);
-        return .{ .head = head101, .body = "", .body_allocated = false, .date_hole = 0 };
+        return .{ .head = head101, .body = res.body, .body_allocated = res.body_allocated, .date_hole = 0 };
     }
 
     // A bufPrint failure answers null now, not the canned 500, so the leg

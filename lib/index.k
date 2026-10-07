@@ -105,6 +105,7 @@ serve =
         | sent |> orisha:release-body(a.body, allocated: a.body_allocated)
         | broken _ |> orisha:release-body(a.body, allocated: a.body_allocated)
     ! frame f |> orisha/pump:ws-frame(f)
+    ! closed fd |> orisha/pump:ws-closed(fd)
     | stopped s -> shutdown s
     | failed e -> failed e
 

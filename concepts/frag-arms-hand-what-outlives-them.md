@@ -33,3 +33,13 @@ reassembled (opcode on the Exchange, control frames answered at the seam)
 and the reply writes a frame inline on the worker. The dup+spawn hammer
 remains for server-initiated pushes with no inbound trigger — SSE,
 timers, broadcasts — which `! frame` does not reach.
+
+2026-10-07 — the last open case closed without the hammer. `ws-send-fd`
+sends to a connection by descriptor while it sits idle, `! closed`
+reports teardown so fd-keyed registries drop stale entries, and a 101
+answer's body rides out as the first websocket frame — Action Cable's
+welcome — before any client message. The pump stays the only writer;
+a per-connection mutex serializes inbound-arm replies against
+fd-addressed sends, and release waits on that mutex so no send meets
+freed state. For websocket protocols the detached thread is now the
+exception, not the shape.

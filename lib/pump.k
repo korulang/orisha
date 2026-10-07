@@ -23,6 +23,7 @@
 pub tor drive { port: u16, tls_port: ?u16, cert_path: ?string, key_path: ?string }
 ! arrived *Exchange
 ! frame *Exchange
+! closed usize
 | stopped string
 | failed string
 
@@ -64,6 +65,7 @@ pub tor __retire {}
 pub tor init { port: u16, tls_port: ?u16, cert_path: ?string, key_path: ?string }
 ! arrived *Exchange
 ! frame *Exchange
+! closed usize
 | ?started
 | failed string
 
@@ -129,6 +131,41 @@ pub tor reply { x: *Exchange, head: string, body: string, date_hole: usize }
 pub tor ws-send { x: *Exchange, payload: string, opcode: ?u8 }
 
 pub tor ws-close { x: *Exchange }
+
+// ============================================================================
+// WS-SEND-FD — write one frame to a connection named by descriptor
+// ============================================================================
+// `ws-send` can only answer the frame currently being dispatched. A broadcast
+// — a pub/sub channel, a heartbeat, a server push — must reach an upgraded
+// connection while it is IDLE in the readiness loop, on whatever thread is
+// doing the sending. `fd` is the integer `fileno` reported; the pump still
+// owns the descriptor and remains the only writer — the flow names the
+// target, the pump frames and sends.
+//
+// The answer is `sent`, or `gone` when no upgraded connection carries that fd
+// — a registry that hears `gone` forgets the entry. Writes on one connection
+// are serialized inside the pump: a `ws-send` in a frame arm and a
+// `ws-send-fd` from a pusher thread cannot interleave bytes mid-frame, and a
+// send that races a release waits rather than writing into freed state.
+
+pub tor ws-send-fd { fd: usize, payload: string, opcode: ?u8 }
+| sent
+| gone
+
+// ============================================================================
+// WS-CLOSED — the pump is reaping an upgraded connection
+// ============================================================================
+// Fires once per upgraded connection when the pump releases it — close
+// handshake, protocol violation, hang-up, idle eviction, or server stop.
+// `fd` is the descriptor a registry must forget; it is passed by value
+// because the Exchange is already dead by definition. The default is a no-op:
+// a websocket claimant that tracks no connections is not forced to implement
+// it. Abstract so a claimant can implement it; the companion's empty default
+// means a websocket app that tracks no connections is unaffected either way.
+// @retain: dispatched from the release path in raw Zig, invisible to the
+// dead-stripper for the same reason `fill` is.
+
+[abstract|retain]pub tor ws-closed { fd: usize }
 
 // ============================================================================
 // WS-FRAME — a complete websocket message on an upgraded connection

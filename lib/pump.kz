@@ -155,10 +155,24 @@ const MAX_TRACKED_FD = 4096;
 // and `requestLen` never sees them again.
 pub const ConnMode = enum { http, ws };
 
+// One writer at a time on a websocket connection. `ws-send` in a frame arm
+// and `ws-send-fd` from a pusher thread can both target the same socket;
+// without the lock two frames interleave on the wire. Freestanding targets
+// run the pump single-threaded, so the type degrades to a no-op there —
+// std.Thread.Mutex's futex path has no kernel behind it on a unikernel.
+const SendMutex = switch (@import("builtin").os.tag) {
+    .freestanding => struct {
+        pub fn lock(_: *const @This()) void {}
+        pub fn unlock(_: *const @This()) void {}
+    },
+    else => std.Thread.Mutex,
+};
+
 pub const ConnState = struct {
     fd: c_int = -1,
     ssl: ?*ServerTls = null,
     mode: ConnMode = .http,
+    ws_mu: SendMutex = .{},
     buf: [REQUEST_BUFFER]u8 = undefined,
     len: usize = 0,
     // Websocket reassembly — only meaningful while mode == .ws. `buf` holds
@@ -213,11 +227,27 @@ fn releaseConn(fd: posix.fd_t) void {
     conn_states[idx] = null;
     conn_states_mu.unlock();
     if (s) |st| {
+        // A `ws-send-fd` already mid-write holds ws_mu; teardown waits for it
+        // rather than freeing the ConnState out from under its frame.
+        st.ws_mu.lock();
         closeConn(st);
+        st.ws_mu.unlock();
         std.heap.c_allocator.destroy(st);
     } else {
         posix.close(@intCast(fd));
     }
+}
+
+// "Is this fd an upgraded websocket connection right now" — asked at teardown
+// sites to decide whether `closed` fires, and asked BEFORE releaseConn takes
+// the slot, so the fd still names this connection and not a reissued one.
+fn connIsWs(fd: posix.fd_t) bool {
+    const idx: usize = @intCast(fd);
+    if (idx >= MAX_TRACKED_FD) return false;
+    conn_states_mu.lock();
+    defer conn_states_mu.unlock();
+    const s = conn_states[idx] orelse return false;
+    return s.mode == .ws;
 }
 
 fn closeConn(st: *ConnState) void {
@@ -585,8 +615,11 @@ fn wsNext(st: *ConnState, consumed: *usize) ?WsItem {
 }
 
 // Emit one unmasked frame — server frames are never masked (§5.1) and never
-// fragmented here: a message the application sent is one frame.
-fn wsSendFrame(st: *ConnState, opcode: u8, payload: []const u8) bool {
+// fragmented here: a message the application sent is one frame. The Raw half
+// writes; the locking half is what `ws-send`-in-an-arm and `ws-send-fd` from
+// another thread both funnel through, so two writers on one connection can
+// never interleave bytes mid-frame.
+fn wsSendFrameRaw(st: *ConnState, opcode: u8, payload: []const u8) bool {
     var hdr: [10]u8 = undefined;
     hdr[0] = 0x80 | opcode;
     var hlen: usize = 2;
@@ -603,6 +636,35 @@ fn wsSendFrame(st: *ConnState, opcode: u8, payload: []const u8) bool {
     }
     if (!writeAllConn(st, hdr[0..hlen])) return false;
     return payload.len == 0 or writeAllConn(st, payload);
+}
+
+fn wsSendFrame(st: *ConnState, opcode: u8, payload: []const u8) bool {
+    st.ws_mu.lock();
+    defer st.ws_mu.unlock();
+    return wsSendFrameRaw(st, opcode, payload);
+}
+
+// The cross-thread counterpart: name a connection by descriptor rather than
+// by the exchange being dispatched. The lookup happens under conn_states_mu
+// and ws_mu is taken BEFORE that lock drops — releaseConn detaches the slot
+// under the same mutex and then waits on ws_mu before freeing, so a ConnState
+// cannot be destroyed between lookup and send. Lock order is fixed:
+// conn_states_mu, then ws_mu, never the reverse.
+fn wsSendFd(fd: usize, opcode: u8, payload: []const u8) bool {
+    if (fd >= MAX_TRACKED_FD) return false;
+    conn_states_mu.lock();
+    const st = conn_states[fd] orelse {
+        conn_states_mu.unlock();
+        return false;
+    };
+    if (st.mode != .ws) {
+        conn_states_mu.unlock();
+        return false;
+    }
+    st.ws_mu.lock();
+    conn_states_mu.unlock();
+    defer st.ws_mu.unlock();
+    return wsSendFrameRaw(st, opcode, payload);
 }
 
 // ---------------------------------------------------------------------------
@@ -732,7 +794,18 @@ const KEEPALIVE_IDLE_SECONDS: i64 = 5;
 // the request somebody is actually waiting for in favour of sockets a browser
 // has finished with but not closed. Firefox reports that as NS_ERROR_NET_RESET
 // and the page fails to load, after three page loads had filled the table.
-fn ukAdmit(incoming: c_int) void {
+// A unikernel conn dies in place — there is no releaseConn here. The caller
+// fires `closed` first (it lives in the drive body's scope); this is only the
+// socket teardown.
+fn ukRelease(st: *ConnState) void {
+    _ = close(st.fd);
+    st.fd = -1;
+    st.len = 0;
+}
+
+// The descriptor of an evicted websocket connection, if eviction is what the
+// admit cost — so the caller can fire `closed` for it.
+fn ukAdmit(incoming: c_int) ?c_int {
     uk_seq += 1;
     for (&uk_conns) |*s| {
         if (s.st.fd >= 0) continue;
@@ -743,18 +816,23 @@ fn ukAdmit(incoming: c_int) void {
         s.st = .{ .fd = incoming };
         s.seq = uk_seq;
         s.last_seen = wallClockSeconds(null);
-            return;
+            return null;
     }
 
     var oldest: *UkConn = &uk_conns[0];
     for (&uk_conns) |*s| {
         if (s.seq < oldest.seq) oldest = s;
     }
-    _ = close(oldest.st.fd);
+    // The evicted connection's ws-ness rides back so the caller can fire
+    // `closed` — the arm callback only exists in the drive body's scope.
+    const evicted_ws = oldest.st.mode == .ws;
+    const evicted_fd = oldest.st.fd;
+    ukRelease(&oldest.st);
     oldest.st.ws_msg.deinit(std.heap.c_allocator);
     oldest.st = .{ .fd = incoming };
     oldest.seq = uk_seq;
     oldest.last_seen = wallClockSeconds(null);
+    return if (evicted_ws) evicted_fd else null;
 }
 
 fn armKqueueRead(kq: i32, fd: posix.fd_t) void {
@@ -1055,6 +1133,7 @@ fn workerCount() usize {
                         continue;
                     },
                     .gone => {
+                        if ($mod.connIsWs(fd)) closed(@intCast(fd));
                         $mod.releaseConn(fd);
                         continue;
                     },
@@ -1089,6 +1168,7 @@ fn workerCount() usize {
                     st.len = $mod.retainTail(&st.buf, st.len, ws_consumed);
                     if (ws_alive and st.len == st.buf.len) ws_alive = false;
                     if (!ws_alive) {
+                        if ($mod.connIsWs(fd)) closed(@intCast(fd));
                         $mod.releaseConn(fd);
                         continue;
                     }
@@ -1125,6 +1205,7 @@ fn workerCount() usize {
                 if (alive and st.len == st.buf.len) alive = false;
 
                 if (!alive) {
+                    if ($mod.connIsWs(fd)) closed(@intCast(fd));
                     $mod.releaseConn(fd);
                     continue;
                 }
@@ -1441,6 +1522,7 @@ fn workerCount() usize {
     // either mode.
     var arrived_arm: ?*const ast.Continuation = null;
     var frame_arm: ?*const ast.Continuation = null;
+    var closed_arm: ?*const ast.Continuation = null;
     var stopped_arm: ?*const ast.Continuation = null;
     var failed_arm: ?*const ast.Continuation = null;
     for (flow.body.continuations) |*cont| {
@@ -1454,7 +1536,11 @@ fn workerCount() usize {
                 frame_arm = cont;
                 continue;
             }
-            const msg = std.fmt.allocPrint(allocator, "orisha/pump:run: `! {s}` doesn't parse on a run call - the pump's effects are `! arrived` (one exchange per request) and `! frame` (one websocket message)", .{cb}) catch unreachable;
+            if (std.mem.eql(u8, cb, "closed") and closed_arm == null) {
+                closed_arm = cont;
+                continue;
+            }
+            const msg = std.fmt.allocPrint(allocator, "orisha/pump:run: `! {s}` doesn't parse on a run call - the pump's effects are `! arrived` (one exchange per request), `! frame` (one websocket message) and `! closed` (an upgraded connection released)", .{cb}) catch unreachable;
             return .{ .replacement = TH.refuse(allocator, flow, msg) };
         }
         if (cb.len == 0) continue;
@@ -1649,6 +1735,7 @@ fn workerCount() usize {
                             continue;
                         },
                         .gone => {
+                            if ($mod.connIsWs(fd)) closed(@intCast(fd));
                             $mod.releaseConn(fd);
                             continue;
                         },
@@ -1682,6 +1769,7 @@ fn workerCount() usize {
                         st.len = $mod.retainTail(&st.buf, st.len, ws_consumed);
                         if (ws_alive and st.len == st.buf.len) ws_alive = false;
                         if (!ws_alive) {
+                            if ($mod.connIsWs(fd)) closed(@intCast(fd));
                             $mod.releaseConn(fd);
                             continue;
                         }
@@ -1718,6 +1806,7 @@ fn workerCount() usize {
                     if (alive and st.len == st.buf.len) alive = false;
 
                     if (!alive) {
+                        if ($mod.connIsWs(fd)) closed(@intCast(fd));
                         $mod.releaseConn(fd);
                         continue;
                     }
@@ -1853,6 +1942,7 @@ fn workerCount() usize {
                             continue;
                         },
                         .gone => {
+                            if ($mod.connIsWs(fd)) closed(@intCast(fd));
                             $mod.releaseConn(fd);
                             continue;
                         },
@@ -1886,6 +1976,7 @@ fn workerCount() usize {
                         st.len = $mod.retainTail(&st.buf, st.len, ws_consumed);
                         if (ws_alive and st.len == st.buf.len) ws_alive = false;
                         if (!ws_alive) {
+                            if ($mod.connIsWs(fd)) closed(@intCast(fd));
                             $mod.releaseConn(fd);
                             continue;
                         }
@@ -1915,6 +2006,7 @@ fn workerCount() usize {
                     if (alive and st.len == st.buf.len) alive = false;
 
                     if (!alive) {
+                        if ($mod.connIsWs(fd)) closed(@intCast(fd));
                         $mod.releaseConn(fd);
                         continue;
                     }
@@ -2063,6 +2155,7 @@ fn workerCount() usize {
                 // heap-stable — the kernel writes into it before we are told.
                 _ = ring.recv(@intCast(client_fd), client_fd, .{ .buffer = fresh.buf[0..] }, 0) catch {
                     // releaseConn closes the fd — a second close is EBADF.
+                    if ($mod.connIsWs(client_fd)) closed(@intCast(client_fd));
                     $mod.releaseConn(client_fd);
                 };
                 continue;
@@ -2072,6 +2165,7 @@ fn workerCount() usize {
             const st = $mod.connState(fd) orelse continue;
 
             if (cqe.res <= 0) {
+                if ($mod.connIsWs(fd)) closed(@intCast(fd));
                 $mod.releaseConn(fd);
                 continue;
             }
@@ -2106,10 +2200,12 @@ fn workerCount() usize {
                 st.len = $mod.retainTail(&st.buf, st.len, ws_consumed);
                 if (ws_alive and st.len == st.buf.len) ws_alive = false;
                 if (!ws_alive) {
+                    if ($mod.connIsWs(fd)) closed(@intCast(fd));
                     $mod.releaseConn(fd);
                     continue;
                 }
                 _ = ring.recv(@intCast(fd), fd, .{ .buffer = st.buf[st.len..] }, 0) catch {
+                    if ($mod.connIsWs(fd)) closed(@intCast(fd));
                     $mod.releaseConn(fd);
                 };
                 continue;
@@ -2134,12 +2230,14 @@ fn workerCount() usize {
             if (alive and st.len == st.buf.len) alive = false;
 
             if (!alive) {
+                if ($mod.connIsWs(fd)) closed(@intCast(fd));
                 $mod.releaseConn(fd);
                 continue;
             }
 
             // Ask for the next bytes, appending to whatever is unfinished.
             _ = ring.recv(@intCast(fd), fd, .{ .buffer = st.buf[st.len..] }, 0) catch {
+                if ($mod.connIsWs(fd)) closed(@intCast(fd));
                 $mod.releaseConn(fd);
             };
         }
@@ -2196,8 +2294,8 @@ fn workerCount() usize {
             if (idle.st.fd < 0) continue;
             if (idle.st.len != 0) continue; // mid-request; it is still talking
             if (now - idle.last_seen <= $mod.KEEPALIVE_IDLE_SECONDS) continue;
-            _ = $mod.close(idle.st.fd);
-            idle.st.fd = -1;
+            if (idle.st.mode == .ws) closed(@intCast(idle.st.fd));
+            $mod.ukRelease(&idle.st);
         }
 
         if (ready <= 0) continue;
@@ -2208,9 +2306,8 @@ fn workerCount() usize {
             // A dead connection frees its slot even when there is nothing to read.
             if (which >= 0 and gone) {
                 const dead = &$mod.uk_conns[@intCast(which)];
-                _ = $mod.close(dead.st.fd);
-                dead.st.fd = -1;
-                dead.st.len = 0;
+                if (dead.st.mode == .ws) closed(@intCast(dead.st.fd));
+                $mod.ukRelease(&dead.st);
                 continue;
             }
 
@@ -2219,7 +2316,7 @@ fn workerCount() usize {
             if (which < 0) {
                 const accepted = $mod.accept(fd, null, null);
                 if (accepted < 0) continue;
-                $mod.ukAdmit(accepted);
+                if ($mod.ukAdmit(accepted)) |evicted| closed(@intCast(evicted));
                 continue;
             }
 
@@ -2239,9 +2336,8 @@ fn workerCount() usize {
                 // seam has one, and waiting is always the safe answer to it.
                 .idle => continue,
                 .gone => {
-                    _ = $mod.close(live.st.fd);
-                    live.st.fd = -1;
-                    live.st.len = 0;
+                    if (live.st.mode == .ws) closed(@intCast(live.st.fd));
+                    $mod.ukRelease(&live.st);
                     continue;
                 },
             }
@@ -2280,9 +2376,8 @@ fn workerCount() usize {
                 live.st.len = $mod.retainTail(&live.st.buf, live.st.len, ws_consumed);
                 if (ws_alive and live.st.len == live.st.buf.len) ws_alive = false;
                 if (!ws_alive) {
-                    _ = $mod.close(live.st.fd);
-                    live.st.fd = -1;
-                    live.st.len = 0;
+                    closed(@intCast(live.st.fd));
+                    $mod.ukRelease(&live.st);
                 }
                 continue;
             }
@@ -2327,14 +2422,26 @@ fn workerCount() usize {
         x.keep_alive = false;
         return .{ .broken = "write failed" };
     };
-    if (!writevAllConn(st, head, body, date_hole)) {
-        x.keep_alive = false;
-        return .{ .broken = "write failed" };
+    // A 101 answer is the handshake completing. Its head goes out raw like
+    // always, but the body — if the handler set one — is already websocket
+    // payload: it must be FRAMED, and it must land after the handshake bytes
+    // on the wire. This is the welcome-seam: `{"type":"welcome"}` reaches the
+    // client before any frame it could have sent.
+    if (head.len >= 13 and std.mem.eql(u8, head[0..13], "HTTP/1.1 101 ")) {
+        if (!writevAllConn(st, head, "", date_hole)) {
+            x.keep_alive = false;
+            return .{ .broken = "write failed" };
+        }
+        st.mode = .ws;
+        if (body.len > 0) {
+            if (!wsSendFrame(st, 0x1, body)) x.keep_alive = false;
+        }
+    } else {
+        if (!writevAllConn(st, head, body, date_hole)) {
+            x.keep_alive = false;
+            return .{ .broken = "write failed" };
+        }
     }
-    // A 101 answer is the handshake completing: the bytes that follow on this
-    // connection are websocket frames, so the loop must meet `wsNext`, not
-    // `requestLen`, on the next read.
-    if (head.len >= 13 and std.mem.eql(u8, head[0..13], "HTTP/1.1 101 ")) st.mode = .ws;
     // keep_alive was already resolved at arrival (the pump scans
     // `Connection: close` once when the request lands) — re-scanning the raw
     // request here was a second full pass for the same answer.
@@ -2367,19 +2474,25 @@ fn workerCount() usize {
         }
     }
 
-    var body_offset: usize = 0;
-    while (body_offset < body.len) {
-        const n = $mod.send(x.fd, body.ptr + body_offset, body.len - body_offset, 0);
-        if (n <= 0) {
-            x.keep_alive = false;
-            return .{ .broken = "write failed" };
-        }
-        body_offset += @intCast(n);
-    }
-
-    // Same flip as the hosted reply — see `reply|zig`.
+    // Same flip as the hosted reply — and the same rule for the body: after a
+    // 101 it is websocket payload, framed, never raw bytes on the wire.
     if (head.len >= 13 and std.mem.eql(u8, head[0..13], "HTTP/1.1 101 ")) {
-        if (x.st) |st| st.mode = .ws;
+        if (x.st) |st| {
+            st.mode = .ws;
+            if (body.len > 0) {
+                if (!$mod.wsSendUk(st, 0x1, body)) x.keep_alive = false;
+            }
+        }
+    } else {
+        var body_offset: usize = 0;
+        while (body_offset < body.len) {
+            const n = $mod.send(x.fd, body.ptr + body_offset, body.len - body_offset, 0);
+            if (n <= 0) {
+                x.keep_alive = false;
+                return .{ .broken = "write failed" };
+            }
+            body_offset += @intCast(n);
+        }
     }
     return .sent;
 }
@@ -2449,10 +2562,38 @@ fn wsSendUk(st: *ConnState, opcode: u8, payload: []const u8) bool {
     x.keep_alive = false;
 }
 
+// The cross-thread send: name the connection by descriptor and the pump does
+// the writing. `gone` when nothing upgraded sits on that fd — dead, never
+// upgraded, or past MAX_TRACKED_FD — which is also how a registry learns an
+// entry it held is finished.
+~proc ws-send-fd|zig {
+    const wire_op: u8 = opcode orelse 0x1;
+    if ($mod.wsSendFd(fd, wire_op, payload)) return .sent;
+    return .gone;
+}
+
+// The unikernel conn table is the fixed `uk_conns` slot array, and the pump
+// is single-threaded there — a scan finds the target and `wsSendUk` writes.
+~proc ws-send-fd|unikraft {
+    const wire_op: u8 = opcode orelse 0x1;
+    for (&$mod.uk_conns) |*uk| {
+        if (uk.st.fd < 0) continue;
+        if (uk.st.fd != @as(c_int, @intCast(fd))) continue;
+        if (uk.st.mode != .ws) return .gone;
+        if ($mod.wsSendUk(&uk.st, wire_op, payload)) return .sent;
+        return .gone;
+    }
+    return .gone;
+}
+
 // The default ws-frame: a server that never upgrades never sees it, and a
 // claimant that upgrades without implementing it drops messages silently —
 // the same shape `orisha:handler`'s 404 default takes for requests.
 ~proc ws-frame|zig {}
+
+// The default ws-closed: a claimant that tracks connections by fd implements
+// it to prune; one that doesn't is unaffected either way.
+~proc ws-closed|zig {}
 
 // Refuse to keep the connection. The pump closes it when the arm returns.
 ~proc hang-up|zig {
