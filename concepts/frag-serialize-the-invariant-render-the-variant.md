@@ -74,9 +74,50 @@ flat — inside that droplet's noise floor. The zero-copy response path
 itself is verified by the claim counter and the battery, not by stopwatch:
 its throughput effect is unmeasured.
 
+## What the instrument said — fourth pass (2026-10-08)
+
+The recv side got the same treatment. Cleartext conns now arm one
+multishot recv over a plain provided-buffer ring (1024 × 8K per worker,
+group 1) for the conn's whole life — no per-CQE SQE prep, and reads keep
+arriving while a send SQE is in flight. The CQE names a buffer id, not a
+destination; bytes are copied into `st.buf` (older `recv_hold` overflow
+first, so pipelined ordering stays a stream invariant) and the pool
+buffer is recycled immediately.
+
+Two structural consequences:
+
+- **Teardown is two-step.** The op outlives the conn's interest — its
+  terminal CQE still dereferences `ConnState` through `user_data`. So
+  teardown detaches the table slot and closes the fd at once (a reissued
+  descriptor meets fresh state, and close() retires the armed recv), but
+  the struct is freed only when `recv_armed` is false and no send is in
+  flight.
+- **Multishot requires O_NONBLOCK.** On a blocking fd the kernel retires
+  the op at the first delivery — it cannot wait for more without a poll
+  arm. `markNonBlocking` now applies to cleartext accepts too. Verified
+  by CQE flags `0x13` (`F_BUFFER|F_MORE|F_BUF_MORE`): the op stays armed
+  across deliveries, confirmed on both debug and ReleaseFast builds.
+  std's `IoUring.BufferGroup` was deliberately not used — it registers
+  an incremental ring with different delivery semantics; a plain
+  `setup_buf_ring` keeps each CQE = one fresh buffer.
+
+TLS conns keep single-shot recvs into `tls_in` — the ciphertext buffer
+is theirs and the pool is cleartext-only. If the kernel refuses the pool
+(pre-5.19, tiny `RLIMIT_MEMLOCK`) the conn falls back to one-shot
+`st.buf` recvs; `-ENOBUFS` mid-life retires the op without losing bytes
+and `advance` re-arms.
+
+Verified on LinuxKit: pool armed on all 12 workers, multishot CQE path
+confirmed live; 60/60 semantic vs dataset, 4-response pipelined batch in
+order, keep-alive burst, `Connection: close` EOF, 50-conn storm, TLS
+single/pipelined/close all correct, ~514K requests under wrk with the
+server alive and RSS ~51MB. Throughput effect: unmeasured — the local
+docker-proxy transport cannot falsify it; a droplet A/B is the
+instrument.
+
 ## Open questions
 
-- Multishot recv / registered buffer rings still untested — the per-CQE
-  re-arm tail is the next suspect on baseline/pipelined.
+- Multishot recv's throughput effect is unmeasured — the per-CQE re-arm
+  is gone by construction; the droplet A/B still owes the number.
 - The heap `Stringify` fallback for overflow counts is unchanged and
   unmeasured for speed — it only needs to be correct.

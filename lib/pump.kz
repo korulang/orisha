@@ -235,6 +235,16 @@ pub const ConnState = struct {
     send_off: usize = 0,
     send_len: usize = 0,
     ring_dead: bool = false,
+    // Multishot recv on provided buffers stays armed for the conn's whole
+    // life, so it is the one op that outlives teardown interest: its terminal
+    // CQE still dereferences this struct through user_data. ring_closing
+    // marks the conn detached+closed; the free waits for both arms to fold.
+    // recv_hold parks the overflow when a pool buffer delivers more than
+    // st.buf has room for — a streamed request must not be cut mid-parse.
+    recv_armed: bool = false,
+    ring_closing: bool = false,
+    recv_hold: std.ArrayListUnmanaged(u8) = .{},
+    recv_hold_off: usize = 0,
     // Ring-TLS conns: `ssl` rides a memory-BIO pair, so the wire is ours.
     // tls_in is the ciphertext buffer the recv SQE fills; tls_plain holds
     // plaintext owed to the cipher when SSL_write wants more input first;
@@ -281,6 +291,17 @@ fn connState(fd: posix.fd_t) ?*ConnState {
     return s;
 }
 
+// The ring pump drops the table slot the moment a conn is dead — a reissued
+// descriptor must meet fresh state, not a zombie whose multishot recv is
+// still folding in. The ConnState itself is freed later, by the owner.
+fn detachConn(fd: posix.fd_t) void {
+    const idx: usize = @intCast(fd);
+    if (idx >= MAX_TRACKED_FD) return;
+    conn_states_mu.lock();
+    conn_states[idx] = null;
+    conn_states_mu.unlock();
+}
+
 fn releaseConn(fd: posix.fd_t) void {
     const idx: usize = @intCast(fd);
     if (idx >= MAX_TRACKED_FD) {
@@ -315,7 +336,10 @@ fn connIsWs(fd: posix.fd_t) bool {
     return s.mode == .ws;
 }
 
-fn closeConn(st: *ConnState) void {
+// TLS side of teardown: needs the live fd — the kTLS alert goes out on it.
+// Called on its own by the ring pump, where the fd close must come after
+// the table detach (a reissued descriptor must meet fresh state).
+fn closeConnTls(st: *ConnState) void {
     if (HAS_OPENSSL) {
         const mod = @import("root").koru_koru.koru_openssl;
         // Kernel-owned record layer: SSL is already gone, so the alert goes
@@ -327,14 +351,22 @@ fn closeConn(st: *ConnState) void {
             st.ssl = null;
         }
     }
+}
+
+fn closeConnWire(st: *ConnState) void {
+    closeConnTls(st);
     if (st.fd >= 0) {
         posix.shutdown(@intCast(st.fd), .both) catch {};
         posix.close(@intCast(st.fd));
         st.fd = -1;
     }
+}
+
+fn closeConnMem(st: *ConnState) void {
     st.ws_msg.deinit(std.heap.c_allocator);
     st.pending.deinit(std.heap.c_allocator);
     st.tls_plain.deinit(std.heap.c_allocator);
+    st.recv_hold.deinit(std.heap.c_allocator);
     if (st.send_buf.len > 0) {
         std.heap.c_allocator.free(st.send_buf);
         st.send_buf = &.{};
@@ -344,6 +376,11 @@ fn closeConn(st: *ConnState) void {
         st.tls_in = &.{};
     }
     st.len = 0;
+}
+
+fn closeConn(st: *ConnState) void {
+    closeConnWire(st);
+    closeConnMem(st);
 }
 
 fn shutdownConn(st: *ConnState) void {
@@ -2844,14 +2881,16 @@ fn workerCount() usize {
     // *ConnState tagged in the low bits, so a completion never touches the
     // connection table or its mutex.
     //
-    // Per connection at most one SQE is in flight (half-duplex): recv, or a
-    // send over send_buf. Replies stage into send_buf between completions and
-    // leave as ONE send SQE per readable batch — a 16-deep pipeline pays one
-    // send, not sixteen writes. Bytes written while a send is in flight queue
-    // in `pending` — send_buf is kernel-owned until its CQE lands — and drain
-    // into the tail at the next submission boundary. Teardown only ever runs
-    // inside a CQE, so a conn is never freed while the kernel still holds a
-    // reference to it.
+    // Per connection, at most one send SQE is in flight over send_buf, plus
+    // (cleartext, with a buffer pool) one multishot recv that stays armed for
+    // the conn's whole life — reads proceed while a send is outstanding, so
+    // a pipelined burst no longer queues behind the reply's own CQE. Replies
+    // stage into send_buf between completions and leave as ONE send SQE per
+    // readable batch — a 16-deep pipeline pays one send, not sixteen writes.
+    // Bytes written while a send is in flight queue in `pending` — send_buf
+    // is kernel-owned until its CQE lands — and drain into the tail at the
+    // next submission boundary. Teardown detaches and closes the fd at once
+    // but frees the ConnState only when every armed op has folded in.
 
     const W = struct {
         const TAG_SEND: u64 = 1;
@@ -2861,10 +2900,69 @@ fn workerCount() usize {
         ring: linux.IoUring,
         listen_fd: $mod.posix.fd_t,
         tls_listen_fd: $mod.posix.fd_t,
+        // Provided-buffer pool for cleartext multishot recv: the kernel picks
+        // the destination per packet and the op stays armed for the conn's
+        // life — no per-recv SQE prep, and reads proceed while a send is in
+        // flight. Null when the kernel won't register one (pre-5.19, tiny
+        // RLIMIT_MEMLOCK): those conns fall back to one-shot st.buf recvs.
+        //
+        // This is deliberately NOT std's IoUring.BufferGroup: that registers
+        // an incremental ring, and incremental rings change delivery
+        // semantics. A plain ring keeps each CQE = one fresh buffer.
+        bufgrp: ?*Pool = null,
+        ms_seen: bool = false,
         // One .unsupported from the installer means this kernel has no TLS
         // ULP — every later conn would probe the same dead path, so the
         // worker stops offering installs and TLS stays on memory BIOs.
         ktls_dead: bool = false,
+
+        const Pool = struct {
+            ring: *linux.IoUring,
+            buffers: []u8,
+            br: *linux.io_uring_buf_ring,
+            mask: u16,
+            size: u32,
+
+            fn init(ring: *linux.IoUring, size: u32, count: u16) !Pool {
+                const buffers = try std.heap.c_allocator.alloc(u8, @as(usize, size) * count);
+                errdefer std.heap.c_allocator.free(buffers);
+                const br = try linux.IoUring.setup_buf_ring(ring.fd, count, 1, .{ .inc = false });
+                linux.IoUring.buf_ring_init(br);
+                const mask = linux.IoUring.buf_ring_mask(count);
+                var i: u16 = 0;
+                while (i < count) : (i += 1) {
+                    const pos = @as(usize, size) * i;
+                    linux.IoUring.buf_ring_add(br, buffers[pos .. pos + size], i, mask, i);
+                }
+                linux.IoUring.buf_ring_advance(br, count);
+                return .{ .ring = ring, .buffers = buffers, .br = br, .mask = mask, .size = size };
+            }
+
+            fn arm(p: *Pool, user_data: u64, fd: $mod.posix.fd_t) !*linux.io_uring_sqe {
+                const sqe = try p.ring.get_sqe();
+                sqe.prep_rw(.RECV, fd, 0, 0, 0);
+                sqe.flags |= linux.IOSQE_BUFFER_SELECT;
+                sqe.buf_index = 1;
+                sqe.user_data = user_data;
+                sqe.ioprio |= linux.IORING_RECV_MULTISHOT;
+                return sqe;
+            }
+
+            fn sliceAt(p: *Pool, buffer_id: u16, n: usize) []u8 {
+                const pos = @as(usize, p.size) * buffer_id;
+                return p.buffers[pos .. pos + n];
+            }
+
+            // Hand the CQE's buffer straight back — recycled the moment it is
+            // consumed so a deep batch can't starve the pool.
+            fn release(p: *Pool, cqe: linux.io_uring_cqe) void {
+                const bid = cqe.buffer_id() catch return;
+                const pos = @as(usize, p.size) * bid;
+                linux.IoUring.buf_ring_add(p.br, p.buffers[pos .. pos + p.size], bid, p.mask, 0);
+                linux.IoUring.buf_ring_advance(p.br, 1);
+            }
+
+        };
 
         fn udSend(st: *$mod.ConnState) u64 {
             return @intFromPtr(st) | TAG_SEND;
@@ -2874,23 +2972,64 @@ fn workerCount() usize {
             return @ptrFromInt(@as(usize, @intCast(ud & ~@as(u64, 3))));
         }
 
+        // A multishot recv is armed for the conn's whole life, so teardown is
+        // two-step: the slot is detached and the fd closed NOW (a reissued
+        // descriptor must meet fresh state), and close() makes the kernel
+        // retire the armed recv — its terminal CQE is what frees st. Frees
+        // deferred until nothing in flight can still name the struct.
         fn teardown(w: *@This(), st: *$mod.ConnState) void {
-            // Callers promise no SQE is in flight for this conn — the only
-            // teardown sites are CQEs (op consumed) and prep failures (op
-            // never queued), which is what makes the free safe.
+            if (!st.ring_closing) {
+                st.ring_closing = true;
+                st.ring_dead = true;
+                if ($mod.connIsWs(st.fd)) closed(@intCast(st.fd));
+                if ($mod.HAS_OPENSSL) $mod.closeConnTls(st);
+                if (st.fd >= 0) {
+                    $mod.detachConn(st.fd);
+                    $mod.posix.shutdown(@intCast(st.fd), .both) catch {};
+                    $mod.posix.close(@intCast(st.fd));
+                    st.fd = -1;
+                }
+            }
+            w.maybeFreeRing(st);
+        }
+
+        fn maybeFreeRing(w: *@This(), st: *$mod.ConnState) void {
             _ = w;
-            if ($mod.connIsWs(st.fd)) closed(@intCast(st.fd));
-            $mod.releaseConn(st.fd);
+            if (!st.ring_closing or st.recv_armed or st.send_len != 0) return;
+            // Nothing can still reference st: recv folded, no send in flight,
+            // fd already detached and closed. A `ws-send-fd` pusher could be
+            // mid-write — same wait releaseConn does.
+            st.ws_mu.lock();
+            defer st.ws_mu.unlock();
+            $mod.closeConnMem(st);
+            std.heap.c_allocator.destroy(st);
         }
 
         fn submitRecv(w: *@This(), st: *$mod.ConnState) bool {
             // TLS conns receive ciphertext into tls_in at the residual offset
             // — a record split across CQEs stays buffered until it completes.
             // st.buf is where plaintext accumulates once rbio has been fed.
-            const buf: []u8 = if ($mod.HAS_OPENSSL and st.ssl != null)
-                st.tls_in[st.tls_in_used..]
-            else
-                st.buf[st.len..];
+            if ($mod.HAS_OPENSSL and st.ssl != null) {
+                const buf = st.tls_in[st.tls_in_used..];
+                _ = w.ring.recv(@intFromPtr(st), st.fd, .{ .buffer = buf }, 0) catch {
+                    _ = w.ring.submit() catch {};
+                    _ = w.ring.recv(@intFromPtr(st), st.fd, .{ .buffer = buf }, 0) catch return false;
+                };
+                return true;
+            }
+            // Cleartext: one multishot recv rides the provided-buffer pool for
+            // the conn's whole life — nothing to re-arm per batch. Already
+            // armed conns (and the send-in-flight window) just return.
+            if (st.recv_armed) return true;
+            if (w.bufgrp) |bg| {
+                _ = bg.arm(@intFromPtr(st), st.fd) catch {
+                    _ = w.ring.submit() catch {};
+                    _ = bg.arm(@intFromPtr(st), st.fd) catch return false;
+                };
+                st.recv_armed = true;
+                return true;
+            }
+            const buf = st.buf[st.len..];
             _ = w.ring.recv(@intFromPtr(st), st.fd, .{ .buffer = buf }, 0) catch {
                 _ = w.ring.submit() catch {};
                 _ = w.ring.recv(@intFromPtr(st), st.fd, .{ .buffer = buf }, 0) catch return false;
@@ -3007,7 +3146,10 @@ fn workerCount() usize {
                 if (cqe.res >= 0) {
                     const cfd: $mod.posix.fd_t = @intCast(cqe.res);
                     $mod.disableNagle(cfd);
-                    if (is_tls) $mod.markNonBlocking(cfd);
+                    // Multishot recv terminates at the first delivery on a
+                    // blocking fd — the kernel cannot wait for more without
+                    // a poll arm. O_NONBLOCK keeps it armed across CQEs.
+                    $mod.markNonBlocking(cfd);
                     if ($mod.connState(cfd)) |st| {
                         st.len = 0;
                         st.owner_ring = @ptrCast(w);
@@ -3073,9 +3215,14 @@ fn workerCount() usize {
                 return;
             }
 
-            // recv completion — for a cleartext conn the bytes are already in
-            // st.buf and the count arrives in cqe.res. TLS conns received
-            // ciphertext into tls_in instead — feed rbio, drive the cipher.
+            // recv completion. recv_armed means the conn's bytes ride the
+            // provided-buffer pool — the CQE names a buffer id, not a place
+            // we chose. TLS conns got ciphertext into tls_in instead; pool-less
+            // cleartext lands in st.buf. Both are one-shot: the op is consumed.
+            if (st.recv_armed) {
+                w.msRecvCqe(st, cqe);
+                return;
+            }
             if (cqe.res <= 0 or st.ring_dead) {
                 w.teardown(st);
                 return;
@@ -3089,6 +3236,79 @@ fn workerCount() usize {
             st.len += @intCast(cqe.res);
             w.dispatchReadable(st);
             w.advance(st);
+        }
+
+        // A multishot recv CQE: res bytes sit in pool buffer `buffer_id`,
+        // IORING_CQE_F_MORE says the op stays armed. Bytes join st.buf (older
+        // recv_hold overflow first — pipelined ordering is a stream invariant),
+        // the pool buffer goes straight back, and dispatch runs on the same
+        // contiguous view the other pumps have.
+        fn msRecvCqe(w: *@This(), st: *$mod.ConnState, cqe: linux.io_uring_cqe) void {
+            if (!w.ms_seen) {
+                w.ms_seen = true;
+                std.debug.print("Pump: multishot recv live on provided buffers\n", .{});
+            }
+            const bg = w.bufgrp.?;
+            if (cqe.res > 0) {
+                const n: usize = @intCast(cqe.res);
+                if (cqe.buffer_id()) |bid| {
+                    w.drainRecvHold(st);
+                    const buf = bg.sliceAt(bid, n);
+                    const room = st.buf.len - st.len;
+                    const fit = @min(room, n);
+                    @memcpy(st.buf[st.len..][0..fit], buf[0..fit]);
+                    st.len += fit;
+                    if (n > fit) {
+                        st.recv_hold.appendSlice(std.heap.c_allocator, buf[fit..n]) catch {
+                            st.ring_dead = true;
+                        };
+                    }
+                } else |_| {
+                    // A buffer id we cannot resolve means lost wire bytes —
+                    // the stream is desynced, so the conn cannot continue.
+                    st.ring_dead = true;
+                }
+                bg.release(cqe);
+            }
+            if (cqe.flags & linux.IORING_CQE_F_MORE == 0) st.recv_armed = false;
+            if (st.ring_dead or cqe.res == 0) {
+                w.teardown(st);
+                return;
+            }
+            if (cqe.res < 0) {
+                // -ENOBUFS means the pool ran dry mid-storm: the op retired
+                // with nothing lost (the kernel kept the bytes), and advance
+                // re-arms. Anything else kills the conn.
+                if (cqe.res == -@as(i32, @intFromEnum(linux.E.NOBUFS))) {
+                    w.advance(st);
+                    return;
+                }
+                w.teardown(st);
+                return;
+            }
+            w.dispatchReadable(st);
+            w.drainRecvHold(st);
+            w.advance(st);
+        }
+
+        // recv_hold is overflow from a pool buffer that out-ran st.buf's
+        // remaining room — parked bytes, older than anything still on the
+        // wire. Each dispatch may free room; drain what fits and re-dispatch
+        // until the hold empties or the buffer genuinely fills.
+        fn drainRecvHold(w: *@This(), st: *$mod.ConnState) void {
+            while (!st.ring_dead and st.len < st.buf.len and st.recv_hold_off < st.recv_hold.items.len) {
+                const room = st.buf.len - st.len;
+                const avail = st.recv_hold.items.len - st.recv_hold_off;
+                const n = @min(room, avail);
+                @memcpy(st.buf[st.len..][0..n], st.recv_hold.items[st.recv_hold_off..][0..n]);
+                st.len += n;
+                st.recv_hold_off += n;
+                if (st.recv_hold_off == st.recv_hold.items.len) {
+                    st.recv_hold.clearRetainingCapacity();
+                    st.recv_hold_off = 0;
+                }
+                w.dispatchReadable(st);
+            }
         }
 
         // Answer every complete request (or frame, once upgraded) already
@@ -3258,6 +3478,18 @@ fn workerCount() usize {
             else
                 -1;
             var w = @This(){ .ring = ring, .listen_fd = listen_fd, .tls_listen_fd = tls_listen_fd };
+            // 1024 pool buffers of 8K per worker — far more than the deepest
+            // CQE batch (512) can hold hostage, since each buffer is recycled
+            // the moment its CQE is processed. Requests bigger than a buffer
+            // simply arrive as several CQEs; st.buf accumulates them.
+            var bg_store: ?Pool = Pool.init(&w.ring, 8192, 1024) catch |e| blk: {
+                std.debug.print("Pump: provided-buffer pool refused ({s}) — conns use one-shot recv\n", .{@errorName(e)});
+                break :blk null;
+            };
+            if (bg_store) |*bg| {
+                w.bufgrp = bg;
+                std.debug.print("Pump: buffer pool armed\n", .{});
+            }
             _ = w.ring.accept_multishot($mod.URING_ACCEPT, listen_fd, null, null, 0) catch {
                 std.debug.print("Pump: io_uring accept arm failed\n", .{});
                 return;
