@@ -418,15 +418,30 @@ fn appendPending(st: *ConnState, segments: []const []const u8) bool {
         // shares only that region under ws_mu, never the buffer a submit is
         // about to pin.
         if (st.send_len == 0 and st.mode != .ws) {
-            if (st.send_staged + need > MAX_PENDING) return false;
-            if (st.send_buf.len < st.send_staged + need) {
-                const nb = std.heap.c_allocator.alloc(u8, @max(4096, st.send_buf.len * 2, st.send_staged + need)) catch return false;
-                @memcpy(nb[0..st.send_staged], st.send_buf[0..st.send_staged]);
-                if (st.send_buf.len > 0) std.heap.c_allocator.free(st.send_buf);
-                st.send_buf = nb;
-            }
             for (segments) |seg| {
-                @memcpy(st.send_buf[st.send_staged..][0..seg.len], seg);
+                if (seg.len == 0) continue;
+                // Rendered straight into send_buf via ringRenderTarget —
+                // claim the span instead of copying it. The renderer
+                // reserved capacity, so the buffer cannot need growth here.
+                if (seg.ptr == st.send_buf.ptr + st.send_staged) {
+                    st.send_staged += seg.len;
+                    continue;
+                }
+                if (st.send_staged + seg.len > MAX_PENDING) return false;
+                if (st.send_buf.len < st.send_staged + seg.len) {
+                    const nb = std.heap.c_allocator.alloc(u8, @max(4096, st.send_buf.len * 2, st.send_staged + seg.len)) catch return false;
+                    @memcpy(nb[0..st.send_staged], st.send_buf[0..st.send_staged]);
+                    if (st.send_buf.len > 0) std.heap.c_allocator.free(st.send_buf);
+                    st.send_buf = nb;
+                }
+                // A slice inside send_buf but not at the staged boundary
+                // can only be a displaced pre-stage — the ranges overlap,
+                // so forwards is the defined order.
+                if (@intFromPtr(seg.ptr) -% @intFromPtr(st.send_buf.ptr) < st.send_buf.len) {
+                    std.mem.copyForwards(u8, st.send_buf[st.send_staged..][0..seg.len], seg);
+                } else {
+                    @memcpy(st.send_buf[st.send_staged..][0..seg.len], seg);
+                }
                 st.send_staged += seg.len;
             }
             return true;
@@ -443,6 +458,26 @@ fn appendPending(st: *ConnState, segments: []const []const u8) bool {
     st.pending.ensureUnusedCapacity(std.heap.c_allocator, need) catch return false;
     for (segments) |seg| st.pending.appendSliceAssumeCapacity(seg);
     return true;
+}
+
+// A renderer may ask for space inside the dispatching conn's send_buf and
+// write the response where it will be sent from — appendPending claims the
+// span by pointer match instead of copying it. Null wherever staging into
+// send_buf would be unsafe: a send SQE owns the buffer while in flight, ws
+// shares it under ws_mu, and a mem-BIO TLS conn owes the bytes a trip
+// through the cipher before they may touch the wire.
+pub fn ringRenderTarget(fd: posix.fd_t, min_len: usize) ?[]u8 {
+    const st = connState(@intCast(fd)) orelse return null;
+    if (st.owner_ring == null or st.mode == .ws or st.send_len != 0) return null;
+    if (HAS_OPENSSL and st.ssl != null) return null;
+    if (st.send_staged + min_len > MAX_PENDING) return null;
+    if (st.send_buf.len < st.send_staged + min_len) {
+        const nb = std.heap.c_allocator.alloc(u8, @max(4096, st.send_buf.len * 2, st.send_staged + min_len)) catch return null;
+        @memcpy(nb[0..st.send_staged], st.send_buf[0..st.send_staged]);
+        if (st.send_buf.len > 0) std.heap.c_allocator.free(st.send_buf);
+        st.send_buf = nb;
+    }
+    return st.send_buf[st.send_staged..];
 }
 
 // Append an ordered segment to the queue and try to drain — the shape every

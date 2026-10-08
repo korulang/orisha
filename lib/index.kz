@@ -597,8 +597,14 @@ const RESPONSE_500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\
         // Baked messages carry no Date — it is serve-time (RFC 9110 §10.1.1),
         // so the send path splices the current line in after the status line.
         // `date_hole` is that insertion offset; 0 means "head is already
-        // complete" and every non-baked head takes it.
-        const hole = if (std.mem.indexOfScalar(u8, res.body, '\r')) |cr| cr + 2 else 0;
+        // complete" and every non-baked head takes it. A baked head that
+        // rendered its own Date right at the splice point is complete too —
+        // splicing would emit the field twice.
+        var hole: usize = 0;
+        if (std.mem.indexOfScalar(u8, res.body, '\r')) |cr| {
+            const at = cr + 2;
+            if (at + 6 > res.body.len or !std.mem.eql(u8, res.body[at..][0..6], "Date: ")) hole = at;
+        }
         return .{ .head = res.body, .body = "", .body_allocated = false, .date_hole = hole, .close = res.close };
     }
 

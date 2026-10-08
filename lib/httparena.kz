@@ -180,11 +180,12 @@ const Impl = struct {
         }
 
         // The complete wire message — status line, headers, JSON — written
-        // once, contiguously, into body_work. Returning it as the Response
-        // body puts it on the pre-rendered path (answer() ships "HTTP/1."
-        // bodies verbatim), so the only copy left is appendPending's into
-        // the send buffer.
-        fn jsonResponse(source: []const CachedItem, count: usize, m: i64) ?[]const u8 {
+        // once, contiguously. When the request rides an io_uring conn whose
+        // send buffer is unpinned, ringRenderTarget hands back that exact
+        // staging span and appendPending claims it by pointer — the response
+        // is never copied at all. Otherwise the body_work scratch serves and
+        // the old single-copy path applies.
+        fn jsonResponse(source: []const CachedItem, count: usize, m: i64, fd: usize) ?[]const u8 {
             var jh: [32]u8 = undefined;
             const jhs = std.fmt.bufPrint(&jh, "{{\"count\":{d},\"items\":[", .{count}) catch return null;
             var body_len: usize = jhs.len + 2;
@@ -193,19 +194,28 @@ const Impl = struct {
                 body_len += item.prefix.len + digitsLen(item.price * item.quantity * m) + 1;
                 if (i > 0) body_len += 1;
             }
-            var hdr: [160]u8 = undefined;
+            var hdr: [200]u8 = undefined;
+            // The Date line is embedded at render time — httpDateLine() is
+            // the per-second threadlocal the send path splices in anyway —
+            // so the baked-head contract finds the field already present and
+            // emits the message as one unspliced segment.
             const hs = std.fmt.bufPrint(&hdr,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n",
-                .{body_len}) catch return null;
-            if (hs.len + body_len > body_work.len) return null;
-            @memcpy(body_work[0..hs.len], hs);
+                "HTTP/1.1 200 OK\r\n{s}Content-Type: application/json\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n",
+                .{ orisha.httpDateLine(), body_len }) catch return null;
+            const total = hs.len + body_len;
+            const dst: []u8 = if (fd != 0)
+                (orisha.koru_pump.ringRenderTarget(@intCast(fd), total) orelse
+                    (if (body_work.len >= total) body_work[0..] else return null))
+            else
+                (if (body_work.len >= total) body_work[0..] else return null);
+            @memcpy(dst[0..hs.len], hs);
             var p = hs.len;
-            @memcpy(body_work[p..][0..jhs.len], jhs);
+            @memcpy(dst[p..][0..jhs.len], jhs);
             p += jhs.len;
-            p += jsonItemsInto(body_work[p..], source, count, m) orelse return null;
-            body_work[p] = ']';
-            body_work[p + 1] = '}';
-            return body_work[0 .. p + 2];
+            p += jsonItemsInto(dst[p..], source, count, m) orelse return null;
+            dst[p] = ']';
+            dst[p + 1] = '}';
+            return dst[0 .. p + 2];
         }
 
         // Serialize {"items":[...],"count":N} — the same field order
@@ -302,7 +312,7 @@ const Impl = struct {
             };
 
             if (!wantsGzip(r.accept_encoding)) {
-                if (jsonResponse(cache, count, m)) |msg| {
+                if (jsonResponse(cache, count, m, r.fd)) |msg| {
                     return .{ .status = 200, .body = msg, .content_type = "application/json", .body_allocated = false };
                 }
             }

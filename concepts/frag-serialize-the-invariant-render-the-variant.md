@@ -49,11 +49,33 @@ unchanged, cleartext + TLS pipelined/keep-alive/close all correct. A wrk
 A/B through docker-proxy showed no resolvable delta — laptop timing cannot
 falsify this change; the droplet run is the instrument.
 
+## What the instrument said — third pass (2026-10-08)
+
+The last copy fell too. `Request.fd` names the conn; `ringRenderTarget(fd,
+len)` in pump.kz looks it up and — when the conn is ring-owned, non-ws,
+non-TLS, with no send SQE in flight — returns `send_buf[send_staged..]` as
+the render destination (growing it first). The renderer writes the wire
+message there directly and `appendPending` claims the span by pointer
+match, no memcpy. The Date splice would have displaced the span (the
+middle segment is external), so `jsonResponse` embeds the line itself via
+`httpDateLine()` and the baked-head contract learned that a `Date:` already
+at the splice point means `date_hole = 0` — identical wire bytes, one
+unspliced segment.
+
+A counter probe under wrk showed 217,089/217,927 json responses claimed
+without copy (~all; the delta is warmup traffic). Guards that refuse the
+target — send in flight, ws mode, live mem-BIO SSL — keep the unsafe cases
+on the copying path; a pipelined batch accumulates several rendered
+responses into `send_buf` contiguously and ships them in one send SQE.
+
+The earlier droplet A/B (second-pass binary vs its parent, same host,
+alternating): +4–10% best-of-3 on baseline/pipelined/jsoncomp, jsontls
+flat — inside that droplet's noise floor. The zero-copy response path
+itself is verified by the claim counter and the battery, not by stopwatch:
+its throughput effect is unmeasured.
+
 ## Open questions
 
-- `appendPending` still copies every response once. Removing it means the
-  app rendering into `send_buf` (or a per-conn slab) directly — a contract
-  change between httparena.kz and the ring, unmeasured.
 - Multishot recv / registered buffer rings still untested — the per-CQE
   re-arm tail is the next suspect on baseline/pipelined.
 - The heap `Stringify` fallback for overflow counts is unchanged and
