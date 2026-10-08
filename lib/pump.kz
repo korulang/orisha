@@ -55,6 +55,7 @@ const MAX_EVENTS = 64;
 // result, never a hint.
 const URING_ENTRIES: u16 = 4096;
 const URING_ACCEPT: u64 = std.math.maxInt(u64);
+const URING_ACCEPT_TLS: u64 = URING_ACCEPT - 1;
 
 // One read is not one request.
 //
@@ -234,6 +235,14 @@ pub const ConnState = struct {
     send_off: usize = 0,
     send_len: usize = 0,
     ring_dead: bool = false,
+    // Ring-TLS conns: `ssl` rides a memory-BIO pair, so the wire is ours.
+    // tls_in is the ciphertext buffer the recv SQE fills; tls_plain holds
+    // plaintext owed to the cipher when SSL_write wants more input first;
+    // send_buf/pending on a TLS conn always carry ciphertext.
+    tls_in: []u8 = &.{},
+    tls_plain: std.ArrayListUnmanaged(u8) = .{},
+    tls_plain_off: usize = 0,
+    tls_shutdown_sent: bool = false,
 };
 
 var conn_states: [MAX_TRACKED_FD]?*ConnState = .{null} ** MAX_TRACKED_FD;
@@ -308,9 +317,14 @@ fn closeConn(st: *ConnState) void {
     }
     st.ws_msg.deinit(std.heap.c_allocator);
     st.pending.deinit(std.heap.c_allocator);
+    st.tls_plain.deinit(std.heap.c_allocator);
     if (st.send_buf.len > 0) {
         std.heap.c_allocator.free(st.send_buf);
         st.send_buf = &.{};
+    }
+    if (st.tls_in.len > 0) {
+        std.heap.c_allocator.free(st.tls_in);
+        st.tls_in = &.{};
     }
     st.len = 0;
 }
@@ -374,6 +388,12 @@ fn appendPending(st: *ConnState, segments: []const []const u8) bool {
     for (segments) |seg| need += seg.len;
     if (st.owner_ring != null) {
         // Ring conns never flush inline — output is the next send SQE's job.
+        // TLS ring conns hold ciphertext in the wire regions, so response
+        // plaintext goes through the cipher first; wbio's output lands in
+        // send_buf/pending below.
+        if (HAS_OPENSSL) {
+            if (st.ssl != null) return tlsRingWrite(st, segments);
+        }
         // No send in flight means send_buf is unpinned and can grow under us;
         // with one in flight the kernel owns it, so bytes queue in pending
         // instead. ws conns always take the pending leg: a foreign pusher
@@ -1164,6 +1184,172 @@ fn driveTlsHandshake(st: *ConnState) TlsStep {
         std.mem.doNotOptimizeAway(st);
     }
     return .failed;
+}
+
+// ---------------------------------------------------------------------------
+// Ring-TLS — the io_uring pump's TLS plumbing
+// ---------------------------------------------------------------------------
+// A socket-fd SSL reads and writes the descriptor itself, which the ring
+// cannot honour — the recv SQE already owns the ciphertext. So a TLS ring
+// conn rides a memory-BIO pair instead: recv completes into `tls_in`, feeds
+// rbio, and SSL_read yields plaintext; everything owed to the wire —
+// handshake flights, records, close_notify — leaves wbio as ciphertext into
+// send_buf/pending. A TLS conn's wire queues therefore never hold plaintext;
+// `tls_plain` is the one place plaintext waits, for a cipher that wants more
+// input before it will take more output.
+const TLS_IN_CAP: usize = 64 * 1024;
+
+fn beginTlsHandshakeMem(client_fd: c_int) ?*ServerTls {
+    if (HAS_OPENSSL) {
+        const openssl = @import("root").koru_koru.koru_openssl;
+        const ctx = tls_server_ctx orelse return null;
+        const begun = openssl.sslMemBegin(ctx, std.heap.page_allocator);
+        return switch (begun) {
+            .ok => |ssl| blk: {
+                const conn = std.heap.page_allocator.create(openssl.Tls) catch {
+                    openssl.releaseServerSsl(ssl);
+                    posix.close(@intCast(client_fd));
+                    return null;
+                };
+                conn.* = .{ .ssl = ssl, .ctx = ctx.ctx, .owns_ctx = false, .fd = client_fd, .allocator = std.heap.page_allocator };
+                break :blk conn;
+            },
+            .err => {
+                posix.close(@intCast(client_fd));
+                return null;
+            },
+        };
+    } else {
+        posix.close(@intCast(client_fd));
+    }
+    return null;
+}
+
+// Ciphertext to the wire region: send_buf when unpinned (the common case —
+// appended after any already-staged bytes, so ordering holds), pending when
+// a send SQE owns the buffer.
+fn ringStageWire(st: *ConnState, ct: []const u8) bool {
+    if (ct.len == 0) return true;
+    if (st.send_len == 0) {
+        if (st.send_staged + ct.len > MAX_PENDING) return false;
+        if (st.send_buf.len < st.send_staged + ct.len) {
+            const nb = std.heap.c_allocator.alloc(u8, st.send_staged + ct.len) catch return false;
+            @memcpy(nb[0..st.send_staged], st.send_buf[0..st.send_staged]);
+            if (st.send_buf.len > 0) std.heap.c_allocator.free(st.send_buf);
+            st.send_buf = nb;
+        }
+        @memcpy(st.send_buf[st.send_staged..][0..ct.len], ct);
+        st.send_staged += ct.len;
+        return true;
+    }
+    if (pendingLen(st) + ct.len > MAX_PENDING) return false;
+    st.pending.ensureUnusedCapacity(std.heap.c_allocator, ct.len) catch return false;
+    st.pending.appendSliceAssumeCapacity(ct);
+    return true;
+}
+
+// Everything the cipher emitted since the last drain leaves wbio for the
+// wire queue — handshake flights and close_notify take the same path as
+// response records. When send_buf is unpinned the BIO reads straight into
+// the staged tail (one copy); mid-flight it detours through scratch to
+// pending because the kernel owns send_buf until its CQE lands.
+fn drainWbioRing(st: *ConnState) bool {
+    const mod = @import("root").koru_koru.koru_openssl;
+    const s = st.ssl.?.ssl orelse return false;
+    var scratch: [16384]u8 = undefined;
+    while (mod.sslMemOutPending(s) > 0) {
+        if (st.send_len == 0) {
+            const need = mod.sslMemOutPending(s);
+            if (st.send_staged + need > MAX_PENDING) return false;
+            if (st.send_buf.len < st.send_staged + need) {
+                const nb = std.heap.c_allocator.alloc(u8, st.send_staged + need) catch return false;
+                @memcpy(nb[0..st.send_staged], st.send_buf[0..st.send_staged]);
+                if (st.send_buf.len > 0) std.heap.c_allocator.free(st.send_buf);
+                st.send_buf = nb;
+            }
+            const n = mod.sslMemDrainOut(s, st.send_buf[st.send_staged .. st.send_staged + need]);
+            if (n == 0) break;
+            st.send_staged += n;
+            continue;
+        }
+        const n = mod.sslMemDrainOut(s, &scratch);
+        if (n == 0) break;
+        if (!ringStageWire(st, scratch[0..n])) return false;
+    }
+    return true;
+}
+
+fn tlsPlainLen(st: *ConnState) usize {
+    return st.tls_plain.items.len - st.tls_plain_off;
+}
+
+// Plaintext the cipher refused earlier goes first — anything appended behind
+// it would reorder the stream.
+fn drainTlsPlain(st: *ConnState) bool {
+    const mod = @import("root").koru_koru.koru_openssl;
+    const s = st.ssl.?.ssl orelse return false;
+    while (tlsPlainLen(st) > 0) {
+        switch (mod.sslWriteSome(s, st.tls_plain.items[st.tls_plain_off..])) {
+            .wrote => |n| st.tls_plain_off += n,
+            .want_read, .want_write => return true,
+            .failed => return false,
+        }
+    }
+    st.tls_plain.clearRetainingCapacity();
+    st.tls_plain_off = 0;
+    return true;
+}
+
+// Response bytes on a TLS conn: plaintext through the cipher, ciphertext to
+// the wire queue. A cipher that wants input first parks the remainder in
+// tls_plain — it is drained by the next ciphertext arrival.
+fn tlsRingWrite(st: *ConnState, segments: []const []const u8) bool {
+    const mod = @import("root").koru_koru.koru_openssl;
+    const s = st.ssl.?.ssl orelse return false;
+    for (segments, 0..) |seg, si| {
+        var off: usize = 0;
+        while (off < seg.len) {
+            if (tlsPlainLen(st) > 0) {
+                var need = seg.len - off;
+                for (segments[si + 1 ..]) |rest| need += rest.len;
+                if (st.tls_plain.items.len + need > MAX_PENDING) return false;
+                st.tls_plain.ensureUnusedCapacity(std.heap.c_allocator, need) catch return false;
+                st.tls_plain.appendSliceAssumeCapacity(seg[off..]);
+                for (segments[si + 1 ..]) |rest| st.tls_plain.appendSliceAssumeCapacity(rest);
+                return drainWbioRing(st);
+            }
+            switch (mod.sslWriteSome(s, seg[off..])) {
+                .wrote => |n| off += n,
+                .want_read, .want_write => {
+                    var need = seg.len - off;
+                    for (segments[si + 1 ..]) |rest| need += rest.len;
+                    if (st.tls_plain.items.len + need > MAX_PENDING) return false;
+                    st.tls_plain.ensureUnusedCapacity(std.heap.c_allocator, need) catch return false;
+                    st.tls_plain.appendSliceAssumeCapacity(seg[off..]);
+                    for (segments[si + 1 ..]) |rest| st.tls_plain.appendSliceAssumeCapacity(rest);
+                    return drainWbioRing(st);
+                },
+                .failed => return false,
+            }
+        }
+    }
+    return drainWbioRing(st);
+}
+
+// The drain a dead or alive TLS conn runs at each submission boundary: owed
+// plaintext through the cipher, close_notify once if the conn is dying, and
+// whatever wbio produced onto the wire queue.
+fn tlsRingDrain(st: *ConnState) bool {
+    if (!drainTlsPlain(st)) {
+        st.ring_dead = true;
+        return false;
+    }
+    if (st.ring_dead and !st.tls_shutdown_sent) {
+        const mod = @import("root").koru_koru.koru_openssl;
+        if (st.ssl.?.ssl) |s| mod.sslMemShutdown(s);
+        st.tls_shutdown_sent = true;
+    }
+    return drainWbioRing(st);
 }
 
 fn registerClient(client_fd: posix.fd_t, ssl: ?*ServerTls, kq: i32) void {
@@ -2554,8 +2740,8 @@ fn workerCount() usize {
 // a call site.
 
 ~proc drive|io-uring {
-    if (tls_port != null) {
-        return .{ .failed = "TLS is not supported on the io_uring pump yet" };
+    if ($mod.maybeStartTls(tls_port, cert_path, key_path)) |err_msg| {
+        return .{ .failed = err_msg };
     }
     // `std.os.linux.IoUring` cannot be NAMED on a non-Linux target — it reaches
     // for `linux.E` and a macOS build has `darwin.E` instead, so this is a type
@@ -2593,6 +2779,7 @@ fn workerCount() usize {
 
         ring: linux.IoUring,
         listen_fd: $mod.posix.fd_t,
+        tls_listen_fd: $mod.posix.fd_t,
 
         fn udSend(st: *$mod.ConnState) u64 {
             return @intFromPtr(st) | TAG_SEND;
@@ -2612,9 +2799,15 @@ fn workerCount() usize {
         }
 
         fn submitRecv(w: *@This(), st: *$mod.ConnState) bool {
-            _ = w.ring.recv(@intFromPtr(st), st.fd, .{ .buffer = st.buf[st.len..] }, 0) catch {
+            // TLS conns receive ciphertext into tls_in — st.buf is where
+            // plaintext accumulates once rbio has been fed.
+            const buf: []u8 = if ($mod.HAS_OPENSSL and st.ssl != null)
+                st.tls_in[0..]
+            else
+                st.buf[st.len..];
+            _ = w.ring.recv(@intFromPtr(st), st.fd, .{ .buffer = buf }, 0) catch {
                 _ = w.ring.submit() catch {};
-                _ = w.ring.recv(@intFromPtr(st), st.fd, .{ .buffer = st.buf[st.len..] }, 0) catch return false;
+                _ = w.ring.recv(@intFromPtr(st), st.fd, .{ .buffer = buf }, 0) catch return false;
             };
             return true;
         }
@@ -2653,6 +2846,14 @@ fn workerCount() usize {
                 st.pending_off = 0;
                 if (st.mode == .ws) st.ws_mu.unlock();
             }
+            // TLS: owed plaintext through the cipher, close_notify once if the
+            // conn is dying, wbio's ciphertext onto the tail of the wire queue
+            // — after pending, because pending's bytes are older.
+            if ($mod.HAS_OPENSSL) {
+                if (st.ssl != null) {
+                    if (!$mod.tlsRingDrain(st)) st.ring_dead = true;
+                }
+            }
             if (st.send_staged > 0) {
                 st.send_off = 0;
                 st.send_len = st.send_staged;
@@ -2672,7 +2873,9 @@ fn workerCount() usize {
 
         fn handleCqe(w: *@This(), cqe: linux.io_uring_cqe) void {
             const ud = cqe.user_data;
-            if (ud == $mod.URING_ACCEPT) {
+            if (ud == $mod.URING_ACCEPT or ud == $mod.URING_ACCEPT_TLS) {
+                const is_tls = ud == $mod.URING_ACCEPT_TLS;
+                const accept_fd = if (is_tls) w.tls_listen_fd else w.listen_fd;
                 // Multishot: this one SQE reaps the whole connect storm.
                 // F_MORE cleared means the op retired — re-arm it once.
                 if (cqe.res >= 0) {
@@ -2681,9 +2884,29 @@ fn workerCount() usize {
                     if ($mod.connState(cfd)) |st| {
                         st.len = 0;
                         st.owner_ring = @ptrCast(w);
+                        var ready = true;
+                        if (is_tls) {
+                            // Memory-BIO SSL — the ring keeps the wire, the
+                            // cipher gets buffers. The fd is dead to SSL.
+                            st.ssl = $mod.beginTlsHandshakeMem(@intCast(cfd));
+                            if (st.ssl == null) {
+                                // A failed begin already closed cfd — keep
+                                // teardown from closing it twice.
+                                st.fd = -1;
+                                ready = false;
+                            } else {
+                                st.tls_in = std.heap.c_allocator.alloc(u8, $mod.TLS_IN_CAP) catch &.{};
+                                if (st.tls_in.len == 0) ready = false;
+                                st.tls_hs = true;
+                            }
+                        }
                         // The recv buffer lives in the conn's own heap state —
                         // the kernel writes into it before we are told.
-                        if (!w.submitRecv(st)) w.teardown(st);
+                        if (ready) {
+                            if (!w.submitRecv(st)) w.teardown(st);
+                        } else {
+                            w.teardown(st);
+                        }
                     } else {
                         $mod.posix.close(cfd);
                     }
@@ -2693,9 +2916,9 @@ fn workerCount() usize {
                     // quarter of the port (SO_REUSEPORT keeps hashing conns
                     // to it), so a full SQ is not an acceptable answer: push
                     // what's staged and try again.
-                    _ = w.ring.accept_multishot($mod.URING_ACCEPT, w.listen_fd, null, null, 0) catch {
+                    _ = w.ring.accept_multishot(ud, accept_fd, null, null, 0) catch {
                         _ = w.ring.submit() catch {};
-                        _ = w.ring.accept_multishot($mod.URING_ACCEPT, w.listen_fd, null, null, 0) catch {};
+                        _ = w.ring.accept_multishot(ud, accept_fd, null, null, 0) catch {};
                     };
                 }
                 return;
@@ -2723,14 +2946,30 @@ fn workerCount() usize {
                 return;
             }
 
-            // recv completion — the bytes are already in st.buf, the count
-            // arrives in cqe.res.
+            // recv completion — for a cleartext conn the bytes are already in
+            // st.buf and the count arrives in cqe.res. TLS conns received
+            // ciphertext into tls_in instead — feed rbio, drive the cipher.
             if (cqe.res <= 0 or st.ring_dead) {
                 w.teardown(st);
                 return;
             }
+            if ($mod.HAS_OPENSSL) {
+                if (st.ssl != null) {
+                    w.tlsRecvStep(st, @intCast(cqe.res));
+                    return;
+                }
+            }
             st.len += @intCast(cqe.res);
+            w.dispatchReadable(st);
+            w.advance(st);
+        }
 
+        // Answer every complete request (or frame, once upgraded) already
+        // sitting in st.buf — the same helpers the other pumps use, so a
+        // browser is handled identically here. Replies stage in send_buf and
+        // leave as one send SQE per readable batch.
+        fn dispatchReadable(w: *@This(), st: *$mod.ConnState) void {
+            _ = w;
             // Upgraded connection: frames, not requests — same seam as the
             // kqueue pump's `st.mode == .ws` block; the re-arm is the next
             // submitted SQE rather than a readiness re-arm.
@@ -2760,13 +2999,9 @@ fn workerCount() usize {
                 st.len = $mod.retainTail(&st.buf, st.len, ws_consumed);
                 if (ws_alive and st.len == st.buf.len) ws_alive = false;
                 if (!ws_alive) st.ring_dead = true;
-                w.advance(st);
                 return;
             }
 
-            // Answer every COMPLETE request — the same helpers the other pumps
-            // use, so a browser is handled identically here. Replies stage in
-            // send_buf and leave as one send SQE per readable batch.
             st.batching = true;
             var consumed: usize = 0;
             var alive = true;
@@ -2785,6 +3020,60 @@ fn workerCount() usize {
             st.len = $mod.retainTail(&st.buf, st.len, consumed);
             if (alive and st.len == st.buf.len) alive = false;
             if (!alive) st.ring_dead = true;
+        }
+
+        // A TLS conn's recv CQE: ciphertext is sitting in tls_in. Feed rbio,
+        // drive the handshake until it settles, then pull plaintext until the
+        // cipher wants more wire input. Replies queue through appendPending's
+        // TLS leg — plaintext through the cipher, ciphertext to the wire.
+        fn tlsRecvStep(w: *@This(), st: *$mod.ConnState, ct_len: usize) void {
+            const mod = @import("root").koru_koru.koru_openssl;
+            const tls = st.ssl.?;
+            const s = tls.ssl orelse {
+                w.teardown(st);
+                return;
+            };
+            mod.sslMemFeedIn(s, st.tls_in[0..ct_len]);
+            if (st.tls_hs) {
+                switch ($mod.driveTlsHandshake(st)) {
+                    .ready => st.tls_hs = false,
+                    .want_read, .want_write => {},
+                    .failed => st.ring_dead = true,
+                }
+                _ = $mod.drainWbioRing(st);
+                if (st.tls_hs or st.ring_dead) {
+                    w.advance(st);
+                    return;
+                }
+            }
+            // Pull plaintext until the cipher asks for more ciphertext — a
+            // full st.buf is the only reason to run the dispatch + read
+            // cycle again on the same feed.
+            while (true) {
+                var pull_more = true;
+                while (st.len < st.buf.len) {
+                    switch (mod.sslMemRead(s, st.buf[st.len..])) {
+                        .read => |n| st.len += n,
+                        .want_read => {
+                            pull_more = false;
+                            break;
+                        },
+                        .gone, .failed => {
+                            pull_more = false;
+                            st.ring_dead = true;
+                            break;
+                        },
+                    }
+                }
+                w.dispatchReadable(st);
+                if (st.ring_dead or !pull_more) break;
+                // Inner loop stopped only because st.buf was full — retainTail
+                // freed room; more plaintext may still sit inside the cipher.
+                if (st.len == st.buf.len) {
+                    st.ring_dead = true;
+                    break;
+                }
+            }
             w.advance(st);
         }
 
@@ -2804,11 +3093,27 @@ fn workerCount() usize {
                 std.debug.print("Pump: io_uring worker failed to listen on :{}\n", .{port_});
                 return;
             };
-            var w = @This(){ .ring = ring, .listen_fd = listen_fd };
+            // A second reuseport listener when TLS is configured — same ring,
+            // same machinery, a different UD so accepted conns start as
+            // memory-BIO handshakes instead of cleartext reads.
+            const tls_listen_fd: $mod.posix.fd_t = if ($mod.tls_listen_port != 0)
+                $mod.openReusePortListener($mod.tls_listen_port) orelse {
+                    std.debug.print("Pump: io_uring worker failed to listen on :{}\n", .{$mod.tls_listen_port});
+                    return;
+                }
+            else
+                -1;
+            var w = @This(){ .ring = ring, .listen_fd = listen_fd, .tls_listen_fd = tls_listen_fd };
             _ = w.ring.accept_multishot($mod.URING_ACCEPT, listen_fd, null, null, 0) catch {
                 std.debug.print("Pump: io_uring accept arm failed\n", .{});
                 return;
             };
+            if (tls_listen_fd >= 0) {
+                _ = w.ring.accept_multishot($mod.URING_ACCEPT_TLS, tls_listen_fd, null, null, 0) catch {
+                    std.debug.print("Pump: io_uring TLS accept arm failed\n", .{});
+                    return;
+                };
+            }
 
             var cqes: [CQE_BATCH]linux.io_uring_cqe = undefined;
             while (true) {
@@ -3047,11 +3352,17 @@ fn workerCount() usize {
     if (!x.keep_alive) {
         // A FIN before the queue drains would cut the response mid-flight —
         // when bytes are still pending, mark the conn and let the
-        // write-ready event do the closing instead.
-        if (pendingLen(st) > 0) {
-            st.close_when_drained = true;
-        } else {
-            $mod.shutdownConn(st);
+        // write-ready event do the closing instead. On the ring pump the
+        // reply is staged bytes awaiting a send SQE, not wire bytes —
+        // shutdown(SHUT_WR) here would race the submit and EPIPE it — so the
+        // conn's ring_dead flag (set by the reader on !keep_alive) routes it
+        // through advance's drain-then-teardown path instead.
+        if (st.owner_ring == null) {
+            if (pendingLen(st) > 0) {
+                st.close_when_drained = true;
+            } else {
+                $mod.shutdownConn(st);
+            }
         }
     }
     return .sent;
