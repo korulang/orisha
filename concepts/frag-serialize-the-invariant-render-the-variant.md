@@ -115,9 +115,42 @@ server alive and RSS ~51MB. Throughput effect: unmeasured — the local
 docker-proxy transport cannot falsify it; a droplet A/B is the
 instrument.
 
+## What the instrument said — fifth pass (2026-10-08)
+
+The droplet A/B exposed two bugs the local battery missed, then measured.
+
+**The collapse was a use-after-free, not flow control.** Under `-r 25`
+conn churn the new build died intermittently: connect-error storms while
+established conns kept serving. Local repro needed send-then-close-
+immediately clients to fire it. Core dump: `maybeFreeRing` ran
+`st.ws_mu.lock(); defer st.ws_mu.unlock(); closeConnMem(st); destroy(st)`
+— the defer evaluated `st.ws_mu` on freed memory. Debug's mutex
+owner-assert panicked (`unreachable`, trace destroyed by a panicking
+panic-handler); ReleaseFast silently corrupted the heap. Two adjacent
+defects fixed in the same pass: `bg.release` was gated on `res > 0`,
+leaking a pool buffer per terminal `F_BUFFER` CQE; and `-ENOBUFS` now
+parks the conn on one-shot recvs (`ms_off`) instead of an arm→ENOBUFS
+re-arm spin.
+
+**Post-fix interleaved A/B (c-4 pair, gcannon/wrk, 3 rounds each):
+baseline tie (~165K), pipelined tie (1.17–1.21M), jsontls tie (~55K),
+jsoncomp loss — new 28.7–30.6K vs prev 31.2–34.9K, ~8–10% behind on the
+churn profile.** The mechanism as built is a small loss, not a win:
+every conn close pays a second CQE pass (the armed recv's terminal CQE
+runs teardown→free again after close()), and each recv batch pays a
+pool-buffer→`st.buf` copy the one-shot path never had — recv directly
+into `st.buf` was free. The saved re-arm does not cover the extra
+teardown pass under conn churn.
+
+The open question is settled in the negative direction: multishot recv
+on this shape — copy into `st.buf`, deferred free — loses on the profile
+it was meant to help. A win requires dispatch to run on the pool buffer
+directly (zero recv-side copy) and the terminal-CQE pass to do less.
+
 ## Open questions
 
-- Multishot recv's throughput effect is unmeasured — the per-CQE re-arm
-  is gone by construction; the droplet A/B still owes the number.
+- Whether dispatch-from-pool-buffer (parsing in place, `st.buf` only for
+  split-request tails) flips the jsoncomp sign — the surgery that would
+  make the mechanism pay for itself.
 - The heap `Stringify` fallback for overflow counts is unchanged and
   unmeasured for speed — it only needs to be correct.

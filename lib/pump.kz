@@ -242,6 +242,11 @@ pub const ConnState = struct {
     // recv_hold parks the overflow when a pool buffer delivers more than
     // st.buf has room for — a streamed request must not be cut mid-parse.
     recv_armed: bool = false,
+    // Set on -ENOBUFS: the pool ran dry, so this conn finishes on plain
+    // one-shot recvs into st.buf. Without it, ENOBUFS → re-arm → ENOBUFS
+    // is a submit/reap spin per conn — measured as a throughput collapse
+    // with full CPU under -r churn, not a stall.
+    ms_off: bool = false,
     ring_closing: bool = false,
     recv_hold: std.ArrayListUnmanaged(u8) = .{},
     recv_hold_off: usize = 0,
@@ -2998,10 +3003,11 @@ fn workerCount() usize {
             if (!st.ring_closing or st.recv_armed or st.send_len != 0) return;
             // Nothing can still reference st: recv folded, no send in flight,
             // fd already detached and closed. A `ws-send-fd` pusher could be
-            // mid-write — same wait releaseConn does.
+            // mid-write — same wait releaseConn does. The unlock must precede
+            // destroy: a defer would run on freed memory.
             st.ws_mu.lock();
-            defer st.ws_mu.unlock();
             $mod.closeConnMem(st);
+            st.ws_mu.unlock();
             std.heap.c_allocator.destroy(st);
         }
 
@@ -3022,12 +3028,14 @@ fn workerCount() usize {
             // armed conns (and the send-in-flight window) just return.
             if (st.recv_armed) return true;
             if (w.bufgrp) |bg| {
-                _ = bg.arm(@intFromPtr(st), st.fd) catch {
-                    _ = w.ring.submit() catch {};
-                    _ = bg.arm(@intFromPtr(st), st.fd) catch return false;
-                };
-                st.recv_armed = true;
-                return true;
+                if (!st.ms_off) {
+                    _ = bg.arm(@intFromPtr(st), st.fd) catch {
+                        _ = w.ring.submit() catch {};
+                        _ = bg.arm(@intFromPtr(st), st.fd) catch return false;
+                    };
+                    st.recv_armed = true;
+                    return true;
+                }
             }
             const buf = st.buf[st.len..];
             _ = w.ring.recv(@intFromPtr(st), st.fd, .{ .buffer = buf }, 0) catch {
@@ -3268,8 +3276,12 @@ fn workerCount() usize {
                     // the stream is desynced, so the conn cannot continue.
                     st.ring_dead = true;
                 }
-                bg.release(cqe);
             }
+            // The buffer goes back whenever the kernel consumed one — F_BUFFER,
+            // not res, is the signal. A terminal CQE (EOF, error) can still
+            // carry a consumed buffer; gating release on res>0 leaks one per
+            // conn close, and churn drains the pool into ENOBUFS collapse.
+            if (cqe.flags & linux.IORING_CQE_F_BUFFER != 0) bg.release(cqe);
             if (cqe.flags & linux.IORING_CQE_F_MORE == 0) st.recv_armed = false;
             if (st.ring_dead or cqe.res == 0) {
                 w.teardown(st);
@@ -3280,6 +3292,9 @@ fn workerCount() usize {
                 // with nothing lost (the kernel kept the bytes), and advance
                 // re-arms. Anything else kills the conn.
                 if (cqe.res == -@as(i32, @intFromEnum(linux.E.NOBUFS))) {
+                    // Pool ran dry — re-arming instantly would just bounce
+                    // ENOBUFS forever. Finish the conn on one-shot recvs.
+                    st.ms_off = true;
                     w.advance(st);
                     return;
                 }
