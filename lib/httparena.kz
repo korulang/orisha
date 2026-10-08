@@ -54,14 +54,13 @@ const Impl = struct {
         var dataset_bytes: ?[]u8 = null;
 
         const CachedItem = struct {
-            id: i64,
             price: i64,
             quantity: i64,
-            active: bool,
-            rating: Rating,
-            name_json: []const u8,
-            category_json: []const u8,
-            tags_json: []const u8,
+            // Everything up to and including "total": — every other field is
+            // a dataset constant, so it serializes once at startup. Per
+            // request the only live bytes are the computed total digits and
+            // the closing brace: the response still depends on count and m.
+            prefix: []const u8,
         };
         var cached_items: ?[]CachedItem = null;
 
@@ -113,15 +112,16 @@ const Impl = struct {
                 const category_json = try escapeJsonString(alloc, src.category);
                 errdefer alloc.free(category_json);
                 const tags_json = try tagsToJson(alloc, src.tags);
+                const prefix = try std.fmt.allocPrint(alloc,
+                    "{{\"id\":{d},\"name\":{s},\"category\":{s},\"price\":{d},\"quantity\":{d},\"active\":{},\"tags\":{s},\"rating\":{{\"score\":{d},\"count\":{d}}},\"total\":",
+                    .{ src.id, name_json, category_json, src.price, src.quantity, src.active, tags_json, src.rating.score, src.rating.count });
+                alloc.free(name_json);
+                alloc.free(category_json);
+                alloc.free(tags_json);
                 built[i] = .{
-                    .id = src.id,
                     .price = src.price,
                     .quantity = src.quantity,
-                    .active = src.active,
-                    .rating = src.rating,
-                    .name_json = name_json,
-                    .category_json = category_json,
-                    .tags_json = tags_json,
+                    .prefix = prefix,
                 };
             }
             cached_items = built;
@@ -142,35 +142,43 @@ const Impl = struct {
             return finishHttp("text/plain", num_slice);
         }
 
-        fn writeJsonItem(w: anytype, item: CachedItem, m: i64) !void {
-            const total = item.price * item.quantity * m;
-            try w.print(
-                "{{\"id\":{d},\"name\":{s},\"category\":{s},\"price\":{d},\"quantity\":{d},\"active\":{},\"tags\":{s},\"rating\":{{\"score\":{d},\"count\":{d}}},\"total\":{d}}}",
-                .{
-                    item.id,
-                    item.name_json,
-                    item.category_json,
-                    item.price,
-                    item.quantity,
-                    item.active,
-                    item.tags_json,
-                    item.rating.score,
-                    item.rating.count,
-                    total,
-                },
-            );
+        // One item, cursor-style: the cached prefix is a memcpy, the only
+        // bytes rendered live are total = price*quantity*m and the closing
+        // brace — the field the benchmark's m parameter exists to vary.
+        fn jsonItemsInto(dst: []u8, cache: []const CachedItem, count: usize, m: i64) ?usize {
+            var p: usize = 0;
+            for (0..count) |i| {
+                const item = cache[i];
+                if (i > 0) {
+                    if (p >= dst.len) return null;
+                    dst[p] = ',';
+                    p += 1;
+                }
+                const total = item.price * item.quantity * m;
+                var num: [24]u8 = undefined;
+                const ns = std.fmt.bufPrint(&num, "{d}", .{total}) catch return null;
+                if (p + item.prefix.len + ns.len + 1 > dst.len) return null;
+                @memcpy(dst[p..][0..item.prefix.len], item.prefix);
+                p += item.prefix.len;
+                @memcpy(dst[p..][0..ns.len], ns);
+                p += ns.len;
+                dst[p] = '}';
+                p += 1;
+            }
+            return p;
         }
 
         fn jsonResponse(source: []const CachedItem, count: usize, m: i64) ?[]const u8 {
-            var stream = std.io.fixedBufferStream(&body_work);
-            const w = stream.writer();
-            w.print("{{\"count\":{d},\"items\":[", .{count}) catch return null;
-            for (0..count) |i| {
-                if (i > 0) w.writeAll(",") catch return null;
-                writeJsonItem(w, source[i], m) catch return null;
-            }
-            w.writeAll("]}") catch return null;
-            return finishHttp("application/json", stream.getWritten());
+            var hdr: [32]u8 = undefined;
+            const hs = std.fmt.bufPrint(&hdr, "{{\"count\":{d},\"items\":[", .{count}) catch return null;
+            if (hs.len + 2 > body_work.len) return null;
+            @memcpy(body_work[0..hs.len], hs);
+            var p = hs.len;
+            p += jsonItemsInto(body_work[p..], source, count, m) orelse return null;
+            if (p + 2 > body_work.len) return null;
+            body_work[p] = ']';
+            body_work[p + 1] = '}';
+            return finishHttp("application/json", body_work[0 .. p + 2]);
         }
 
         // Serialize {"items":[...],"count":N} — the same field order
@@ -183,15 +191,14 @@ const Impl = struct {
                 if (json_scratch.len > 0) alloc.free(json_scratch);
                 json_scratch = nb;
             }
-            var stream = std.io.fixedBufferStream(json_scratch);
-            const w = stream.writer();
-            w.writeAll("{\"items\":[") catch return null;
-            for (0..count) |i| {
-                if (i > 0) w.writeAll(",") catch return null;
-                writeJsonItem(w, cache[i], m) catch return null;
-            }
-            w.print("],\"count\":{d}}}", .{count}) catch return null;
-            return stream.getWritten();
+            @memcpy(json_scratch[0..10], "{\"items\":[");
+            var p: usize = 10;
+            p += jsonItemsInto(json_scratch[p..], cache, count, m) orelse return null;
+            var tail: [24]u8 = undefined;
+            const ts = std.fmt.bufPrint(&tail, "],\"count\":{d}}}", .{count}) catch return null;
+            if (p + ts.len > json_scratch.len) return null;
+            @memcpy(json_scratch[p..][0..ts.len], ts);
+            return json_scratch[0 .. p + ts.len];
         }
 
         fn datasetItems() ![]const DatasetItem {
