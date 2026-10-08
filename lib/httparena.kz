@@ -142,6 +142,17 @@ const Impl = struct {
             return finishHttp("text/plain", num_slice);
         }
 
+        // Decimal width without rendering — the response head carries
+        // Content-Length, so body length is summed before anything is
+        // written and the body lands directly behind the head in one
+        // contiguous message. No mid-buffer copy.
+        fn digitsLen(v: i64) usize {
+            var n: usize = if (v < 0) 2 else 1;
+            var a: u64 = @abs(v);
+            while (a >= 10) : (a /= 10) n += 1;
+            return n;
+        }
+
         // One item, cursor-style: the cached prefix is a memcpy, the only
         // bytes rendered live are total = price*quantity*m and the closing
         // brace — the field the benchmark's m parameter exists to vary.
@@ -168,17 +179,33 @@ const Impl = struct {
             return p;
         }
 
+        // The complete wire message — status line, headers, JSON — written
+        // once, contiguously, into body_work. Returning it as the Response
+        // body puts it on the pre-rendered path (answer() ships "HTTP/1."
+        // bodies verbatim), so the only copy left is appendPending's into
+        // the send buffer.
         fn jsonResponse(source: []const CachedItem, count: usize, m: i64) ?[]const u8 {
-            var hdr: [32]u8 = undefined;
-            const hs = std.fmt.bufPrint(&hdr, "{{\"count\":{d},\"items\":[", .{count}) catch return null;
-            if (hs.len + 2 > body_work.len) return null;
+            var jh: [32]u8 = undefined;
+            const jhs = std.fmt.bufPrint(&jh, "{{\"count\":{d},\"items\":[", .{count}) catch return null;
+            var body_len: usize = jhs.len + 2;
+            for (0..count) |i| {
+                const item = source[i];
+                body_len += item.prefix.len + digitsLen(item.price * item.quantity * m) + 1;
+                if (i > 0) body_len += 1;
+            }
+            var hdr: [160]u8 = undefined;
+            const hs = std.fmt.bufPrint(&hdr,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n",
+                .{body_len}) catch return null;
+            if (hs.len + body_len > body_work.len) return null;
             @memcpy(body_work[0..hs.len], hs);
             var p = hs.len;
+            @memcpy(body_work[p..][0..jhs.len], jhs);
+            p += jhs.len;
             p += jsonItemsInto(body_work[p..], source, count, m) orelse return null;
-            if (p + 2 > body_work.len) return null;
             body_work[p] = ']';
             body_work[p + 1] = '}';
-            return finishHttp("application/json", body_work[0 .. p + 2]);
+            return body_work[0 .. p + 2];
         }
 
         // Serialize {"items":[...],"count":N} — the same field order

@@ -420,7 +420,7 @@ fn appendPending(st: *ConnState, segments: []const []const u8) bool {
         if (st.send_len == 0 and st.mode != .ws) {
             if (st.send_staged + need > MAX_PENDING) return false;
             if (st.send_buf.len < st.send_staged + need) {
-                const nb = std.heap.c_allocator.alloc(u8, st.send_staged + need) catch return false;
+                const nb = std.heap.c_allocator.alloc(u8, @max(4096, st.send_buf.len * 2, st.send_staged + need)) catch return false;
                 @memcpy(nb[0..st.send_staged], st.send_buf[0..st.send_staged]);
                 if (st.send_buf.len > 0) std.heap.c_allocator.free(st.send_buf);
                 st.send_buf = nb;
@@ -1251,7 +1251,7 @@ fn ringStageWire(st: *ConnState, ct: []const u8) bool {
     if (st.send_len == 0) {
         if (st.send_staged + ct.len > MAX_PENDING) return false;
         if (st.send_buf.len < st.send_staged + ct.len) {
-            const nb = std.heap.c_allocator.alloc(u8, st.send_staged + ct.len) catch return false;
+            const nb = std.heap.c_allocator.alloc(u8, @max(4096, st.send_buf.len * 2, st.send_staged + ct.len)) catch return false;
             @memcpy(nb[0..st.send_staged], st.send_buf[0..st.send_staged]);
             if (st.send_buf.len > 0) std.heap.c_allocator.free(st.send_buf);
             st.send_buf = nb;
@@ -1306,7 +1306,7 @@ fn drainWbioRing(st: *ConnState) bool {
             const need = mod.sslMemOutPending(s);
             if (st.send_staged + need > MAX_PENDING) return false;
             if (st.send_buf.len < st.send_staged + need) {
-                const nb = std.heap.c_allocator.alloc(u8, st.send_staged + need) catch return false;
+                const nb = std.heap.c_allocator.alloc(u8, @max(4096, st.send_buf.len * 2, st.send_staged + need)) catch return false;
                 @memcpy(nb[0..st.send_staged], st.send_buf[0..st.send_staged]);
                 if (st.send_buf.len > 0) std.heap.c_allocator.free(st.send_buf);
                 st.send_buf = nb;
@@ -2882,7 +2882,7 @@ fn workerCount() usize {
                 if (st.mode == .ws) st.ws_mu.lock();
                 const room = st.send_staged + pn;
                 if (st.send_buf.len < room) {
-                    const nb = std.heap.c_allocator.alloc(u8, room) catch {
+                    const nb = std.heap.c_allocator.alloc(u8, @max(4096, st.send_buf.len * 2, room)) catch {
                         if (st.mode == .ws) st.ws_mu.unlock();
                         w.teardown(st);
                         return;

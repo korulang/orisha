@@ -29,9 +29,32 @@ shows the writer symbols below the 1.5% floor entirely. The verification
 that could have falsified it — a byte-exact diff of the serialized body
 against the previous binary — passed on both cleartext and TLS.
 
+## What the instrument said — second pass (2026-10-08)
+
+The residual `memcpy` was not one copy but two: `body_work` → `http_out`
+(`finishHttp` re-printing the finished body) → `send_buf` (`appendPending`).
+Since `Content-Length` is computable before writing — the body is prefix
+lengths plus decimal widths — the head can land at offset 0 and the body
+directly behind it: one contiguous wire message, rendered once. The
+`body_work → http_out` pass is gone; `appendPending`'s copy into `send_buf`
+is the only one left and it exists for pin safety while a send SQE is in
+flight. `send_buf` growth is now doubling-with-floor instead of exact-size,
+so a conn's buffer stops reallocating on every larger response (the
+`clear_page_erms` term).
+
+Local verification on LinuxKit (no kTLS — the mem-BIO leg): 30/30
+`(count, m)` responses byte-identical to the previous binary, 60/60
+semantically checked against the dataset (live `total` per `m`), gzip path
+unchanged, cleartext + TLS pipelined/keep-alive/close all correct. A wrk
+A/B through docker-proxy showed no resolvable delta — laptop timing cannot
+falsify this change; the droplet run is the instrument.
+
 ## Open questions
 
-- The residual flat tail is memcpy + page clearing; whether a registered
-  buffer ring or writev-style scatter removes it is unmeasured.
+- `appendPending` still copies every response once. Removing it means the
+  app rendering into `send_buf` (or a per-conn slab) directly — a contract
+  change between httparena.kz and the ring, unmeasured.
+- Multishot recv / registered buffer rings still untested — the per-CQE
+  re-arm tail is the next suspect on baseline/pipelined.
 - The heap `Stringify` fallback for overflow counts is unchanged and
   unmeasured for speed — it only needs to be correct.
