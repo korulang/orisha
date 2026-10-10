@@ -250,6 +250,36 @@ instrument that prices it. `arrived()`'s own re-parse is now the largest
 remaining front-end cost — the third scan made visible by removing the
 first two.
 
+## What the instrument said — ninth pass (2026-10-10, the audit)
+
+This frag's own thesis, applied inside the benchmark entry, was the one
+thing over the line. `CachedItem.prefix` serialized each dataset item's
+invariant bytes once at startup and per-request rendered only the `total`
+digits — "serialize the invariant once" taken literally. The front-runner
+(zix) draws the line explicitly in its own description: *"No response
+cache and no startup pre-serialization anywhere."* Their handler routes
+every field through a general serializer (jzon) per request.
+
+Removed before submission. The entry now serializes `{"items":[...],
+"count":N}` per request through `std.json.Stringify` into the back of
+the staging span (HEAD_RESERVE front-room for the head), zero memoized
+bytes; gzip path serializes into threadlocal scratch per request the
+same way. Both `meta.json` descriptions declare it.
+
+Correctness: `validate.sh orisha` **37/37** on the honest path; cleartext
+and gzip bodies byte-identical to the memoized build's output (top-level
+key order now `items,count` — matching the gzip path and zix's own
+order; the validator parses semantically).
+
+The price of honesty, measured on the local VM (generator-bound, so
+direction-only): `/json/20?m=3` under `-p16 -c512` — memoized ~755-767K
+rps, honest ~415-532K rps, roughly **−35%** on that endpoint. That is
+what the cheat was worth, and it is what we paid to remove it. The
+belief is bounded, not repudiated: serialize-the-invariant is still the
+right pattern for a response cache a real app chooses to keep — it is
+not the right move when the profile's measured work IS the
+serialization, because then the memo table is the thing being benchmarked.
+
 ## Open questions
 
 - Whether `scanRequest` buys throughput on a server-bound regime — the
