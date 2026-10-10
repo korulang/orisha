@@ -176,12 +176,48 @@ change whose expected effect is single-digit percent. The same-box zix A/B
 datum but says nothing about this specific change. A quiet-hardware A/B —
 droplet pair or the board — is the instrument.
 
+## What the instrument said — seventh pass (2026-10-10, droplet)
+
+Priced on quiet hardware: a dedicated `c-4` pair in sfo3 (server
+`24.199.101.245`, gcannon load `209.38.75.119` over private LAN, steal 0%),
+`3848955` vs `00ded44` interleaved 4 rounds each profile.
+
+The methodological finding comes first, because without it the run reads as
+a wash: **on a 4-vCPU pair the generator saturates before the server in every
+default profile.** Baseline `-p1 -c512` pinned flat at ~168K regardless of
+conn count (round-trip bound, server ~53% busy); `-p16` reached 1.09–1.35M
+with the server at ~31–34%; churn `-r10` at ~120K. Throughput-identical A/B
+in that regime measures the client, not the server — the earlier "±10%
+noise" was really "zero sensitivity." The discriminating regime was made by
+`taskset -c 0` on the server process: one core, provably saturated (25% of
+total = 100% of one), while the generator retains headroom.
+
+Under that regime, four interleaved rounds of the board's own pipelined
+profile (`-p16 -c512`, the load where each recv batch carries up to 16
+requests and the removed copy is largest):
+
+- `00ded44`: 1.03M, 1.01M, 0.975M, 1.02M — mean ~1.01M rps
+- `3848955`: 0.956M, 0.872M, 0.895M, 0.866M — mean ~0.897M rps
+- **+12.6% mean, non-overlapping distributions** (min-new 0.975M > max-prev
+  0.956M); gcannon latency corroborates (avg 8.13ms vs 9.39ms, −13%);
+  ~88M responses, zero errors.
+
+Profiles where the patch's mechanism doesn't engage priced at parity, which
+is the expected shape rather than a disappointment: json-gzip at 4 cores
+(server-bound at 99%, deflate-dominated) ~73.9K vs ~73.8K; TLS json at 1
+core (ciphertext still takes the copy path into the mem-BIO) ~52.6K vs
+~52.7K. Churn `-r10` stayed generator-bound at ~120K both — the
+terminal-CQE teardown cost is real but unpriced by this instrument.
+
+Verdict on the change: keep it. The removed copy is worth ~+12% on the
+profile where it applies, zero elsewhere measured. The board's pipelined
+score measures server saturation with a loadgen that doesn't cap first, so
+this delta is the honest estimate of what the change buys there.
+
 ## Open questions
 
-- Whether the pool-dispatch build flips the jsoncomp sign on quiet
-  hardware — measured only as "correct and strictly less work per CQE"
-  so far; the droplet pair owes it a number.
 - Whether the terminal-CQE pass can do less (deferred-free batching) —
-  the second half of the named surgery, not yet attempted.
+  the second half of the named surgery, not yet attempted; churn profiles
+  need a stronger generator than a 4-vCPU box to price it.
 - The heap `Stringify` fallback for overflow counts is unchanged and
   unmeasured for speed — it only needs to be correct.
