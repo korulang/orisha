@@ -147,10 +147,41 @@ on this shape — copy into `st.buf`, deferred free — loses on the profile
 it was meant to help. A win requires dispatch to run on the pool buffer
 directly (zero recv-side copy) and the terminal-CQE pass to do less.
 
+## What the instrument said — sixth pass (2026-10-10)
+
+The named surgery landed: `dispatchHttpSlice` runs the request loop on
+whatever buffer holds the bytes, and `msRecvCqe` calls it on the checked-out
+pool buffer whenever nothing is pending (`st.len == 0`, `recv_hold` empty,
+non-ws, not already dead). Only a request straddling the buffer's end parks
+its tail in `st.buf`; `x.raw`'s borrow contract is unchanged — the pool
+buffer is released to the ring only after `arrived()` returns, so the kernel
+cannot overwrite bytes mid-parse.
+
+A correctness trap surfaced that the copy path had masked: dispatch can now
+set `ring_dead` *before* the terminal-`res` check, and `teardown()` closes
+the fd without draining — a `Connection: close` request went out as EOF
+with no response. `pre_dead` splits the cases: death on arrival tears down
+immediately (and skips dispatch entirely, as before), death during dispatch
+falls through to `advance()`, which flushes the staged response then closes.
+The same trap was latent in the old code's `drainRecvHold` path.
+
+Correctness: HttpArena `validate.sh orisha` — **37/37 pass** including the
+1047-offset fragmentation suite, pipelined batches, gzip negotiation, and
+TLS 1.3 quality; plus hand-verified split-request, same-write pipelining,
+and close-then-EOF. Throughput: **unresolved.** wrk showed +15–25% at
+-c64/-c512; gcannon (the board's own generator class) showed deltas inside
+the ±10% run-to-run noise of the LinuxKit VM — this box cannot price a
+change whose expected effect is single-digit percent. The same-box zix A/B
+(orisha +25–30% interleaved on baseline, +65% on gzip-json) is the stronger
+datum but says nothing about this specific change. A quiet-hardware A/B —
+droplet pair or the board — is the instrument.
+
 ## Open questions
 
-- Whether dispatch-from-pool-buffer (parsing in place, `st.buf` only for
-  split-request tails) flips the jsoncomp sign — the surgery that would
-  make the mechanism pay for itself.
+- Whether the pool-dispatch build flips the jsoncomp sign on quiet
+  hardware — measured only as "correct and strictly less work per CQE"
+  so far; the droplet pair owes it a number.
+- Whether the terminal-CQE pass can do less (deferred-free batching) —
+  the second half of the named surgery, not yet attempted.
 - The heap `Stringify` fallback for overflow counts is unchanged and
   unmeasured for speed — it only needs to be correct.

@@ -3257,19 +3257,46 @@ fn workerCount() usize {
                 std.debug.print("Pump: multishot recv live on provided buffers\n", .{});
             }
             const bg = w.bufgrp.?;
+            // ring_dead set BY this CQE's dispatch (Connection: close, a dead
+            // ws frame) must still reach advance() — the staged response has
+            // to flush before the fd drops. Only a conn already dead on
+            // arrival tears down without draining.
+            const pre_dead = st.ring_dead;
+            var dispatched = false;
             if (cqe.res > 0) {
                 const n: usize = @intCast(cqe.res);
                 if (cqe.buffer_id()) |bid| {
-                    w.drainRecvHold(st);
                     const buf = bg.sliceAt(bid, n);
-                    const room = st.buf.len - st.len;
-                    const fit = @min(room, n);
-                    @memcpy(st.buf[st.len..][0..fit], buf[0..fit]);
-                    st.len += fit;
-                    if (n > fit) {
-                        st.recv_hold.appendSlice(std.heap.c_allocator, buf[fit..n]) catch {
-                            st.ring_dead = true;
-                        };
+                    if (!pre_dead and st.len == 0 and st.recv_hold.items.len == 0 and st.mode != .ws) {
+                        // Dispatch where the kernel left the bytes: a request
+                        // fully inside the pool buffer never touches st.buf —
+                        // only a request straddling this buffer's end parks
+                        // its tail there. x.raw borrows `buf` for arrived()
+                        // exactly as it borrows st.buf on every other pump,
+                        // so the buffer must not rejoin the pool until the
+                        // dispatch below is done.
+                        const consumed = w.dispatchHttpSlice(st, buf);
+                        dispatched = true;
+                        if (consumed < buf.len and !st.ring_dead) {
+                            const tail = buf[consumed..];
+                            if (tail.len > st.buf.len) {
+                                st.ring_dead = true;
+                            } else {
+                                @memcpy(st.buf[0..tail.len], tail);
+                                st.len = tail.len;
+                            }
+                        }
+                    } else {
+                        w.drainRecvHold(st);
+                        const room = st.buf.len - st.len;
+                        const fit = @min(room, n);
+                        @memcpy(st.buf[st.len..][0..fit], buf[0..fit]);
+                        st.len += fit;
+                        if (n > fit) {
+                            st.recv_hold.appendSlice(std.heap.c_allocator, buf[fit..n]) catch {
+                                st.ring_dead = true;
+                            };
+                        }
                     }
                 } else |_| {
                     // A buffer id we cannot resolve means lost wire bytes —
@@ -3283,7 +3310,7 @@ fn workerCount() usize {
             // conn close, and churn drains the pool into ENOBUFS collapse.
             if (cqe.flags & linux.IORING_CQE_F_BUFFER != 0) bg.release(cqe);
             if (cqe.flags & linux.IORING_CQE_F_MORE == 0) st.recv_armed = false;
-            if (st.ring_dead or cqe.res == 0) {
+            if (pre_dead or cqe.res == 0) {
                 w.teardown(st);
                 return;
             }
@@ -3301,7 +3328,7 @@ fn workerCount() usize {
                 w.teardown(st);
                 return;
             }
-            w.dispatchReadable(st);
+            if (!dispatched) w.dispatchReadable(st);
             w.drainRecvHold(st);
             w.advance(st);
         }
@@ -3331,7 +3358,6 @@ fn workerCount() usize {
         // browser is handled identically here. Replies stage in send_buf and
         // leave as one send SQE per readable batch.
         fn dispatchReadable(w: *@This(), st: *$mod.ConnState) void {
-            _ = w;
             // Upgraded connection: frames, not requests — same seam as the
             // kqueue pump's `st.mode == .ws` block; the re-arm is the next
             // submitted SQE rather than a readiness re-arm.
@@ -3364,12 +3390,24 @@ fn workerCount() usize {
                 return;
             }
 
+            const consumed = w.dispatchHttpSlice(st, st.buf[0..st.len]);
+            st.len = $mod.retainTail(&st.buf, st.len, consumed);
+            if (!st.ring_dead and st.len == st.buf.len) st.ring_dead = true;
+        }
+
+        // The request-dispatch loop, source-agnostic: `bytes` may be the
+        // st.buf prefix or a checked-out pool buffer — x.raw borrows either
+        // for the duration of arrived() only, which is the same contract
+        // ConnState.buf borrows carry today. Returns bytes consumed; a dying
+        // conn sets st.ring_dead rather than reporting it out of band.
+        fn dispatchHttpSlice(w: *@This(), st: *$mod.ConnState, bytes: []const u8) usize {
+            _ = w;
             st.batching = true;
             var consumed: usize = 0;
             var alive = true;
-            while (consumed < st.len) {
-                const take = $mod.requestLen(st.buf[consumed..st.len]) orelse break;
-                var exchange = $mod.Exchange{ .fd = st.fd, .st = st, .raw = st.buf[consumed .. consumed + take] };
+            while (consumed < bytes.len) {
+                const take = $mod.requestLen(bytes[consumed..]) orelse break;
+                var exchange = $mod.Exchange{ .fd = st.fd, .st = st, .raw = bytes[consumed .. consumed + take] };
                 if ($mod.requestWantsClose(exchange.raw)) exchange.keep_alive = false;
                 arrived(&exchange);
                 consumed += take;
@@ -3379,9 +3417,8 @@ fn workerCount() usize {
                 }
             }
             st.batching = false;
-            st.len = $mod.retainTail(&st.buf, st.len, consumed);
-            if (alive and st.len == st.buf.len) alive = false;
             if (!alive) st.ring_dead = true;
+            return consumed;
         }
 
         // A TLS conn's recv CQE: ciphertext is sitting in tls_in after any
