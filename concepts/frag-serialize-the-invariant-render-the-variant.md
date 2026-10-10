@@ -328,5 +328,13 @@ HttpArena `validate.sh orisha`: **37/37 pass** on the fused code.
   need a stronger generator than a 4-vCPU box to price it.
 - Whether kTLS actually engaged on the race hardware — the mem-BIO
   fallback is silent; `st.ktls_on` instrumentation is a one-line check.
+  Local engagement is *impossible*, measured: the LinuxKit kernel
+  (6.12.76, arm64) has `CONFIG_TLS` unset — `ss -ti` shows no `ulp` on
+  live :8081 conns and `TCP_ULP` attach returns EOPNOTSUPP, so the
+  `.unsupported` arm parks every conn on mem-BIO by design. The install
+  path itself was code-verified (quiet-point conditions, RX-before-TX
+  ordering, cipher map) and was live-verified on an earlier droplet;
+  race-run engagement is unrecoverable — the box is gone. Fold a
+  `ktls_on` counter into the next droplet run.
 - The heap `Stringify` fallback for overflow counts is unchanged and
   unmeasured for speed — it only needs to be correct.
