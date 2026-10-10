@@ -101,7 +101,7 @@ pub tor serve { port: u16, tls_port: ?u16, cert_path: ?string, key_path: ?string
 
 serve =
     orisha/pump:run(port, tls_port, cert_path, key_path)
-    ! arrived x |> orisha/pump:raw(x): raw |> orisha/pump:fileno(x): xfd |> orisha:answer(raw, fd: xfd): a |> orisha/pump:reply(x, a.head, a.body, a.date_hole, hang: a.close)
+    ! arrived x |> orisha:answer(x): a |> orisha/pump:reply(x, a.head, a.body, a.date_hole, hang: a.close)
         | sent |> orisha:release-body(a.body, allocated: a.body_allocated)
         | broken _ |> orisha:release-body(a.body, allocated: a.body_allocated)
     ! frame f |> orisha/pump:ws-frame(f)
@@ -112,16 +112,14 @@ serve =
 // ============================================================================
 // ANSWER — parse one request, run the handler, shape the response
 // ============================================================================
-// Platform-free by construction: it takes request bytes plus a descriptor
-// integer and returns response bytes — never a platform handle type. Every
-// pump shares it. The body is in the companion.
-
-// `fd` is the descriptor the request arrived on — passed through to
-// `Request.fd` so the handler can name its own connection (`ws-send-fd`
-// pushes, fd-keyed registries) without seeing the Exchange. The `close`
-// the record reports back is `Response.close`: a handler that asked for a
-// hang-up gets it after the bytes land.
-pub tor answer { raw: string, fd: usize } -> { head: string, body: string, body_allocated: bool, date_hole: usize, close: bool }
+// Platform-free by construction: it takes the exchange the pump dispatched
+// and returns response bytes — never a platform handle type. Every pump
+// shares it. The body is in the companion.
+//
+// It reads `x.raw` in place rather than `pump:raw`'s arena copy, and the
+// parse `scanRequest` already produced rather than re-scanning the head —
+// one request, one walk.
+pub tor answer { x: *orisha/pump:Exchange } -> { head: string, body: string, body_allocated: bool, date_hole: usize, close: bool }
 
 // Free a handler body that fmt.blk allocated. Static slices and fmt:ln TLS
 // buffers arrive with allocated=false; those must not be freed.

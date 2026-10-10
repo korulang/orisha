@@ -280,15 +280,53 @@ right pattern for a response cache a real app chooses to keep — it is
 not the right move when the profile's measured work IS the
 serialization, because then the memo table is the thing being benchmarked.
 
+## What the instrument said — tenth pass (2026-10-11, the fused parse)
+
+The eighth pass's open question is answered in code: `scanRequest` now
+produces a `Head` — request line split (method/target), a capped array of
+header name/value offsets, `head_len`, `chunked`, `wants_close` — in the
+one walk it was already doing, and `answer` consumes it instead of
+re-scanning. Offsets rather than slices, so the struct means the same
+thing in any buffer; overflow past 64 headers stores `unstored_tail` and
+misses resume as a line walk — lookup is exactly as complete as a scan.
+
+The boundary changed with it: `answer` takes the `*Exchange` itself.
+`pump:raw` copied every request into a per-request arena only because a
+`->` return may not borrow a parameter (610_007) — taking `x` as a
+parameter sidesteps the pin entirely, and the arena copy, `pump:fileno`,
+and `pump:raw` calls all leave the arrived chain. Per request the head
+block is now walked ONCE (was: up to eight passes counting the two
+`rawHasHeaderName` byte probes, which also silently died).
+
+Every lazy accessor follows: `Request.head` carries the parse, so
+`req.header`, `cookie`, `ws-accept`, `form` consult pairs first and scan
+only the overflow tail. `rawHasHeaderName` is deleted outright.
+
+Mechanism confirmed by same-load perf (`-p16 -c512`, LinuxKit): front-end
+userspace ~33% → ~13% of samples — `arrived`+`indexOfPos`+
+`dispatchHttpSlice`+`headerValue` collapsed into `dispatchHttpSlice`
+8.67% + `indexOfPos` 3.49% + `headValueParsed` 1.08%. Throughput still
+unpriced locally (7.58–7.73M both builds, generator-bound as ever).
+
+Correctness: 9/9 hand probes (fragmented head, same-write pipeline,
+close+EOF, CL/chunked body + successor, dup CL, malformed CL→chunked,
+gzip negotiation through the pair lookup, query-string target) plus the
+overflow case — `Accept-Encoding` at header position 71 found through
+`unstored_tail`, gzip negotiated, body decompresses to valid JSON.
+HttpArena `validate.sh orisha`: **37/37 pass** on the fused code.
+
 ## Open questions
 
-- Whether `scanRequest` buys throughput on a server-bound regime — the
-  mechanism is confirmed but the profile delta (~8 points of CPU) needs
-  the same single-core-pinned instrument that priced the seventh pass.
-- Whether the five header scans' removal exposes `arrived()`'s parse as
-  the next frontier — folding scan+parse into one pass is the deeper cut.
+- Whether the fused front-end buys throughput on a server-bound regime —
+  ~20 points of userspace removed; the single-core-pinned droplet or the
+  board is the instrument.
+- Whether `std.json.Stringify` can be made fast enough to close the
+  jzon gap — commissioned out for the emit path (chunked writes, escape
+  table); the serializer is ~40% of /json CPU and is toolchain, not entry.
 - Whether the terminal-CQE pass can do less (deferred-free batching) —
   the second half of the named surgery, not yet attempted; churn profiles
   need a stronger generator than a 4-vCPU box to price it.
+- Whether kTLS actually engaged on the race hardware — the mem-BIO
+  fallback is silent; `st.ktls_on` instrumentation is a one-line check.
 - The heap `Stringify` fallback for overflow counts is unchanged and
   unmeasured for speed — it only needs to be correct.

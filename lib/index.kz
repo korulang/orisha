@@ -47,9 +47,13 @@ pub const Request = struct {
     accept_encoding: ?[]const u8 = null,
     if_none_match: ?[]const u8 = null,
     // The raw header block — request line through the blank line — borrowed
-    // from the request bytes. `header`/`cookie` scan it lazily on demand, so
-    // a route that never asks pays one slice store and nothing else.
+    // from the request bytes. `header`/`cookie` consult `head`'s captured
+    // pairs first and walk this block only for overflow or unparsed input.
     headers: ?[]const u8 = null,
+    // The pump's one-pass parse of the same block; borrows the dispatch
+    // frame, so like `headers` it dies with the request. null on transports
+    // that never ran `scanRequest` (the wasm host builds Request itself).
+    head: ?*const koru_pump.Head = null,
     // The descriptor the request arrived on — the same integer `pump:fileno`
     // reports and `ws-send-fd` addresses. 0 on transports with no descriptor
     // (the wasm host builds its Request itself and passes none).
@@ -369,6 +373,34 @@ fn requestPathKey(allocator: std.mem.Allocator, target: []const u8) []const u8 {
     return out[0..w];
 }
 
+// First match wins, over the pairs the pump captured — a miss is definitive
+// when every header fit (`unstored_tail == 0`) and resumes as a line walk
+// over the overflow tail when it didn't. `head == null` — a Request built by
+// hand or a dispatch path with no scan — reads the block the way it always
+// did. `base` is whichever buffer the caller parsed: `x.raw` on the way in,
+// `req.headers` on the lazy path; the pair offsets index both identically.
+fn headValueParsed(head: ?*const koru_pump.Head, base: []const u8, name: []const u8) ?[]const u8 {
+    const h = head orelse return headerValue(base, name);
+    if (h.head_len == 0 or h.head_len > base.len) return headerValue(base, name);
+    for (h.pairs[0..h.pair_count]) |p| {
+        if (std.ascii.eqlIgnoreCase(base[p.name_off..][0..p.name_len], name)) {
+            return base[p.value_off..][0..p.value_len];
+        }
+    }
+    if (h.unstored_tail == 0) return null;
+    var scan: usize = h.unstored_tail;
+    while (scan < h.head_len) {
+        const nl = std.mem.indexOfPos(u8, base, scan, "\r\n") orelse break;
+        const line = base[scan..nl];
+        scan = nl + 2;
+        if (line.len == 0) break;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " \t"), name)) continue;
+        return std.mem.trim(u8, line[colon + 1 ..], " \t");
+    }
+    return null;
+}
+
 fn headerValue(raw: []const u8, name: []const u8) ?[]const u8 {
     const first_line = std.mem.indexOf(u8, raw, "\r\n") orelse return null;
     var scan: usize = first_line + 2;
@@ -509,23 +541,40 @@ const RESPONSE_500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\
 
 ~proc answer|zig {
     const req_allocator = $mod.requestAllocator();
+    const raw = x.raw;
+    const parsed = x.head;
+    const fd: usize = @intCast(x.fd);
     var method: []const u8 = "GET";
     var path: []const u8 = "/";
     var query: ?[]const u8 = null;
 
-    var i: usize = 0;
-    while (i < raw.len and raw[i] != ' ') : (i += 1) {}
-    if (i < raw.len) {
-        method = raw[0..i];
-        i += 1;
-        var j: usize = i;
-        while (j < raw.len and raw[j] != ' ') : (j += 1) {}
-        if (j > i) {
-            const target = raw[i..j];
+    if (parsed) |h| {
+        // The pump's scan already split the request line — read it back.
+        if (h.target_len > 0) {
+            if (h.method_len > 0) method = raw[h.method_off..][0..h.method_len];
+            const target = raw[h.target_off..][0..h.target_len];
             if (std.mem.indexOfScalar(u8, target, '?')) |q| {
                 query = target[q + 1 ..];
             }
             path = $mod.requestPathKey(req_allocator, target);
+        }
+    } else {
+        // A dispatch path that never scanned (none today — every pump
+        // produces a Head) still answers: walk the request line here.
+        var i: usize = 0;
+        while (i < raw.len and raw[i] != ' ') : (i += 1) {}
+        if (i < raw.len) {
+            method = raw[0..i];
+            i += 1;
+            var j: usize = i;
+            while (j < raw.len and raw[j] != ' ') : (j += 1) {}
+            if (j > i) {
+                const target = raw[i..j];
+                if (std.mem.indexOfScalar(u8, target, '?')) |q| {
+                    query = target[q + 1 ..];
+                }
+                path = $mod.requestPathKey(req_allocator, target);
+            }
         }
     }
 
@@ -533,38 +582,36 @@ const RESPONSE_500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\
     // Header names are case-insensitive. The Vercel adapter used to omit this
     // header entirely; once it forwards it, browsers send `If-None-Match` in
     // whatever casing their stack picked, and a literal search would miss.
-    if (rawHasHeaderName(raw, "if-none-match")) {
-        var scan: usize = 0;
-        while (scan < raw.len) {
-            const nl = std.mem.indexOfPos(u8, raw, scan, "\r\n") orelse break;
-            const line = raw[scan..nl];
-            scan = nl + 2;
-            if (line.len < 15) continue;
-            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-            if (!std.ascii.eqlIgnoreCase(line[0..colon], "if-none-match")) continue;
-            var etag_raw = std.mem.trim(u8, line[colon + 1 ..], " \t");
-            if (etag_raw.len >= 2 and etag_raw[0] == '"' and etag_raw[etag_raw.len - 1] == '"') {
-                etag_raw = etag_raw[1 .. etag_raw.len - 1];
-            }
+    if ($mod.headValueParsed(parsed, raw, "if-none-match")) |etag_raw| {
+        if (etag_raw.len >= 2 and etag_raw[0] == '"' and etag_raw[etag_raw.len - 1] == '"') {
+            client_etag = etag_raw[1 .. etag_raw.len - 1];
+        } else {
             client_etag = etag_raw;
-            break;
         }
     }
 
-    const accept_encoding = if (rawHasHeaderName(raw, "accept-encoding"))
-        headerValue(raw, "accept-encoding")
-    else
-        null;
+    const accept_encoding = $mod.headValueParsed(parsed, raw, "accept-encoding");
 
     var body: ?[]const u8 = null;
     var headers_block: ?[]const u8 = null;
 
-    if (std.mem.indexOf(u8, raw, "\r\n\r\n")) |header_end| {
+    if (parsed) |h| {
+        headers_block = raw[0..h.head_len];
+        const body_raw = if (h.head_len < raw.len) raw[h.head_len..] else "";
+        if (h.chunked) {
+            var decoded_buf: [4096]u8 = undefined;
+            if (decodeChunkedPayload(body_raw, &decoded_buf)) |decoded| {
+                body = decoded;
+            }
+        } else if (body_raw.len > 0) {
+            body = body_raw;
+        }
+    } else if (std.mem.indexOf(u8, raw, "\r\n\r\n")) |header_end| {
         const headers_end = header_end + 4;
-        const head = raw[0..headers_end];
-        headers_block = head;
+        const block = raw[0..headers_end];
+        headers_block = block;
         const body_raw = if (headers_end < raw.len) raw[headers_end..] else "";
-        if (transferEncodingChunkedHead(head)) {
+        if (transferEncodingChunkedHead(block)) {
             var decoded_buf: [4096]u8 = undefined;
             if (decodeChunkedPayload(body_raw, &decoded_buf)) |decoded| {
                 body = decoded;
@@ -582,6 +629,7 @@ const RESPONSE_500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\
         .accept_encoding = accept_encoding,
         .if_none_match = client_etag,
         .headers = headers_block,
+        .head = parsed,
         .fd = fd,
         .allocator = req_allocator,
     };
@@ -708,16 +756,16 @@ const RESPONSE_500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\
 // The answer is a borrow of the request bytes — valid for the handler's life,
 // which is as long as anything may keep it.
 ~proc header|zig {
-    const head = req.headers orelse return null;
-    return headerValue(head, name);
+    const block = req.headers orelse return null;
+    return headValueParsed(req.head, block, name);
 }
 
 // base64(SHA-1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")) — RFC 6455 §4.2.2.
 // The answer lives in the request arena: the upgrade head is built and sent
 // before the arm returns, so the accept value's life is the request's.
 ~proc ws-accept|zig {
-    const head = req.headers orelse return null;
-    const key = headerValue(head, "sec-websocket-key") orelse return null;
+    const block = req.headers orelse return null;
+    const key = headValueParsed(req.head, block, "sec-websocket-key") orelse return null;
     var sha = std.crypto.hash.Sha1.init(.{});
     sha.update(key);
     sha.update("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
@@ -729,16 +777,16 @@ const RESPONSE_500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\
 }
 
 ~proc cookie|zig {
-    const head = req.headers orelse return null;
-    const cookies = headerValue(head, "cookie") orelse return null;
+    const block = req.headers orelse return null;
+    const cookies = headValueParsed(req.head, block, "cookie") orelse return null;
     return cookieValue(cookies, name);
 }
 
 // `form` reads fields only off a body that declared itself urlencoded — a
 // JSON body parsed as pairs is how a string value becomes a phantom field.
 ~proc form|zig {
-    const head = req.headers orelse return null;
-    const ct = headerValue(head, "content-type") orelse return null;
+    const block = req.headers orelse return null;
+    const ct = headValueParsed(req.head, block, "content-type") orelse return null;
     const urlencoded = "application/x-www-form-urlencoded";
     if (ct.len < urlencoded.len or !std.ascii.eqlIgnoreCase(ct[0..urlencoded.len], urlencoded)) return null;
     const body = req.body orelse return null;
@@ -851,17 +899,6 @@ fn formatHttpDateFromEpoch(buf: *[29]u8, epoch: i64) void {
     @memcpy(buf[25..29], " GMT");
 }
 
-fn rawHasHeaderName(raw: []const u8, comptime name: []const u8) bool {
-    if (raw.len < name.len + 2) return false;
-    var i: usize = 0;
-    while (i + name.len + 1 < raw.len) : (i += 1) {
-        if (raw[i] == '\r' and raw[i + 1] == '\n') {
-            if (i + 3 < raw.len and raw[i + 2] == '\r' and raw[i + 3] == '\n') return false;
-        }
-        if (std.ascii.eqlIgnoreCase(raw[i .. i + name.len], name) and raw[i + name.len] == ':') return true;
-    }
-    return false;
-}
 
 fn two(dst: *[2]u8, v: u32) void {
     dst[0] = '0' + @as(u8, @intCast((v / 10) % 10));
