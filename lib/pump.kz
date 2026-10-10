@@ -75,25 +75,6 @@ const URING_ACCEPT_TLS: u64 = URING_ACCEPT - 1;
 // This function answers the one question the three pumps share: where does the
 // first request in this buffer end? The loops that use it are mechanical; this
 // is the part that must not be written three times.
-fn transferEncodingChunked(head: []const u8) bool {
-    var line_start: usize = 0;
-    while (line_start < head.len) {
-        const line_end = std.mem.indexOfPos(u8, head, line_start, "\r\n") orelse break;
-        const line = head[line_start..line_end];
-        if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
-            if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " \t"), "transfer-encoding")) {
-                const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
-                var lower_buf: [128]u8 = undefined;
-                if (value.len > lower_buf.len) return false;
-                const lower = std.ascii.lowerString(&lower_buf, value);
-                return std.mem.indexOf(u8, lower, "chunked") != null;
-            }
-        }
-        line_start = line_end + 2;
-    }
-    return false;
-}
-
 fn chunkedMessageLen(body: []const u8) ?usize {
     var pos: usize = 0;
     while (true) {
@@ -110,21 +91,65 @@ fn chunkedMessageLen(body: []const u8) ?usize {
     }
 }
 
-fn requestLen(buf: []const u8) ?usize {
-    const head_end = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse return null;
-    const headers_end = head_end + 4;
-    if (contentLength(buf[0..headers_end])) |body_len| {
-        const total = headers_end + body_len;
-        if (total > buf.len) return null;
-        return total;
+// One pass over the head block yields everything the dispatch loops used to
+// scan for separately: the \r\n\r\n terminator, content-length,
+// transfer-encoding: chunked, and connection: close. The old shape walked the
+// same bytes five times per request (terminator + three header searches + the
+// real parse inside arrived()); under pipelined load that was ~20% of all
+// samples in indexOfPos. The request line is scanned too — harmless: a
+// colon inside an absolute-form URI produces a name that matches nothing.
+fn scanRequest(buf: []const u8) ?struct { take: usize, wants_close: bool } {
+    var content_len: ?usize = null;
+    var chunked = false;
+    var wants_close = false;
+    var cl_seen = false;
+    var te_seen = false;
+    var conn_seen = false;
+    var pos: usize = 0;
+    while (true) {
+        const nl = std.mem.indexOfPos(u8, buf, pos, "\r\n") orelse return null;
+        const line = buf[pos..nl];
+        pos = nl + 2;
+        if (line.len == 0) {
+            var take = pos;
+            if (content_len) |body_len| {
+                take += body_len;
+            } else if (chunked) {
+                take += chunkedMessageLen(buf[pos..]) orelse return null;
+            }
+            return if (take <= buf.len) .{ .take = take, .wants_close = wants_close } else null;
+        }
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..colon], " \t");
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        if (std.ascii.eqlIgnoreCase(name, "content-length")) {
+            // First wins — the helpers this replaces returned the first match.
+            // Malformed stays null so transfer-encoding is still consulted,
+            // exactly as the old contentLength() fall-through did.
+            if (!cl_seen) {
+                cl_seen = true;
+                content_len = std.fmt.parseInt(usize, value, 10) catch null;
+            }
+        } else if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
+            if (!te_seen) {
+                te_seen = true;
+                var lower_buf: [128]u8 = undefined;
+                if (value.len <= lower_buf.len) {
+                    const lower = std.ascii.lowerString(&lower_buf, value);
+                    if (std.mem.indexOf(u8, lower, "chunked") != null) chunked = true;
+                }
+            }
+        } else if (std.ascii.eqlIgnoreCase(name, "connection")) {
+            if (!conn_seen) {
+                conn_seen = true;
+                var lower_buf: [64]u8 = undefined;
+                if (value.len <= lower_buf.len) {
+                    const lower = std.ascii.lowerString(&lower_buf, value);
+                    if (std.mem.indexOf(u8, lower, "close") != null) wants_close = true;
+                }
+            }
+        }
     }
-    if (transferEncodingChunked(buf[0..headers_end])) {
-        const chunk_len = chunkedMessageLen(buf[headers_end..]) orelse return null;
-        const total = headers_end + chunk_len;
-        if (total > buf.len) return null;
-        return total;
-    }
-    return headers_end;
 }
 
 // A request can arrive in pieces, so a connection needs somewhere to keep the
@@ -764,45 +789,6 @@ fn retainTail(buf: []u8, len: usize, consumed: usize) usize {
     const remaining = len - consumed;
     if (remaining > 0) std.mem.copyForwards(u8, buf[0..remaining], buf[consumed..len]);
     return remaining;
-}
-
-fn contentLength(head: []const u8) ?usize {
-    var line_start: usize = 0;
-    while (line_start < head.len) {
-        const line_end = std.mem.indexOfPos(u8, head, line_start, "\r\n") orelse break;
-        const line = head[line_start..line_end];
-        if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
-            // Header names are case-insensitive — RFC 9110.
-            if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " \t"), "content-length")) {
-                return std.fmt.parseInt(usize, std.mem.trim(u8, line[colon + 1 ..], " \t"), 10) catch null;
-            }
-        }
-        line_start = line_end + 2;
-    }
-    return null;
-}
-
-fn pumpHeaderValue(raw: []const u8, comptime name: []const u8) ?[]const u8 {
-    const first_line = std.mem.indexOf(u8, raw, "\r\n") orelse return null;
-    var scan: usize = first_line + 2;
-    while (scan < raw.len) {
-        const nl = std.mem.indexOfPos(u8, raw, scan, "\r\n") orelse break;
-        const line = raw[scan..nl];
-        scan = nl + 2;
-        if (line.len == 0) break;
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-        if (!std.ascii.eqlIgnoreCase(line[0..colon], name)) continue;
-        return std.mem.trim(u8, line[colon + 1 ..], " \t");
-    }
-    return null;
-}
-
-fn requestWantsClose(raw: []const u8) bool {
-    const value = pumpHeaderValue(raw, "connection") orelse return false;
-    var lower_buf: [64]u8 = undefined;
-    if (value.len > lower_buf.len) return false;
-    const lower = std.ascii.lowerString(&lower_buf, value);
-    return std.mem.indexOf(u8, lower, "close") != null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1832,11 +1818,11 @@ fn workerCount() usize {
                 var consumed: usize = 0;
                 var alive = true;
                 while (consumed < st.len) {
-                    const take = $mod.requestLen(st.buf[consumed..st.len]) orelse break;
-                    var exchange = $mod.Exchange{ .fd = fd, .st = st, .raw = st.buf[consumed .. consumed + take] };
-                    if ($mod.requestWantsClose(exchange.raw)) exchange.keep_alive = false;
+                    const scan = $mod.scanRequest(st.buf[consumed..st.len]) orelse break;
+                    var exchange = $mod.Exchange{ .fd = fd, .st = st, .raw = st.buf[consumed .. consumed + scan.take] };
+                    if (scan.wants_close) exchange.keep_alive = false;
                     arrived(&exchange);
-                    consumed += take;
+                    consumed += scan.take;
                     if (!exchange.keep_alive) {
                         alive = false;
                         break;
@@ -2474,11 +2460,11 @@ fn workerCount() usize {
                     var consumed: usize = 0;
                     var alive = true;
                     while (consumed < st.len) {
-                        const take = $mod.requestLen(st.buf[consumed..st.len]) orelse break;
-                        var exchange = $mod.Exchange{ .fd = fd, .st = st, .raw = st.buf[consumed .. consumed + take] };
-                        if ($mod.requestWantsClose(exchange.raw)) exchange.keep_alive = false;
+                        const scan = $mod.scanRequest(st.buf[consumed..st.len]) orelse break;
+                        var exchange = $mod.Exchange{ .fd = fd, .st = st, .raw = st.buf[consumed .. consumed + scan.take] };
+                        if (scan.wants_close) exchange.keep_alive = false;
                         arrived(&exchange);
-                        consumed += take;
+                        consumed += scan.take;
                         if (!exchange.keep_alive) {
                             alive = false;
                             break;
@@ -2753,11 +2739,11 @@ fn workerCount() usize {
                     var consumed: usize = 0;
                     var alive = true;
                     while (consumed < st.len) {
-                        const take = $mod.requestLen(st.buf[consumed..st.len]) orelse break;
-                        var exchange = $mod.Exchange{ .fd = fd, .st = st, .raw = st.buf[consumed .. consumed + take] };
-                        if ($mod.requestWantsClose(exchange.raw)) exchange.keep_alive = false;
+                        const scan = $mod.scanRequest(st.buf[consumed..st.len]) orelse break;
+                        var exchange = $mod.Exchange{ .fd = fd, .st = st, .raw = st.buf[consumed .. consumed + scan.take] };
+                        if (scan.wants_close) exchange.keep_alive = false;
                         arrived(&exchange);
-                        consumed += take;
+                        consumed += scan.take;
                         if (!exchange.keep_alive) {
                             alive = false;
                             break;
@@ -3406,11 +3392,11 @@ fn workerCount() usize {
             var consumed: usize = 0;
             var alive = true;
             while (consumed < bytes.len) {
-                const take = $mod.requestLen(bytes[consumed..]) orelse break;
-                var exchange = $mod.Exchange{ .fd = st.fd, .st = st, .raw = bytes[consumed .. consumed + take] };
-                if ($mod.requestWantsClose(exchange.raw)) exchange.keep_alive = false;
+                const scan = $mod.scanRequest(bytes[consumed..]) orelse break;
+                var exchange = $mod.Exchange{ .fd = st.fd, .st = st, .raw = bytes[consumed .. consumed + scan.take] };
+                if (scan.wants_close) exchange.keep_alive = false;
                 arrived(&exchange);
-                consumed += take;
+                consumed += scan.take;
                 if (!exchange.keep_alive) {
                     alive = false;
                     break;
@@ -3718,11 +3704,11 @@ fn workerCount() usize {
             var consumed: usize = 0;
             var alive = true;
             while (consumed < live.st.len) {
-                const take = $mod.requestLen(live.st.buf[consumed..live.st.len]) orelse break;
-                var x = $mod.Exchange{ .fd = live.st.fd, .st = &live.st, .raw = live.st.buf[consumed .. consumed + take] };
-                if ($mod.requestWantsClose(x.raw)) x.keep_alive = false;
+                const scan = $mod.scanRequest(live.st.buf[consumed..live.st.len]) orelse break;
+                var x = $mod.Exchange{ .fd = live.st.fd, .st = &live.st, .raw = live.st.buf[consumed .. consumed + scan.take] };
+                if (scan.wants_close) x.keep_alive = false;
                 arrived(&x);
-                consumed += take;
+                consumed += scan.take;
                 if (!x.keep_alive) {
                     alive = false;
                     break;

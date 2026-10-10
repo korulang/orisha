@@ -214,8 +214,49 @@ profile where it applies, zero elsewhere measured. The board's pipelined
 score measures server saturation with a loadgen that doesn't cap first, so
 this delta is the honest estimate of what the change buys there.
 
+## What the instrument said — eighth pass (2026-10-10, single-pass scan)
+
+The first same-harness race (c-4, `benchmark.sh`, archived under
+`benchmarks/arena-race-2026-10-10/`) named the remaining deficit: zix took
+the pipelined profile 2.15M vs 1.23M while orisha burned *more* CPU for it
+(208% vs 155%) — a structural per-request cost, not a generator artifact.
+Perf under `-p16` put `mem.indexOfPos` near the top of the profile: each
+dispatched request had its header block scanned up to five times — the
+`\r\n\r\n` terminator search, `Content-Length`, `Transfer-Encoding`,
+`Connection`, then the real parse in `arrived()`.
+
+The surgery follows the same belief as every pass before it — walk the
+bytes once: a single `scanRequest` pass computes frame length and
+`Connection: close` together, replacing `requestLen` +
+`requestWantsClose` at all five dispatch sites.
+
+Correctness: all five semantic classes hand-probed byte-identical old vs
+new (split headers, same-write pipelining, `Connection: close` +
+flush-then-EOF, `Content-Length` body + pipelined successor, chunked body
++ successor); ~163M pipelined responses under `-p16 -c512`, zero non-2xx;
+duplicate-header and malformed-`Content-Length` edge probes identical
+old vs new (first-match-wins semantics preserved via seen-flags).
+HttpArena `validate.sh orisha`: **37/37 pass** on the final code,
+including the 1047-offset fragmentation suite.
+
+Mechanism confirmed by same-load perf: `indexOfPos` 10.66% → 6.39%,
+`dispatchHttpSlice` 6.26% → 2.96%, `arrived` flat at ~8.5% — the front-end
+trio dropped ~26% → ~18% of samples. Throughput: **unpriced** — the
+LinuxKit VM is generator-bound (interleaved rounds overlap: old
+2.45/2.60/2.74M, new 2.28/2.66/2.67M); an earlier single-shot 4.07M vs
+1.99M was discarded as a warm-up artifact per the surprise-freeze rule.
+The board's pipelined score, or another single-core-pinned droplet, is the
+instrument that prices it. `arrived()`'s own re-parse is now the largest
+remaining front-end cost — the third scan made visible by removing the
+first two.
+
 ## Open questions
 
+- Whether `scanRequest` buys throughput on a server-bound regime — the
+  mechanism is confirmed but the profile delta (~8 points of CPU) needs
+  the same single-core-pinned instrument that priced the seventh pass.
+- Whether the five header scans' removal exposes `arrived()`'s parse as
+  the next frontier — folding scan+parse into one pass is the deeper cut.
 - Whether the terminal-CQE pass can do less (deferred-free batching) —
   the second half of the named surgery, not yet attempted; churn profiles
   need a stronger generator than a 4-vCPU box to price it.
