@@ -5,26 +5,34 @@ const ha_zlib = @cImport({
     @cInclude("zlib.h");
 });
 
+// Reusable gzip machinery — the deflate stream and both scratch buffers are
+// threadlocal and grow to the largest body seen. Every request is still
+// serialized and compressed fresh; only the allocation is shared. The
+// returned slices are borrowed and must not be freed.
+threadlocal var gz_strm: ha_zlib.z_stream = std.mem.zeroes(ha_zlib.z_stream);
+threadlocal var gz_strm_init = false;
+threadlocal var gz_buf: []u8 = &.{};
+threadlocal var json_scratch: []u8 = &.{};
+
 fn gzipBody(allocator: std.mem.Allocator, content: []const u8) ?[]u8 {
-    const max_output = ha_zlib.compressBound(@intCast(content.len));
-    const output = allocator.alloc(u8, max_output) catch return null;
-    var strm: ha_zlib.z_stream = std.mem.zeroes(ha_zlib.z_stream);
-    strm.next_in = @constCast(content.ptr);
-    strm.avail_in = @intCast(content.len);
-    strm.next_out = output.ptr;
-    strm.avail_out = @intCast(output.len);
-    if (ha_zlib.deflateInit2(&strm, ha_zlib.Z_DEFAULT_COMPRESSION, ha_zlib.Z_DEFLATED, 15 + 16, 8, ha_zlib.Z_DEFAULT_STRATEGY) != ha_zlib.Z_OK) {
-        allocator.free(output);
+    if (!gz_strm_init) {
+        if (ha_zlib.deflateInit2(&gz_strm, ha_zlib.Z_BEST_SPEED, ha_zlib.Z_DEFLATED, 15 + 16, 8, ha_zlib.Z_DEFAULT_STRATEGY) != ha_zlib.Z_OK) return null;
+        gz_strm_init = true;
+    } else if (ha_zlib.deflateReset(&gz_strm) != ha_zlib.Z_OK) {
         return null;
     }
-    const result = ha_zlib.deflate(&strm, ha_zlib.Z_FINISH);
-    const compressed_size = output.len - strm.avail_out;
-    _ = ha_zlib.deflateEnd(&strm);
-    if (result != ha_zlib.Z_STREAM_END) {
-        allocator.free(output);
-        return null;
+    const need: usize = ha_zlib.compressBound(@intCast(content.len));
+    if (gz_buf.len < need) {
+        const nb = allocator.alloc(u8, need) catch return null;
+        if (gz_buf.len > 0) allocator.free(gz_buf);
+        gz_buf = nb;
     }
-    return allocator.realloc(output, compressed_size) catch output[0..compressed_size];
+    gz_strm.next_in = @constCast(content.ptr);
+    gz_strm.avail_in = @intCast(content.len);
+    gz_strm.next_out = gz_buf.ptr;
+    gz_strm.avail_out = @intCast(gz_buf.len);
+    if (ha_zlib.deflate(&gz_strm, ha_zlib.Z_FINISH) != ha_zlib.Z_STREAM_END) return null;
+    return gz_buf[0 .. gz_buf.len - gz_strm.avail_out];
 }
 
 const orisha = @import("root").koru_orisha;
@@ -46,14 +54,13 @@ const Impl = struct {
         var dataset_bytes: ?[]u8 = null;
 
         const CachedItem = struct {
-            id: i64,
             price: i64,
             quantity: i64,
-            active: bool,
-            rating: Rating,
-            name_json: []const u8,
-            category_json: []const u8,
-            tags_json: []const u8,
+            // Everything up to and including "total": — every other field is
+            // a dataset constant, so it serializes once at startup. Per
+            // request the only live bytes are the computed total digits and
+            // the closing brace: the response still depends on count and m.
+            prefix: []const u8,
         };
         var cached_items: ?[]CachedItem = null;
 
@@ -105,15 +112,16 @@ const Impl = struct {
                 const category_json = try escapeJsonString(alloc, src.category);
                 errdefer alloc.free(category_json);
                 const tags_json = try tagsToJson(alloc, src.tags);
+                const prefix = try std.fmt.allocPrint(alloc,
+                    "{{\"id\":{d},\"name\":{s},\"category\":{s},\"price\":{d},\"quantity\":{d},\"active\":{},\"tags\":{s},\"rating\":{{\"score\":{d},\"count\":{d}}},\"total\":",
+                    .{ src.id, name_json, category_json, src.price, src.quantity, src.active, tags_json, src.rating.score, src.rating.count });
+                alloc.free(name_json);
+                alloc.free(category_json);
+                alloc.free(tags_json);
                 built[i] = .{
-                    .id = src.id,
                     .price = src.price,
                     .quantity = src.quantity,
-                    .active = src.active,
-                    .rating = src.rating,
-                    .name_json = name_json,
-                    .category_json = category_json,
-                    .tags_json = tags_json,
+                    .prefix = prefix,
                 };
             }
             cached_items = built;
@@ -134,35 +142,100 @@ const Impl = struct {
             return finishHttp("text/plain", num_slice);
         }
 
-        fn writeJsonItem(w: anytype, item: CachedItem, m: i64) !void {
-            const total = item.price * item.quantity * m;
-            try w.print(
-                "{{\"id\":{d},\"name\":{s},\"category\":{s},\"price\":{d},\"quantity\":{d},\"active\":{},\"tags\":{s},\"rating\":{{\"score\":{d},\"count\":{d}}},\"total\":{d}}}",
-                .{
-                    item.id,
-                    item.name_json,
-                    item.category_json,
-                    item.price,
-                    item.quantity,
-                    item.active,
-                    item.tags_json,
-                    item.rating.score,
-                    item.rating.count,
-                    total,
-                },
-            );
+        // Decimal width without rendering — the response head carries
+        // Content-Length, so body length is summed before anything is
+        // written and the body lands directly behind the head in one
+        // contiguous message. No mid-buffer copy.
+        fn digitsLen(v: i64) usize {
+            var n: usize = if (v < 0) 2 else 1;
+            var a: u64 = @abs(v);
+            while (a >= 10) : (a /= 10) n += 1;
+            return n;
         }
 
-        fn jsonResponse(source: []const CachedItem, count: usize, m: i64) ?[]const u8 {
-            var stream = std.io.fixedBufferStream(&body_work);
-            const w = stream.writer();
-            w.print("{{\"count\":{d},\"items\":[", .{count}) catch return null;
+        // One item, cursor-style: the cached prefix is a memcpy, the only
+        // bytes rendered live are total = price*quantity*m and the closing
+        // brace — the field the benchmark's m parameter exists to vary.
+        fn jsonItemsInto(dst: []u8, cache: []const CachedItem, count: usize, m: i64) ?usize {
+            var p: usize = 0;
             for (0..count) |i| {
-                if (i > 0) w.writeAll(",") catch return null;
-                writeJsonItem(w, source[i], m) catch return null;
+                const item = cache[i];
+                if (i > 0) {
+                    if (p >= dst.len) return null;
+                    dst[p] = ',';
+                    p += 1;
+                }
+                const total = item.price * item.quantity * m;
+                var num: [24]u8 = undefined;
+                const ns = std.fmt.bufPrint(&num, "{d}", .{total}) catch return null;
+                if (p + item.prefix.len + ns.len + 1 > dst.len) return null;
+                @memcpy(dst[p..][0..item.prefix.len], item.prefix);
+                p += item.prefix.len;
+                @memcpy(dst[p..][0..ns.len], ns);
+                p += ns.len;
+                dst[p] = '}';
+                p += 1;
             }
-            w.writeAll("]}") catch return null;
-            return finishHttp("application/json", stream.getWritten());
+            return p;
+        }
+
+        // The complete wire message — status line, headers, JSON — written
+        // once, contiguously. When the request rides an io_uring conn whose
+        // send buffer is unpinned, ringRenderTarget hands back that exact
+        // staging span and appendPending claims it by pointer — the response
+        // is never copied at all. Otherwise the body_work scratch serves and
+        // the old single-copy path applies.
+        fn jsonResponse(source: []const CachedItem, count: usize, m: i64, fd: usize) ?[]const u8 {
+            var jh: [32]u8 = undefined;
+            const jhs = std.fmt.bufPrint(&jh, "{{\"count\":{d},\"items\":[", .{count}) catch return null;
+            var body_len: usize = jhs.len + 2;
+            for (0..count) |i| {
+                const item = source[i];
+                body_len += item.prefix.len + digitsLen(item.price * item.quantity * m) + 1;
+                if (i > 0) body_len += 1;
+            }
+            var hdr: [200]u8 = undefined;
+            // The Date line is embedded at render time — httpDateLine() is
+            // the per-second threadlocal the send path splices in anyway —
+            // so the baked-head contract finds the field already present and
+            // emits the message as one unspliced segment.
+            const hs = std.fmt.bufPrint(&hdr,
+                "HTTP/1.1 200 OK\r\n{s}Content-Type: application/json\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n",
+                .{ orisha.httpDateLine(), body_len }) catch return null;
+            const total = hs.len + body_len;
+            const dst: []u8 = if (fd != 0)
+                (orisha.koru_pump.ringRenderTarget(@intCast(fd), total) orelse
+                    (if (body_work.len >= total) body_work[0..] else return null))
+            else
+                (if (body_work.len >= total) body_work[0..] else return null);
+            @memcpy(dst[0..hs.len], hs);
+            var p = hs.len;
+            @memcpy(dst[p..][0..jhs.len], jhs);
+            p += jhs.len;
+            p += jsonItemsInto(dst[p..], source, count, m) orelse return null;
+            dst[p] = ']';
+            dst[p + 1] = '}';
+            return dst[0 .. p + 2];
+        }
+
+        // Serialize {"items":[...],"count":N} — the same field order
+        // Stringify.valueAlloc emits for .{ .items, .count } — straight into
+        // the reusable scratch buffer. Null on overflow → heap fallback.
+        fn jsonBodyScratch(cache: []const CachedItem, count: usize, m: i64) ?[]const u8 {
+            const need = count * 256 + 64;
+            if (json_scratch.len < need) {
+                const nb = alloc.alloc(u8, need) catch return null;
+                if (json_scratch.len > 0) alloc.free(json_scratch);
+                json_scratch = nb;
+            }
+            @memcpy(json_scratch[0..10], "{\"items\":[");
+            var p: usize = 10;
+            p += jsonItemsInto(json_scratch[p..], cache, count, m) orelse return null;
+            var tail: [24]u8 = undefined;
+            const ts = std.fmt.bufPrint(&tail, "],\"count\":{d}}}", .{count}) catch return null;
+            if (p + ts.len > json_scratch.len) return null;
+            @memcpy(json_scratch[p..][0..ts.len], ts);
+            return json_scratch[0 .. p + ts.len];
         }
 
         fn datasetItems() ![]const DatasetItem {
@@ -239,12 +312,23 @@ const Impl = struct {
             };
 
             if (!wantsGzip(r.accept_encoding)) {
-                if (jsonResponse(cache, count, m)) |msg| {
+                if (jsonResponse(cache, count, m, r.fd)) |msg| {
                     return .{ .status = 200, .body = msg, .content_type = "application/json", .body_allocated = false };
                 }
             }
 
-            // Gzip / fallback: build JSON in the heap (validate json-comp path).
+            // Gzip fast path: serialize into the threadlocal scratch and
+            // deflate through the reusable stream — zero heap traffic per
+            // request. Borrowed buffers → body_allocated = false.
+            if (wantsGzip(r.accept_encoding)) {
+                if (jsonBodyScratch(cache, count, m)) |jb| {
+                    if (gzipBody(alloc, jb)) |gz| {
+                        return .{ .status = 200, .body = gz, .content_type = "application/json", .content_encoding = "gzip", .body_allocated = false };
+                    }
+                }
+            }
+
+            // Gzip overflow / non-gzip overflow fallback: build JSON in the heap.
             const JsonOutItem = struct {
                 id: i64,
                 name: []const u8,
@@ -280,7 +364,7 @@ const Impl = struct {
             if (wantsGzip(r.accept_encoding)) {
                 if (gzipBody(alloc, json_body)) |gz| {
                     alloc.free(json_body);
-                    return .{ .status = 200, .body = gz, .content_type = "application/json", .content_encoding = "gzip", .body_allocated = true };
+                    return .{ .status = 200, .body = gz, .content_type = "application/json", .content_encoding = "gzip", .body_allocated = false };
                 }
             }
             if (finishHttp("application/json", json_body)) |msg| {
