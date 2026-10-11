@@ -101,7 +101,7 @@ pub tor serve { port: u16, tls_port: ?u16, cert_path: ?string, key_path: ?string
 
 serve =
     orisha/pump:run(port, tls_port, cert_path, key_path)
-    ! arrived x |> orisha:answer(x): a |> orisha/pump:reply(x, a.head, a.body, a.date_hole, hang: a.close)
+    ! arrived x |> orisha:answer(x): a |> orisha/pump:reply(x, a.head, a.body, a.date_hole, a.head_static, a.body_static, hang: a.close)
         | sent |> orisha:release-body(a.body, allocated: a.body_allocated)
         | broken _ |> orisha:release-body(a.body, allocated: a.body_allocated)
     ! frame f |> orisha/pump:ws-frame(f)
@@ -119,7 +119,7 @@ serve =
 // It reads `x.raw` in place rather than `pump:raw`'s arena copy, and the
 // parse `scanRequest` already produced rather than re-scanning the head —
 // one request, one walk.
-pub tor answer { x: *orisha/pump:Exchange } -> { head: string, body: string, body_allocated: bool, date_hole: usize, close: bool }
+pub tor answer { x: *orisha/pump:Exchange } -> { head: string, body: string, body_allocated: bool, date_hole: usize, close: bool, head_static: bool, body_static: bool }
 
 // Free a handler body that fmt.blk allocated. Static slices and fmt:ln TLS
 // buffers arrive with allocated=false; those must not be freed.

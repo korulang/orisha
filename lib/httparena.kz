@@ -156,8 +156,10 @@ const Impl = struct {
             const start = HEAD_RESERVE - hs.len;
             @memcpy(dst[start..HEAD_RESERVE], hs);
             const msg_len = hs.len + body_len;
-            if (start != 0) std.mem.copyForwards(u8, dst[0..msg_len], dst[start .. start + msg_len]);
-            return dst[0..msg_len];
+            // No slide to dst[0]: on a ring conn the send path claims the
+            // span with a send_base offset, so the whole 8 KB+ body move is
+            // gone; off-ring the slice copies into pending either way.
+            return dst[start .. start + msg_len];
         }
 
         // Serialize {"items":[...],"count":N} per request through Stringify
@@ -222,7 +224,7 @@ const Impl = struct {
 
         fn handlePipeline(r: *orisha.Request) orisha.Response {
             _ = r;
-            return .{ .status = 200, .body = pipeline_response, .content_type = "text/plain", .body_allocated = false };
+            return .{ .status = 200, .body = pipeline_response, .content_type = "text/plain", .body_allocated = false, .body_static = true };
         }
 
         fn handleBaseline(r: *orisha.Request) orisha.Response {

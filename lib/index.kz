@@ -257,6 +257,12 @@ pub const Response = struct {
     // Default false so existing `{ status, body, content_type }` produces stay
     // honest — they do not own the bytes.
     body_allocated: bool = false,
+    // Voucher: `body` is immortal memory — a comptime/rodata slice that
+    // outlives any in-flight send. Only set it for bytes that exist for the
+    // process's whole life: an io_uring send can still be reading them when
+    // the next pipelined request runs, which is exactly when arena and
+    // threadlocal buffers are already dead.
+    body_static: bool = false,
     // `close: true` answers then drops the connection — the handler's half of
     // `pump:hang-up`, which a Response can carry because the handler never
     // sees the Exchange. On a 101 it means "frame the body, send a close
@@ -653,7 +659,7 @@ const RESPONSE_500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\
             const at = cr + 2;
             if (at + 6 > res.body.len or !std.mem.eql(u8, res.body[at..][0..6], "Date: ")) hole = at;
         }
-        return .{ .head = res.body, .body = "", .body_allocated = false, .date_hole = hole, .close = res.close };
+        return .{ .head = res.body, .body = "", .body_allocated = false, .date_hole = hole, .close = res.close, .head_static = res.body_static, .body_static = false };
     }
 
     // `content_type: null` means NO Content-Type header — a bare redirect or
@@ -676,7 +682,7 @@ const RESPONSE_500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\
     const extras: []const u8 = if (res.extra_headers) |raw_extras| blk: {
         if (!extraHeadersWellFormed(raw_extras)) {
             if (res.body_allocated) koru_allocator().free(res.body);
-            return .{ .head = RESPONSE_500, .body = "", .body_allocated = false, .date_hole = 0, .close = res.close };
+            return .{ .head = RESPONSE_500, .body = "", .body_allocated = false, .date_hole = 0, .close = res.close, .head_static = true, .body_static = false };
         }
         break :blk raw_extras;
     } else "";
@@ -699,9 +705,9 @@ const RESPONSE_500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\
             .{ extras, &date_buf },
         ) catch {
             if (res.body_allocated) koru_allocator().free(res.body);
-            return .{ .head = RESPONSE_500, .body = "", .body_allocated = false, .date_hole = 0, .close = res.close };
+            return .{ .head = RESPONSE_500, .body = "", .body_allocated = false, .date_hole = 0, .close = res.close, .head_static = true, .body_static = false };
         };
-        return .{ .head = head101, .body = res.body, .body_allocated = res.body_allocated, .date_hole = 0, .close = res.close };
+        return .{ .head = head101, .body = res.body, .body_allocated = res.body_allocated, .date_hole = 0, .close = res.close, .head_static = false, .body_static = res.body_static and !res.body_allocated };
     }
 
     // A bufPrint failure answers null now, not the canned 500, so the leg
@@ -733,9 +739,9 @@ const RESPONSE_500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\
 
     const head_slice = head orelse {
         if (res.body_allocated) koru_allocator().free(res.body);
-        return .{ .head = RESPONSE_500, .body = "", .body_allocated = false, .date_hole = 0, .close = res.close };
+        return .{ .head = RESPONSE_500, .body = "", .body_allocated = false, .date_hole = 0, .close = res.close, .head_static = true, .body_static = false };
     };
-    return .{ .head = head_slice, .body = res.body, .body_allocated = res.body_allocated, .date_hole = 0, .close = res.close };
+    return .{ .head = head_slice, .body = res.body, .body_allocated = res.body_allocated, .date_hole = 0, .close = res.close, .head_static = false, .body_static = res.body_static and !res.body_allocated };
 }
 
 ~proc release-body|zig {
@@ -1150,34 +1156,80 @@ fn headerPrefixKeepAlive(status: u16) ?[]const u8 {
     }
 
     var result_counter: usize = 0;
-    var first_branch = true;
 
-    // Emit flat if / else if chain for all non-catchall patterns
-    for (parsed_patterns.items) |*pp| {
+    // Group non-catchall patterns by method, preserving the profile-sorted
+    // order inside each group. A request matches at most one method, so
+    // per-method blocks keep first-match semantics while the method string
+    // is checked once per request instead of once per branch.
+    var method_names: std.ArrayList([]const u8) = .empty;
+    var method_groups: std.ArrayList(std.ArrayList(usize)) = .empty;
+    for (parsed_patterns.items, 0..) |*pp, pi| {
         if (pp.is_catchall) continue;
-
-        // Find continuation for this pattern
-        const cont = find_cont: {
-            for (pattern_conts.items) |pc| {
-                if (std.mem.eql(u8, pc.pattern, pp.raw)) break :find_cont pc.cont;
+        var gi: ?usize = null;
+        for (method_names.items, 0..) |mn, i| {
+            if (std.mem.eql(u8, mn, pp.method)) {
+                gi = i;
+                break;
             }
-            break :find_cont null;
+        }
+        const idx = gi orelse blk: {
+            method_names.append(allocator, pp.method) catch unreachable;
+            method_groups.append(allocator, .empty) catch unreachable;
+            break :blk method_names.items.len - 1;
         };
+        method_groups.items[idx].append(allocator, pi) catch unreachable;
+    }
 
-        // Emit if / else if
-        if (first_branch) {
+    // The catch-all body is generated once and emitted inside every method
+    // group — a request whose method matched but whose path didn't must
+    // still reach it — and once more in the final else for methods outside
+    // the table.
+    var catch_all_code: ?[]const u8 = null;
+    if (catch_all_cont) |cont| {
+        catch_all_code = continuation_codegen.generateContinuationChainWithItems(
+            allocator,
+            cont,
+            program.main_module_name,
+            &result_counter,
+            2,
+            program.items,
+        ) catch unreachable;
+    }
+
+    // Emit method-grouped if / else if blocks for all non-catchall patterns.
+    var first_group = true;
+    for (method_names.items, 0..) |mname, mi| {
+        if (first_group) {
             ib.appendSlice(allocator, "    if (") catch unreachable;
-            first_branch = false;
+            first_group = false;
         } else {
             ib.appendSlice(allocator, " else if (") catch unreachable;
         }
-
-        // Condition: method AND path
         ib.appendSlice(allocator, "std.mem.eql(u8, (") catch unreachable;
         ib.appendSlice(allocator, req_expr) catch unreachable;
         ib.appendSlice(allocator, ").method, \"") catch unreachable;
-        ib.appendSlice(allocator, pp.method) catch unreachable;
-        ib.appendSlice(allocator, "\") and ") catch unreachable;
+        ib.appendSlice(allocator, mname) catch unreachable;
+        ib.appendSlice(allocator, "\")) {\n") catch unreachable;
+
+        var first_branch = true;
+        for (method_groups.items[mi].items) |pi| {
+            const pp = &parsed_patterns.items[pi];
+
+            // Find continuation for this pattern
+            const cont = find_cont: {
+                for (pattern_conts.items) |pc| {
+                    if (std.mem.eql(u8, pc.pattern, pp.raw)) break :find_cont pc.cont;
+                }
+                break :find_cont null;
+            };
+
+            // Emit if / else if
+            if (first_branch) {
+                ib.appendSlice(allocator, "    if (") catch unreachable;
+                first_branch = false;
+            } else {
+                ib.appendSlice(allocator, " else if (") catch unreachable;
+            }
 
         // A parameterized pattern keeps the prefix fast path only when its
         // single ':' segment is the LAST segment. Anything more — a param
@@ -1358,20 +1410,21 @@ fn headerPrefixKeepAlive(status: u16) ?[]const u8 {
             ib.appendSlice(allocator, code) catch unreachable;
         }
 
+            ib.appendSlice(allocator, "    }") catch unreachable;
+        }
+
+        // A path miss inside a matched method still lands on the catch-all.
+        if (catch_all_code) |code| {
+            ib.appendSlice(allocator, " else {\n") catch unreachable;
+            ib.appendSlice(allocator, code) catch unreachable;
+            ib.appendSlice(allocator, "    }\n") catch unreachable;
+        }
         ib.appendSlice(allocator, "    }") catch unreachable;
     }
 
-    // Catch-all as else (guarantees all paths covered for Zig control flow)
-    if (catch_all_cont) |cont| {
+    // And so does a method outside the table.
+    if (catch_all_code) |code| {
         ib.appendSlice(allocator, " else {\n") catch unreachable;
-        const code = continuation_codegen.generateContinuationChainWithItems(
-            allocator,
-            cont,
-            program.main_module_name,
-            &result_counter,
-            2,
-            program.items,
-        ) catch unreachable;
         ib.appendSlice(allocator, code) catch unreachable;
         ib.appendSlice(allocator, "    }\n") catch unreachable;
     } else {

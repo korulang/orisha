@@ -119,7 +119,7 @@ pub tor deinit {}
 // a close frame follows, and the pump reaps, so a protocol can refuse a
 // socket cleanly.
 
-pub tor reply { x: *Exchange, head: string, body: string, date_hole: usize, hang: bool }
+pub tor reply { x: *Exchange, head: string, body: string, date_hole: usize, head_static: bool, body_static: bool, hang: bool }
 | sent
 | broken string
 

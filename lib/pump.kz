@@ -58,7 +58,11 @@ pub const Head = struct {
     method_len: u32 = 0,
     target_off: u32 = 0,
     target_len: u32 = 0,
-    pairs: [HEAD_PAIRS_MAX]HeadPair = undefined,
+    // Caller-provided: a HEAD_PAIRS_MAX stack buffer at the dispatch site.
+    // Keeping the array outside Head matters — `Head = .{}` with the array
+    // inline coalesces into a 1KB memset per request (15% of userspace
+    // under pipelined load, 2026-10-11); a slice pointer does not.
+    pairs: []HeadPair = &.{},
     pair_count: u8 = 0,
     // Byte offset of the first header line not stored in `pairs` (the cap
     // overflow point), or 0 when every header fit.
@@ -82,6 +86,15 @@ pub const Exchange = struct {
 
 const READ_BUFFER = 4096;
 const MAX_EVENTS = 64;
+
+// One plan entry per wire segment — a pipelined batch of 16 responses at
+// ~3 segments each fills 48 of 64.
+const SEND_PLAN_MAX = 64;
+const SendPlanEntry = struct {
+    base: usize, // .buf → offset into send_buf; otherwise a raw pointer
+    len: usize,
+    buf: bool,
+};
 
 // io_uring: how deep the submission ring is, and the tag that marks an accept
 // completion apart from a connection's.
@@ -112,10 +125,22 @@ const URING_ACCEPT_TLS: u64 = URING_ACCEPT - 1;
 // This function answers the one question the three pumps share: where does the
 // first request in this buffer end? The loops that use it are mechanical; this
 // is the part that must not be written three times.
+// A "\r\n" terminator as one vectorized scalar scan + a check, not a
+// substring search — line-end is the hot path (once per header line per
+// request) and indexOfPos costs ~4x indexOfScalarPos for a 2-byte needle.
+fn indexOfLineEnd(buf: []const u8, pos: usize) ?usize {
+    var i = pos;
+    while (std.mem.indexOfScalarPos(u8, buf, i, '\n')) |nl| {
+        if (nl > pos and buf[nl - 1] == '\r') return nl - 1;
+        i = nl + 1;
+    }
+    return null;
+}
+
 fn chunkedMessageLen(body: []const u8) ?usize {
     var pos: usize = 0;
     while (true) {
-        const line_end = std.mem.indexOfPos(u8, body, pos, "\r\n") orelse return null;
+        const line_end = indexOfLineEnd(body, pos) orelse return null;
         const chunk_size = std.fmt.parseInt(usize, body[pos..line_end], 16) catch return null;
         pos = line_end + 2;
         if (chunk_size == 0) {
@@ -143,7 +168,7 @@ fn scanRequest(buf: []const u8, head: *Head) ?usize {
     var pos: usize = 0;
     var first_line = true;
     while (true) {
-        const nl = std.mem.indexOfPos(u8, buf, pos, "\r\n") orelse return null;
+        const nl = indexOfLineEnd(buf, pos) orelse return null;
         const line = buf[pos..nl];
         const line_start = pos;
         pos = nl + 2;
@@ -320,8 +345,31 @@ pub const ConnState = struct {
     owner_ring: ?*anyopaque = null,
     send_buf: []u8 = &.{},
     send_staged: usize = 0,
+    send_base: usize = 0,
     send_off: usize = 0,
     send_len: usize = 0,
+    // Scatter send plan: when a response's segments are immortal memory
+    // (baked rodata — Response.body_static) they ride the send SQE as iovecs
+    // instead of being copied into send_buf. The plan is the window's wire
+    // order: STATIC entries are raw pointers, BUF entries are offsets into
+    // send_buf — offsets, not pointers, so a mid-stage realloc cannot kill
+    // them. At promote time the plan materializes into send_iov and the
+    // send goes out as one writev SQE.
+    send_plan: [SEND_PLAN_MAX]SendPlanEntry = undefined,
+    send_plan_n: usize = 0,
+    // +1: a drained pending span older than the plan precedes its entries.
+    send_iov: [SEND_PLAN_MAX + 1]posix.iovec_const = undefined,
+    send_iov_n: usize = 0,
+    send_iov_pos: usize = 0,
+    // Pending bytes appended while a plan window was open are NEWER than the
+    // plan's — they must drain in the next window, not this one. spill_mark
+    // is pending.items.len at the first such spill; advance drains only the
+    // older part. maxInt means "no spill this window".
+    spill_mark: usize = std.math.maxInt(usize),
+    // The per-second Date line pinned into send_buf so a static response's
+    // iovec can point at stable memory; deduped by content within a batch.
+    send_date_off: usize = 0,
+    send_date_len: usize = 0,
     ring_dead: bool = false,
     // Multishot recv on provided buffers stays armed for the conn's whole
     // life, so it is the one op that outlives teardown interest: its terminal
@@ -547,15 +595,39 @@ fn appendPending(st: *ConnState, segments: []const []const u8) bool {
         // instead. ws conns always take the pending leg: a foreign pusher
         // shares only that region under ws_mu, never the buffer a submit is
         // about to pin.
-        if (st.send_len == 0 and st.mode != .ws) {
-            for (segments) |seg| {
+        if (st.send_len == 0 and st.send_iov_n == 0 and st.mode != .ws) {
+            // Plan mode: once any segment in this window was staged as an
+            // iovec, every later byte must be plan-recorded too — wire order
+            // is the plan's, not the buffer's. A seg that arrives when the
+            // plan is full spills to pending and drains in the NEXT window.
+            const plan_mode = st.send_plan_n > 0;
+            for (segments, 0..) |seg, si| {
                 if (seg.len == 0) continue;
+                if (plan_mode and st.send_plan_n == SEND_PLAN_MAX)
+                    return spillToPending(st, segments[si..]);
                 // Rendered straight into send_buf via ringRenderTarget —
                 // claim the span instead of copying it. The renderer
                 // reserved capacity, so the buffer cannot need growth here.
                 if (seg.ptr == st.send_buf.ptr + st.send_staged) {
+                    if (plan_mode) planRecord(st, .{ .base = st.send_staged, .len = seg.len, .buf = true });
                     st.send_staged += seg.len;
                     continue;
+                }
+                // Head-parked render: the renderer left a gap inside
+                // send_buf and composed the response head into it, so the
+                // message it returns starts at send_buf + send_base instead
+                // of the staging boundary. The claim is free only while the
+                // window is empty — a gap between staged bytes and a later
+                // claim would go out on the wire — so once anything is
+                // staged this falls through to the copy leg like before.
+                if (st.send_staged == 0) {
+                    const off = @intFromPtr(seg.ptr) -% @intFromPtr(st.send_buf.ptr);
+                    if (off < st.send_buf.len and off + seg.len <= st.send_buf.len and off + seg.len <= MAX_PENDING) {
+                        if (plan_mode) planRecord(st, .{ .base = off, .len = seg.len, .buf = true });
+                        st.send_base = off;
+                        st.send_staged = off + seg.len;
+                        continue;
+                    }
                 }
                 if (st.send_staged + seg.len > MAX_PENDING) return false;
                 if (st.send_buf.len < st.send_staged + seg.len) {
@@ -572,6 +644,7 @@ fn appendPending(st: *ConnState, segments: []const []const u8) bool {
                 } else {
                     @memcpy(st.send_buf[st.send_staged..][0..seg.len], seg);
                 }
+                if (plan_mode) planRecord(st, .{ .base = st.send_staged, .len = seg.len, .buf = true });
                 st.send_staged += seg.len;
             }
             return true;
@@ -590,6 +663,97 @@ fn appendPending(st: *ConnState, segments: []const []const u8) bool {
     return true;
 }
 
+fn planRecord(st: *ConnState, entry: SendPlanEntry) void {
+    st.send_plan[st.send_plan_n] = entry;
+    st.send_plan_n += 1;
+}
+
+// Segments that arrive after the plan filled are newer than the window's —
+// pending drains only after this send completes, so queueing them there is
+// the order-preserving answer. spill_mark tags where the newer bytes begin
+// so advance doesn't promote them into THIS window ahead of the plan.
+fn spillToPending(st: *ConnState, segments: []const []const u8) bool {
+    if (st.spill_mark == std.math.maxInt(usize)) st.spill_mark = st.pending.items.len;
+    var need: usize = 0;
+    for (segments) |seg| need += seg.len;
+    if (pendingLen(st) + need > MAX_PENDING) return false;
+    st.pending.ensureUnusedCapacity(std.heap.c_allocator, need) catch return false;
+    for (segments) |seg| st.pending.appendSliceAssumeCapacity(seg);
+    return true;
+}
+
+// One planned segment: immortal memory records a raw-pointer entry, anything
+// else is copied into send_buf and records an OFFSET — send_buf may still
+// grow before this window submits, so storing its pointer now would dangle.
+fn stageSeg(st: *ConnState, seg: []const u8, stable: bool) bool {
+    if (seg.len == 0) return true;
+    if (stable) {
+        planRecord(st, .{ .base = @intFromPtr(seg.ptr), .len = seg.len, .buf = false });
+        return true;
+    }
+    if (st.send_staged + seg.len > MAX_PENDING) return false;
+    if (st.send_buf.len < st.send_staged + seg.len) {
+        const nb = std.heap.c_allocator.alloc(u8, @max(4096, st.send_buf.len * 2, st.send_staged + seg.len)) catch return false;
+        @memcpy(nb[0..st.send_staged], st.send_buf[0..st.send_staged]);
+        if (st.send_buf.len > 0) std.heap.c_allocator.free(st.send_buf);
+        st.send_buf = nb;
+    }
+    @memcpy(st.send_buf[st.send_staged..][0..seg.len], seg);
+    planRecord(st, .{ .base = st.send_staged, .len = seg.len, .buf = true });
+    st.send_staged += seg.len;
+    return true;
+}
+
+// The scatter-send leg: whichever of head/body the handler vouched immortal
+// (Response.body_static → a rodata template) rides the send SQE as an iovec
+// — no copy into send_buf. The Date line is threadlocal and flips on the
+// next second, so it gets the window's one pinned copy in send_buf, deduped
+// by content since a pipelined batch shares the second.
+fn stageIovStatic(st: *ConnState, head: []const u8, body: []const u8, date_hole: usize, date_line: []const u8, head_static: bool, body_static: bool) bool {
+    // Adopt any unplanned staged bytes as one BUF entry — they are older
+    // than this response and must precede it on the wire.
+    if (st.send_plan_n == 0 and st.send_staged > st.send_base)
+        planRecord(st, .{ .base = st.send_base, .len = st.send_staged - st.send_base, .buf = true });
+
+    const need: usize = @as(usize, if (date_hole != 0) 3 else 1) + @intFromBool(body.len != 0);
+    if (st.send_plan_n + need > SEND_PLAN_MAX) {
+        const segs: [4][]const u8 = if (date_hole != 0)
+            .{ head[0..date_hole], date_line, head[date_hole..], body }
+        else
+            .{ head, body, "", "" };
+        return spillToPending(st, &segs);
+    }
+
+    if (date_hole == 0) {
+        if (!stageSeg(st, head, head_static)) return false;
+    } else {
+        if (!stageSeg(st, head[0..date_hole], head_static)) return false;
+        // Pin the Date line once per window-second; a matching earlier pin
+        // is reused — iov order is the plan's, so pointing backward inside
+        // send_buf is fine.
+        if (st.send_date_len == date_line.len and st.send_date_off + date_line.len <= st.send_staged and
+            std.mem.eql(u8, st.send_buf[st.send_date_off..][0..date_line.len], date_line))
+        {
+            planRecord(st, .{ .base = st.send_date_off, .len = date_line.len, .buf = true });
+        } else {
+            if (st.send_staged + date_line.len > MAX_PENDING) return false;
+            if (st.send_buf.len < st.send_staged + date_line.len) {
+                const nb = std.heap.c_allocator.alloc(u8, @max(4096, st.send_buf.len * 2, st.send_staged + date_line.len)) catch return false;
+                @memcpy(nb[0..st.send_staged], st.send_buf[0..st.send_staged]);
+                if (st.send_buf.len > 0) std.heap.c_allocator.free(st.send_buf);
+                st.send_buf = nb;
+            }
+            @memcpy(st.send_buf[st.send_staged..][0..date_line.len], date_line);
+            st.send_date_off = st.send_staged;
+            st.send_date_len = date_line.len;
+            planRecord(st, .{ .base = st.send_staged, .len = date_line.len, .buf = true });
+            st.send_staged += date_line.len;
+        }
+        if (!stageSeg(st, head[date_hole..], head_static)) return false;
+    }
+    return stageSeg(st, body, body_static);
+}
+
 // A renderer may ask for space inside the dispatching conn's send_buf and
 // write the response where it will be sent from — appendPending claims the
 // span by pointer match instead of copying it. Null wherever staging into
@@ -598,7 +762,7 @@ fn appendPending(st: *ConnState, segments: []const []const u8) bool {
 // through the cipher before they may touch the wire.
 pub fn ringRenderTarget(fd: posix.fd_t, min_len: usize) ?[]u8 {
     const st = connState(@intCast(fd)) orelse return null;
-    if (st.owner_ring == null or st.mode == .ws or st.send_len != 0) return null;
+    if (st.owner_ring == null or st.mode == .ws or st.send_len != 0 or st.send_iov_n != 0) return null;
     if (HAS_OPENSSL and st.ssl != null) return null;
     if (st.send_staged + min_len > MAX_PENDING) return null;
     if (st.send_buf.len < st.send_staged + min_len) {
@@ -692,8 +856,22 @@ fn writeAllOrQueue(st: *ConnState, data: []const u8) bool {
 // responses are const rodata and cannot be patched, so the line goes out as a
 // middle iovec (same syscall, one extra vector). The slice points at the
 // orisha module's per-second threadlocal buffer: a lookup, not a format.
-fn writevAllConn(st: *ConnState, head: []const u8, body: []const u8, date_hole: usize) bool {
+// Scatter-send pays only where it skips a real copy. Measured 2026-10-11 on
+// the pipeline profile: a ~150-byte static head as raw iovecs LOST ~11% to
+// the flat send_buf copy — the iovec materialization plus the kernel's
+// import of ~24 scattered vectors costs more than memcpy'ing L1-hot bytes.
+// Below a page the copy is the fast path; above it, skipping it is.
+const SCATTER_MIN: usize = 4096;
+
+fn writevAllConn(st: *ConnState, head: []const u8, body: []const u8, date_hole: usize, head_static: bool, body_static: bool) bool {
     const date_line: []const u8 = if (date_hole != 0) @import("root").koru_orisha.httpDateLine() else "";
+    // Handler-vouched immortal memory rides the send SQE as iovecs instead
+    // of copying — when the segment is big enough for the copy to matter.
+    // Gated the same places send_buf staging is: a send in flight pins the
+    // window, ws and mem-BIO TLS are their own output paths.
+    const big = (head_static and head.len >= SCATTER_MIN) or (body_static and body.len >= SCATTER_MIN);
+    if (big and st.owner_ring != null and st.mode != .ws and st.send_len == 0 and st.send_iov_n == 0 and st.ssl == null)
+        return stageIovStatic(st, head, body, date_hole, date_line, head_static, body_static);
     const segs: [4][]const u8 = if (date_hole != 0)
         .{ head[0..date_hole], date_line, head[date_hole..], body }
     else
@@ -1880,8 +2058,9 @@ fn workerCount() usize {
                 st.batching = true;
                 var consumed: usize = 0;
                 var alive = true;
+                var head_pairs: [$mod.HEAD_PAIRS_MAX]$mod.HeadPair = undefined;
                 while (consumed < st.len) {
-                    var head: $mod.Head = .{};
+                    var head: $mod.Head = .{ .pairs = &head_pairs };
                     const take = $mod.scanRequest(st.buf[consumed..st.len], &head) orelse break;
                     var exchange = $mod.Exchange{ .fd = fd, .st = st, .raw = st.buf[consumed .. consumed + take], .head = &head };
                     if (head.wants_close) exchange.keep_alive = false;
@@ -2523,8 +2702,9 @@ fn workerCount() usize {
                     st.batching = true;
                     var consumed: usize = 0;
                     var alive = true;
+                    var head_pairs: [$mod.HEAD_PAIRS_MAX]$mod.HeadPair = undefined;
                     while (consumed < st.len) {
-                        var head: $mod.Head = .{};
+                        var head: $mod.Head = .{ .pairs = &head_pairs };
                         const take = $mod.scanRequest(st.buf[consumed..st.len], &head) orelse break;
                         var exchange = $mod.Exchange{ .fd = fd, .st = st, .raw = st.buf[consumed .. consumed + take], .head = &head };
                         if (head.wants_close) exchange.keep_alive = false;
@@ -2803,8 +2983,9 @@ fn workerCount() usize {
                     st.batching = true;
                     var consumed: usize = 0;
                     var alive = true;
+                    var head_pairs: [$mod.HEAD_PAIRS_MAX]$mod.HeadPair = undefined;
                     while (consumed < st.len) {
-                        var head: $mod.Head = .{};
+                        var head: $mod.Head = .{ .pairs = &head_pairs };
                         const take = $mod.scanRequest(st.buf[consumed..st.len], &head) orelse break;
                         var exchange = $mod.Exchange{ .fd = fd, .st = st, .raw = st.buf[consumed .. consumed + take], .head = &head };
                         if (head.wants_close) exchange.keep_alive = false;
@@ -3098,6 +3279,13 @@ fn workerCount() usize {
         }
 
         fn submitSend(w: *@This(), st: *$mod.ConnState) bool {
+            if (st.send_iov_n > 0) {
+                _ = w.ring.writev(udSend(st), st.fd, st.send_iov[st.send_iov_pos..st.send_iov_n], 0) catch {
+                    _ = w.ring.submit() catch {};
+                    _ = w.ring.writev(udSend(st), st.fd, st.send_iov[st.send_iov_pos..st.send_iov_n], 0) catch return false;
+                };
+                return true;
+            }
             _ = w.ring.send(udSend(st), st.fd, st.send_buf[st.send_off..st.send_len], linux.MSG.NOSIGNAL) catch {
                 _ = w.ring.submit() catch {};
                 _ = w.ring.send(udSend(st), st.fd, st.send_buf[st.send_off..st.send_len], linux.MSG.NOSIGNAL) catch return false;
@@ -3110,11 +3298,20 @@ fn workerCount() usize {
         // send, and a conn answered `keep_alive = false` still flushes its
         // last response before the fd drops.
         fn advance(w: *@This(), st: *$mod.ConnState) void {
-            if (st.send_len != 0) return;
+            if (st.send_len != 0 or st.send_iov_n != 0) return;
             const pn = $mod.pendingLen(st);
-            if (pn > 0) {
+            // Bytes spilled while a plan window was open are NEWER than the
+            // plan's — this window drains only up to the spill mark.
+            const drain_n = if (st.spill_mark == std.math.maxInt(usize))
+                pn
+            else
+                @min(pn, st.spill_mark -| st.pending_off);
+            var drained_lo: usize = 0;
+            var drained_n: usize = 0;
+            if (drain_n > 0) {
                 if (st.mode == .ws) st.ws_mu.lock();
-                const room = st.send_staged + pn;
+                drained_lo = st.send_staged;
+                const room = st.send_staged + drain_n;
                 if (st.send_buf.len < room) {
                     const nb = std.heap.c_allocator.alloc(u8, @max(4096, st.send_buf.len * 2, room)) catch {
                         if (st.mode == .ws) st.ws_mu.unlock();
@@ -3125,10 +3322,14 @@ fn workerCount() usize {
                     if (st.send_buf.len > 0) std.heap.c_allocator.free(st.send_buf);
                     st.send_buf = nb;
                 }
-                @memcpy(st.send_buf[st.send_staged..][0..pn], st.pending.items[st.pending_off..]);
-                st.send_staged += pn;
-                st.pending.clearRetainingCapacity();
-                st.pending_off = 0;
+                @memcpy(st.send_buf[st.send_staged..][0..drain_n], st.pending.items[st.pending_off..][0..drain_n]);
+                st.send_staged += drain_n;
+                drained_n = drain_n;
+                st.pending_off += drain_n;
+                if (st.pending_off == st.pending.items.len) {
+                    st.pending.clearRetainingCapacity();
+                    st.pending_off = 0;
+                }
                 if (st.mode == .ws) st.ws_mu.unlock();
             }
             // TLS: owed plaintext through the cipher, close_notify once if the
@@ -3139,8 +3340,38 @@ fn workerCount() usize {
                     if (!$mod.tlsRingDrain(st)) st.ring_dead = true;
                 }
             }
+            if (st.send_plan_n > 0) {
+                // Plan → iovecs: drained pending (older than the plan) goes
+                // first, then plan order. BUF entries resolve against the
+                // FINAL send_buf — after every grow in this window.
+                var n: usize = 0;
+                if (drained_n > 0) {
+                    st.send_iov[0] = .{ .base = st.send_buf.ptr + drained_lo, .len = drained_n };
+                    n = 1;
+                }
+                for (st.send_plan[0..st.send_plan_n]) |e| {
+                    st.send_iov[n] = .{
+                        .base = if (e.buf) st.send_buf.ptr + e.base else @ptrFromInt(e.base),
+                        .len = e.len,
+                    };
+                    n += 1;
+                }
+                st.send_iov_n = n;
+                st.send_iov_pos = 0;
+                st.send_plan_n = 0;
+                st.send_base = 0;
+                st.send_staged = 0;
+                st.send_date_len = 0;
+                st.spill_mark = std.math.maxInt(usize);
+                if (!w.submitSend(st)) {
+                    st.send_iov_n = 0;
+                    w.teardown(st);
+                }
+                return;
+            }
             if (st.send_staged > 0) {
-                st.send_off = 0;
+                st.send_off = st.send_base;
+                st.send_base = 0;
                 st.send_len = st.send_staged;
                 st.send_staged = 0;
                 if (!w.submitSend(st)) {
@@ -3257,7 +3488,37 @@ fn workerCount() usize {
             if (ud & TAG_SEND != 0) {
                 if (cqe.res <= 0) {
                     st.send_len = 0;
+                    st.send_iov_n = 0;
                     w.teardown(st);
+                    return;
+                }
+                if (st.send_iov_n > 0) {
+                    // Walk the written bytes across the iovec list; resubmit
+                    // with whatever pos/remainder is left.
+                    var rem: usize = @intCast(cqe.res);
+                    var pos = st.send_iov_pos;
+                    while (rem > 0 and pos < st.send_iov_n) {
+                        const l = st.send_iov[pos].len;
+                        if (rem >= l) {
+                            rem -= l;
+                            pos += 1;
+                        } else {
+                            st.send_iov[pos].base += rem;
+                            st.send_iov[pos].len -= rem;
+                            rem = 0;
+                        }
+                    }
+                    st.send_iov_pos = pos;
+                    if (pos < st.send_iov_n) {
+                        if (!w.submitSend(st)) {
+                            st.send_iov_n = 0;
+                            w.teardown(st);
+                        }
+                        return;
+                    }
+                    st.send_iov_n = 0;
+                    st.send_iov_pos = 0;
+                    w.advance(st);
                     return;
                 }
                 st.send_off += @intCast(cqe.res);
@@ -3457,8 +3718,9 @@ fn workerCount() usize {
             st.batching = true;
             var consumed: usize = 0;
             var alive = true;
+            var head_pairs: [$mod.HEAD_PAIRS_MAX]$mod.HeadPair = undefined;
             while (consumed < bytes.len) {
-                var head: $mod.Head = .{};
+                var head: $mod.Head = .{ .pairs = &head_pairs };
                 const take = $mod.scanRequest(bytes[consumed..], &head) orelse break;
                 var exchange = $mod.Exchange{ .fd = st.fd, .st = st, .raw = bytes[consumed .. consumed + take], .head = &head };
                 if (head.wants_close) exchange.keep_alive = false;
@@ -3770,8 +4032,9 @@ fn workerCount() usize {
             // Answer every COMPLETE request — see requestLen and retainTail.
             var consumed: usize = 0;
             var alive = true;
+            var head_pairs: [$mod.HEAD_PAIRS_MAX]$mod.HeadPair = undefined;
             while (consumed < live.st.len) {
-                var head: $mod.Head = .{};
+                var head: $mod.Head = .{ .pairs = &head_pairs };
                 const take = $mod.scanRequest(live.st.buf[consumed..live.st.len], &head) orelse break;
                 var x = $mod.Exchange{ .fd = live.st.fd, .st = &live.st, .raw = live.st.buf[consumed .. consumed + take], .head = &head };
                 if (head.wants_close) x.keep_alive = false;
@@ -3815,7 +4078,7 @@ fn workerCount() usize {
     // on the wire. This is the welcome-seam: `{"type":"welcome"}` reaches the
     // client before any frame it could have sent.
     if (head.len >= 13 and std.mem.eql(u8, head[0..13], "HTTP/1.1 101 ")) {
-        if (!writevAllConn(st, head, "", date_hole)) {
+        if (!writevAllConn(st, head, "", date_hole, head_static, false)) {
             x.keep_alive = false;
             return .{ .broken = "write failed" };
         }
@@ -3833,7 +4096,7 @@ fn workerCount() usize {
         // protocol upgrade must send.
         if (!x.keep_alive) _ = wsSendFrame(st, 0x8, "\x03\xe8");
     } else {
-        if (!writevAllConn(st, head, body, date_hole)) {
+        if (!writevAllConn(st, head, body, date_hole, head_static, body_static)) {
             x.keep_alive = false;
             return .{ .broken = "write failed" };
         }
@@ -3864,6 +4127,8 @@ fn workerCount() usize {
 // no implementation on a freestanding target; `send` is the same loop over the
 // socket symbol the pump already uses.
 ~proc reply|unikraft {
+    _ = head_static; // no io_uring scatter send on the unikernel writer
+    _ = body_static;
     if (hang) x.keep_alive = false;
     // No scatter write here either — a holed head goes out as three sends:
     // up to the insertion point, the Date line, the rest.
