@@ -659,47 +659,7 @@ fn appendPending(st: *ConnState, segments: []const []const u8) bool {
                 if (seg.len == 0) continue;
                 if (plan_mode and st.send_plan_n == SEND_PLAN_MAX)
                     return spillToPending(st, segments[si..]);
-                // Rendered straight into send_buf via ringRenderTarget —
-                // claim the span instead of copying it. The renderer
-                // reserved capacity, so the buffer cannot need growth here.
-                if (seg.ptr == st.send_buf.ptr + st.send_staged) {
-                    if (plan_mode) planRecord(st, .{ .base = st.send_staged, .len = seg.len, .buf = true });
-                    st.send_staged += seg.len;
-                    continue;
-                }
-                // Head-parked render: the renderer left a gap inside
-                // send_buf and composed the response head into it, so the
-                // message it returns starts at send_buf + send_base instead
-                // of the staging boundary. The claim is free only while the
-                // window is empty — a gap between staged bytes and a later
-                // claim would go out on the wire — so once anything is
-                // staged this falls through to the copy leg like before.
-                if (st.send_staged == 0) {
-                    const off = @intFromPtr(seg.ptr) -% @intFromPtr(st.send_buf.ptr);
-                    if (off < st.send_buf.len and off + seg.len <= st.send_buf.len and off + seg.len <= MAX_PENDING) {
-                        if (plan_mode) planRecord(st, .{ .base = off, .len = seg.len, .buf = true });
-                        st.send_base = off;
-                        st.send_staged = off + seg.len;
-                        continue;
-                    }
-                }
-                if (st.send_staged + seg.len > MAX_PENDING) return false;
-                if (st.send_buf.len < st.send_staged + seg.len) {
-                    const nb = pumpAlloc().alloc(u8, @max(4096, st.send_buf.len * 2, st.send_staged + seg.len)) catch return false;
-                    @memcpy(nb[0..st.send_staged], st.send_buf[0..st.send_staged]);
-                    if (st.send_buf.len > 0) pumpAlloc().free(st.send_buf);
-                    st.send_buf = nb;
-                }
-                // A slice inside send_buf but not at the staged boundary
-                // can only be a displaced pre-stage — the ranges overlap,
-                // so forwards is the defined order.
-                if (@intFromPtr(seg.ptr) -% @intFromPtr(st.send_buf.ptr) < st.send_buf.len) {
-                    std.mem.copyForwards(u8, st.send_buf[st.send_staged..][0..seg.len], seg);
-                } else {
-                    @memcpy(st.send_buf[st.send_staged..][0..seg.len], seg);
-                }
-                if (plan_mode) planRecord(st, .{ .base = st.send_staged, .len = seg.len, .buf = true });
-                st.send_staged += seg.len;
+                if (!stageIntoSendBuf(st, seg, plan_mode)) return false;
             }
             return true;
         }
@@ -720,6 +680,99 @@ fn appendPending(st: *ConnState, segments: []const []const u8) bool {
 fn planRecord(st: *ConnState, entry: SendPlanEntry) void {
     st.send_plan[st.send_plan_n] = entry;
     st.send_plan_n += 1;
+}
+
+// One segment into the ring window: claim in-place renders, copy the rest.
+// The empty-segment check lives in the callers — they know whether a zero
+// len means "skip" (loop) or "absent" (pair).
+fn stageIntoSendBuf(st: *ConnState, seg: []const u8, plan_mode: bool) bool {
+    // Rendered straight into send_buf via ringRenderTarget —
+    // claim the span instead of copying it. The renderer
+    // reserved capacity, so the buffer cannot need growth here.
+    if (seg.ptr == st.send_buf.ptr + st.send_staged) {
+        if (plan_mode) planRecord(st, .{ .base = st.send_staged, .len = seg.len, .buf = true });
+        st.send_staged += seg.len;
+        return true;
+    }
+    // Head-parked render: the renderer left a gap inside
+    // send_buf and composed the response head into it, so the
+    // message it returns starts at send_buf + send_base instead
+    // of the staging boundary. The claim is free only while the
+    // window is empty — a gap between staged bytes and a later
+    // claim would go out on the wire — so once anything is
+    // staged this falls through to the copy leg like before.
+    if (st.send_staged == 0) {
+        const off = @intFromPtr(seg.ptr) -% @intFromPtr(st.send_buf.ptr);
+        if (off < st.send_buf.len and off + seg.len <= st.send_buf.len and off + seg.len <= MAX_PENDING) {
+            if (plan_mode) planRecord(st, .{ .base = off, .len = seg.len, .buf = true });
+            st.send_base = off;
+            st.send_staged = off + seg.len;
+            return true;
+        }
+    }
+    if (st.send_staged + seg.len > MAX_PENDING) return false;
+    if (st.send_buf.len < st.send_staged + seg.len) {
+        const nb = pumpAlloc().alloc(u8, @max(4096, st.send_buf.len * 2, st.send_staged + seg.len)) catch return false;
+        @memcpy(nb[0..st.send_staged], st.send_buf[0..st.send_staged]);
+        if (st.send_buf.len > 0) pumpAlloc().free(st.send_buf);
+        st.send_buf = nb;
+    }
+    // A slice inside send_buf but not at the staged boundary
+    // can only be a displaced pre-stage — the ranges overlap,
+    // so forwards is the defined order.
+    if (@intFromPtr(seg.ptr) -% @intFromPtr(st.send_buf.ptr) < st.send_buf.len) {
+        std.mem.copyForwards(u8, st.send_buf[st.send_staged..][0..seg.len], seg);
+    } else {
+        @memcpy(st.send_buf[st.send_staged..][0..seg.len], seg);
+    }
+    if (plan_mode) planRecord(st, .{ .base = st.send_staged, .len = seg.len, .buf = true });
+    st.send_staged += seg.len;
+    return true;
+}
+
+// The two-segment hot path: writevAllConn hands head+body (or a baked flat
+// head + body) straight through in registers — no stack-resident segment
+// array built and re-read per response. Same merge rules as appendPending,
+// which stays for the N-segment callers; the plan-full guard differs in
+// one way: with no index into a remainder slice, a full plan on `b`
+// spills just `b`.
+fn appendPair(st: *ConnState, a: []const u8, b: []const u8) bool {
+    const lock_it = st.mode == .ws;
+    if (lock_it) st.ws_mu.lock();
+    defer if (lock_it) st.ws_mu.unlock();
+    const need = a.len + b.len;
+    if (st.owner_ring != null) {
+        if (HAS_OPENSSL) {
+            if (st.ssl != null) return tlsRingWrite(st, &.{ a, b });
+        }
+        if (st.send_len == 0 and st.send_iov_n == 0 and st.mode != .ws) {
+            const plan_mode = st.send_plan_n > 0;
+            if (a.len != 0) {
+                if (plan_mode and st.send_plan_n == SEND_PLAN_MAX)
+                    return spillToPending(st, &.{ a, b });
+                if (!stageIntoSendBuf(st, a, plan_mode)) return false;
+            }
+            if (b.len != 0) {
+                if (plan_mode and st.send_plan_n == SEND_PLAN_MAX)
+                    return spillToPending(st, &.{b});
+                if (!stageIntoSendBuf(st, b, plan_mode)) return false;
+            }
+            return true;
+        }
+        if (pendingLen(st) + need > MAX_PENDING) return false;
+        st.pending.ensureUnusedCapacity(pumpAlloc(), need) catch return false;
+        st.pending.appendSliceAssumeCapacity(a);
+        st.pending.appendSliceAssumeCapacity(b);
+        return true;
+    }
+    if (st.pending.items.len + need > MAX_PENDING) {
+        if (flushPending(st) == .dead) return false;
+        if (st.pending.items.len + need > MAX_PENDING) return false;
+    }
+    st.pending.ensureUnusedCapacity(pumpAlloc(), need) catch return false;
+    st.pending.appendSliceAssumeCapacity(a);
+    st.pending.appendSliceAssumeCapacity(b);
+    return true;
 }
 
 // Segments that arrive after the plan filled are newer than the window's —
@@ -969,15 +1022,17 @@ fn writevAllConn(st: *ConnState, head: []const u8, body: []const u8, date_hole: 
         return stageIovStatic(st, head, body, date_hole, date_line, head_static, body_static);
     // A holed head composes once per second — one flat segment beats three
     // small copies through appendPending.
-    if (date_hole != 0 and (st.batching or st.owner_ring != null)) {
+    if (st.batching or st.owner_ring != null) {
+        if (date_hole == 0) return appendPair(st, head, body);
         if (bakedSegment(head, date_hole, date_line, head_static)) |flat|
-            return appendPending(st, &.{ flat, body });
+            return appendPair(st, flat, body);
+        const segs4: [4][]const u8 = .{ head[0..date_hole], date_line, head[date_hole..], body };
+        return appendPending(st, &segs4);
     }
     const segs: [4][]const u8 = if (date_hole != 0)
         .{ head[0..date_hole], date_line, head[date_hole..], body }
     else
         .{ head, body, "", "" };
-    if (st.batching or st.owner_ring != null) return appendPending(st, &segs);
     if (HAS_OPENSSL) {
         if (st.ssl != null) {
             return tlsWriteOrQueue(st, &segs);
