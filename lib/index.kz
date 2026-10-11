@@ -268,6 +268,16 @@ pub const Response = struct {
     // sees the Exchange. On a 101 it means "frame the body, send a close
     // frame, hang up" — Action Cable's reject-unauthorized reads exactly so.
     close: bool = false,
+    // Voucher: `body` is a complete HTTP/1.x message — status line, headers,
+    // body — rendered by the handler (or by the compiler for a request-free
+    // route). Set, `answer` ships it verbatim as the head with no render
+    // pass: no Content-Type/Length/Powered-By additions, no "is this wire"
+    // probe per request. `wire_date_hole` is the byte offset the Date line
+    // splices at — known by whoever rendered the message, so it does not get
+    // searched for either. 0 means "head is already complete": a message
+    // that rendered its own Date at the splice point.
+    wire: bool = false,
+    wire_date_hole: usize = 0,
 };
 
 // The header is built into a buffer that outlives the frame, because `answer`
@@ -664,7 +674,12 @@ const RESPONSE_500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\
     };
 
     // A handler that already rendered a whole response (a static route) hands
-    // it back verbatim; it goes out as the head with no separate body.
+    // it back verbatim; it goes out as the head with no separate body. The
+    // `wire` voucher says so up front and carries the splice offset, so a
+    // compiler-rendered response skips the probe and the hole search alike.
+    if (res.wire) {
+        return .{ .head = res.body, .body = "", .body_allocated = false, .date_hole = res.wire_date_hole, .close = res.close, .head_static = res.body_static, .body_static = false };
+    }
     if (std.mem.startsWith(u8, res.body, "HTTP/1.")) {
         // Pre-rendered static routes: the whole message is `head`. `body`
         // is empty, so it must not carry the allocated flag — freeing ""
@@ -982,6 +997,66 @@ fn patternMatchesLiteral(pattern: []const u8, literal: []const u8) bool {
         }
     }
     return lit.next() == null;
+}
+
+// Decode the `body:` string of a produce literal and, when it spells a
+// complete HTTP/1.x message, return the Date splice offset — the value the
+// `answer` tail would otherwise re-derive per request with a prefix check
+// and a CR scan. null means "not a wire response" and the arm emits
+// untagged. The decode must mirror the literal: the transform sees Koru
+// escapes (`\r\n`), the wire sees the bytes they spell.
+fn literalWireDateHole(allocator: std.mem.Allocator, plain: []const u8) ?usize {
+    const body_at = std.mem.indexOf(u8, plain, "body:") orelse return null;
+    var q = body_at + "body:".len;
+    while (q < plain.len and (plain[q] == ' ' or plain[q] == '\t')) q += 1;
+    if (q >= plain.len or plain[q] != '"') return null;
+    var decoded: std.ArrayList(u8) = .empty;
+    defer decoded.deinit(allocator);
+    var i = q + 1;
+    while (i < plain.len) {
+        const c = plain[i];
+        if (c == '"') break;
+        if (c == '\\' and i + 1 < plain.len) {
+            const e = plain[i + 1];
+            const d: u8 = switch (e) {
+                'r' => '\r',
+                'n' => '\n',
+                't' => '\t',
+                '\\' => '\\',
+                '"' => '"',
+                else => {
+                    decoded.append(allocator, '\\') catch return null;
+                    i += 1;
+                    continue;
+                },
+            };
+            decoded.append(allocator, d) catch return null;
+            i += 2;
+            continue;
+        }
+        decoded.append(allocator, c) catch return null;
+        i += 1;
+    }
+    const body = decoded.items;
+    if (!std.mem.startsWith(u8, body, "HTTP/1.")) return null;
+    const cr = std.mem.indexOfScalar(u8, body, '\r') orelse return 0;
+    const at = cr + 2;
+    if (at + 6 <= body.len and std.mem.eql(u8, body[at..][0..6], "Date: ")) return 0;
+    return at;
+}
+
+// Wire voucher: a produce literal whose `body:` already spells a complete
+// HTTP/1.x message carries `.wire` plus the compile-time splice offset — the
+// `answer` tail then takes `res.wire` and skips the startsWith/CR-scan/
+// `Date: ` probe entirely. Inserted inside the record braces the same way
+// mark_body_allocated rides in.
+fn wireTagArmCode(allocator: std.mem.Allocator, cont: *const ast.Continuation, code: []const u8) []const u8 {
+    const n = cont.node orelse return code;
+    if (n != .branch_constructor) return code;
+    const pv = n.branch_constructor.plain_value orelse return code;
+    const hole = literalWireDateHole(allocator, pv) orelse return code;
+    const close = std.mem.lastIndexOfScalar(u8, code, '}') orelse return code;
+    return std.fmt.allocPrint(allocator, "{s}, .wire = true, .wire_date_hole = {} {s}", .{ code[0..close], hole, code[close..] }) catch code;
 }
 
 // Rename orisha's `handler-lite` default impl to `handler-lite.default` —
@@ -1581,14 +1656,14 @@ fn indexOfWord(code: []const u8, word: []const u8) ?usize {
 
         // Continuation code
         if (cont) |active_cont| {
-            const code = continuation_codegen.generateContinuationChainWithItems(
+            const code = wireTagArmCode(allocator, active_cont, continuation_codegen.generateContinuationChainWithItems(
                 allocator,
                 active_cont,
                 program.main_module_name,
                 &result_counter,
                 2,
                 program.items,
-            ) catch unreachable;
+            ) catch unreachable);
             ib.appendSlice(allocator, code) catch unreachable;
         }
 
@@ -1646,7 +1721,7 @@ fn indexOfWord(code: []const u8, word: []const u8) ?usize {
             lb.appendSlice(allocator, pp.path) catch unreachable;
             lb.appendSlice(allocator, "\")) {\n") catch unreachable;
             var lite_counter2: usize = 0;
-            const arm_code = if (cont) |lite_cont|
+            var arm_code = if (cont) |lite_cont|
                 continuation_codegen.generateContinuationChainWithItems(
                     allocator,
                     lite_cont,
@@ -1657,6 +1732,9 @@ fn indexOfWord(code: []const u8, word: []const u8) ?usize {
                 ) catch unreachable
             else
                 continue;
+            if (cont) |lite_cont| {
+                arm_code = wireTagArmCode(allocator, lite_cont, arm_code);
+            }
             lb.appendSlice(allocator, arm_code) catch unreachable;
             lb.appendSlice(allocator, "    }\n") catch unreachable;
         }
