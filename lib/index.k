@@ -84,6 +84,22 @@ pub tor send { conn: *ConnHandle, status: u16, body: string, content_type: ?stri
 // Default implementation - 404 for everything
 handler -> { status: 404, body: "Not Found", content_type: null }
 
+// PRE-REQUEST DISPATCH — routes whose answer never needed the Request.
+// `! [GET /x] -> { ... }` literal arms produce a fixed Response by
+// construction: no `req` exists in their scope, so they are provably
+// request-free. The router transform collects those arms into this impl —
+// answer() consults it BEFORE materializing Request/head fields, and a hit
+// skips all of that machinery. Miss (null) falls through to the full
+// handler unchanged. Default: nothing is request-free.
+//
+// @retain: handler_lite_event is referenced from answer's raw Zig via
+// $mod.handler_lite_event.handler(...) — invisible to the dead-stripper.
+
+[abstract|retain]pub tor handler-lite { method: string, path: string } -> ?Response
+
+// Default implementation - no request-free routes
+handler-lite -> null
+
 // ============================================================================
 // SERVE — a Koru flow over a platform pump
 // ============================================================================

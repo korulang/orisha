@@ -373,6 +373,35 @@ keep deliberately, not oversights. Interleaved A/B `-c800 -t8 -p16`:
 3/4 pairs to the slim build, mean ~11.33M vs ~11.20M — inside the VM's
 noise band; priced verdict belongs to the server-bound droplet.
 
+Priced on the droplet (same harness, `pipelined` profile, best-of-3):
+1,865,282 → **1,941,378 req/s** (+4.1%) against zix's 2,456,538. The
+remaining gap is not sends: perf-stat tracepoints under identical load
+show zix submitting **more** SQEs per request (0.189 vs our 0.126) yet
+moving 16% more requests — because their per-request CPU is ~0.58 µs
+(2.46M @ 142% CPU) versus our ~1.04 µs (1.94M @ 202% CPU). Our userspace
+self-time is ~27% of samples (dispatch blob ~17.6%, staging ~6%),
+concentrated ~40% at the `writevAllConn` call edge and ~13% in the
+AVX-512 request scan; zix's userspace is ~0%. The gap is per-request
+machinery depth, not transport. A `date_hole` memo keyed on the static
+body pointer was tried and **reverted**: −4.5% over 8 interleaved pairs —
+the probe's added branch in the inlined blob cost more than two SIMD
+scans it replaced (the `headValuesParsed2` lesson repeats).
+
+The first structural answer to the machinery finding is the
+request-free dispatch: `handler-lite`, an abstract tor the route
+transform fills with exact-literal route arms that never mention `req`.
+`answer` consults it before building `Request` — a static hit skips
+Request construction, etag/accept-encoding extraction, and the handler
+call entirely. Priced on a c-4 droplet, interleaved alternating-order
+pairs, `-c4096 -t4 -p16` pipelined: **+2.0%** on the static route
+(1,621,250 vs 1,588,750 mean, lite ahead 6/8 pairs), **−1.3%** on
+`/baseline11` dynamic misses (140,596 vs 142,382, behind 4/5) — the
+probe tax every request pays for a walk it didn't take. Validator
+37/37 on the exact lite binary. The deeper form of the same cut — one
+ordered match chain where literal arms return and dynamic arms carry
+their match into Request construction — removes the double-match
+instead of adding a probe.
+
 ## Open questions
 
 - Whether the fused front-end buys throughput on a server-bound regime —

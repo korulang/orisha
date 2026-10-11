@@ -590,70 +590,78 @@ const RESPONSE_500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\
         }
     }
 
-    var client_etag: ?[]const u8 = null;
-    // Header names are case-insensitive. The Vercel adapter used to omit this
-    // header entirely; once it forwards it, browsers send `If-None-Match` in
-    // whatever casing their stack picked, and a literal search would miss.
-    const etag_raw: ?[]const u8 = if (parsed) |h|
-        (if (h.if_none_match_off != 0) raw[h.if_none_match_off..][0..h.if_none_match_len] else null)
-    else
-        $mod.headValueParsed(parsed, raw, "if-none-match");
-    if (etag_raw) |tag| {
-        if (tag.len >= 2 and tag[0] == '"' and tag[tag.len - 1] == '"') {
-            client_etag = tag[1 .. tag.len - 1];
-        } else {
-            client_etag = tag;
-        }
-    }
-
-    const accept_encoding: ?[]const u8 = if (parsed) |h|
-        (if (h.accept_encoding_off != 0) raw[h.accept_encoding_off..][0..h.accept_encoding_len] else null)
-    else
-        $mod.headValueParsed(parsed, raw, "accept-encoding");
-
-    var body: ?[]const u8 = null;
-    var headers_block: ?[]const u8 = null;
-
-    if (parsed) |h| {
-        headers_block = raw[0..h.head_len];
-        const body_raw = if (h.head_len < raw.len) raw[h.head_len..] else "";
-        if (h.chunked) {
-            var decoded_buf: [4096]u8 = undefined;
-            if (decodeChunkedPayload(body_raw, &decoded_buf)) |decoded| {
-                body = decoded;
+    // Request-free dispatch: literal arms (`! [GET /x] -> { ... }`) produce a
+    // fixed Response and cannot touch `req`, so they are collected by the
+    // router transform into handler-lite — consulted here, before any of the
+    // request materialization below. A hit shares the same response tail as
+    // the full path; a miss pays one call and a few compares and everything
+    // proceeds exactly as it always did.
+    const res = $mod.handler_lite_event.handler(.{ .method = method, .path = path }) orelse blk: {
+        var client_etag: ?[]const u8 = null;
+        // Header names are case-insensitive. The Vercel adapter used to omit this
+        // header entirely; once it forwards it, browsers send `If-None-Match` in
+        // whatever casing their stack picked, and a literal search would miss.
+        const etag_raw: ?[]const u8 = if (parsed) |h|
+            (if (h.if_none_match_off != 0) raw[h.if_none_match_off..][0..h.if_none_match_len] else null)
+        else
+            $mod.headValueParsed(parsed, raw, "if-none-match");
+        if (etag_raw) |tag| {
+            if (tag.len >= 2 and tag[0] == '"' and tag[tag.len - 1] == '"') {
+                client_etag = tag[1 .. tag.len - 1];
+            } else {
+                client_etag = tag;
             }
-        } else if (body_raw.len > 0) {
-            body = body_raw;
         }
-    } else if (std.mem.indexOf(u8, raw, "\r\n\r\n")) |header_end| {
-        const headers_end = header_end + 4;
-        const block = raw[0..headers_end];
-        headers_block = block;
-        const body_raw = if (headers_end < raw.len) raw[headers_end..] else "";
-        if (transferEncodingChunkedHead(block)) {
-            var decoded_buf: [4096]u8 = undefined;
-            if (decodeChunkedPayload(body_raw, &decoded_buf)) |decoded| {
-                body = decoded;
-            }
-        } else if (body_raw.len > 0) {
-            body = body_raw;
-        }
-    }
 
-    var req = Request{
-        .method = method,
-        .path = path,
-        .query = query,
-        .body = body,
-        .accept_encoding = accept_encoding,
-        .if_none_match = client_etag,
-        .headers = headers_block,
-        .head = parsed,
-        .fd = fd,
-        .allocator = req_allocator,
+        const accept_encoding: ?[]const u8 = if (parsed) |h|
+            (if (h.accept_encoding_off != 0) raw[h.accept_encoding_off..][0..h.accept_encoding_len] else null)
+        else
+            $mod.headValueParsed(parsed, raw, "accept-encoding");
+
+        var body: ?[]const u8 = null;
+        var headers_block: ?[]const u8 = null;
+
+        if (parsed) |h| {
+            headers_block = raw[0..h.head_len];
+            const body_raw = if (h.head_len < raw.len) raw[h.head_len..] else "";
+            if (h.chunked) {
+                var decoded_buf: [4096]u8 = undefined;
+                if (decodeChunkedPayload(body_raw, &decoded_buf)) |decoded| {
+                    body = decoded;
+                }
+            } else if (body_raw.len > 0) {
+                body = body_raw;
+            }
+        } else if (std.mem.indexOf(u8, raw, "\r\n\r\n")) |header_end| {
+            const headers_end = header_end + 4;
+            const block = raw[0..headers_end];
+            headers_block = block;
+            const body_raw = if (headers_end < raw.len) raw[headers_end..] else "";
+            if (transferEncodingChunkedHead(block)) {
+                var decoded_buf: [4096]u8 = undefined;
+                if (decodeChunkedPayload(body_raw, &decoded_buf)) |decoded| {
+                    body = decoded;
+                }
+            } else if (body_raw.len > 0) {
+                body = body_raw;
+            }
+        }
+
+        var req = Request{
+            .method = method,
+            .path = path,
+            .query = query,
+            .body = body,
+            .accept_encoding = accept_encoding,
+            .if_none_match = client_etag,
+            .headers = headers_block,
+            .head = parsed,
+            .fd = fd,
+            .allocator = req_allocator,
+        };
+
+        break :blk $mod.handler_event.handler(.{ .req = &req });
     };
-
-    const res = $mod.handler_event.handler(.{ .req = &req });
 
     // A handler that already rendered a whole response (a static route) hands
     // it back verbatim; it goes out as the head with no separate body.
@@ -952,6 +960,91 @@ fn headerPrefixKeepAlive(status: u16) ?[]const u8 {
 }
 
 
+// Compile-time echo of the route matcher the transform emits — does a
+// declared pattern possibly match this exact literal path? Used to keep
+// handler-lite's pre-Request dispatch honest about first-match order: a
+// literal arm is only pre-dispatched when no earlier, non-literal pattern
+// could swallow its path first. Segment rules mirror the emitted code:
+// ':' consumes one non-empty segment, '*' consumes the rest, literals
+// must equal, and a non-wildcard pattern must consume the path exactly.
+fn patternMatchesLiteral(pattern: []const u8, literal: []const u8) bool {
+    var pit = std.mem.splitScalar(u8, pattern, '/');
+    var lit = std.mem.splitScalar(u8, literal, '/');
+    _ = lit.next(); // leading empty segment before the first '/'
+    while (pit.next()) |seg| {
+        if (seg.len == 0) continue;
+        if (seg.len == 1 and seg[0] == '*') return true;
+        const cur = lit.next() orelse return false;
+        if (seg.len > 1 and seg[0] == ':') {
+            if (cur.len == 0) return false;
+        } else if (!std.mem.eql(u8, seg, cur)) {
+            return false;
+        }
+    }
+    return lit.next() == null;
+}
+
+// Rename orisha's `handler-lite` default impl to `handler-lite.default` —
+// exactly what resolve_abstract_impl.renameToDefault does at parse time,
+// applied here because the override impl is synthesized only now, inside
+// the transform. `const` is cast off for the same reason resolve mutates
+// in place: the AST lives on the compile arena and is rewritten, not
+// shared immutable data.
+fn renameLiteDefault(items: []const ast.Item, allocator: std.mem.Allocator) void {
+    for (@constCast(items)) |*it| {
+        switch (it.*) {
+            .module_decl => |*md| renameLiteDefault(md.items, allocator),
+            .immediate_impl => |*ii| {
+                if (ii.event_path.segments.len > 0 and
+                    std.mem.eql(u8, ii.event_path.segments[0], "handler-lite") and
+                    std.mem.eql(u8, ii.module, "orisha"))
+                {
+                    const new_segments = allocator.alloc([]const u8, ii.event_path.segments.len) catch unreachable;
+                    new_segments[0] = "handler-lite.default";
+                    for (ii.event_path.segments[1..], 1..) |seg, i| {
+                        new_segments[i] = seg;
+                    }
+                    ii.event_path.segments = new_segments;
+                }
+            },
+            .flow => |*fl| {
+                if (fl.impl_of) |*impl_path| {
+                    if (impl_path.segments.len > 0 and
+                        std.mem.eql(u8, impl_path.segments[0], "handler-lite") and
+                        std.mem.eql(u8, fl.module, "orisha"))
+                    {
+                        const new_segments = allocator.alloc([]const u8, impl_path.segments.len) catch unreachable;
+                        new_segments[0] = "handler-lite.default";
+                        for (impl_path.segments[1..], 1..) |seg, i| {
+                            new_segments[i] = seg;
+                        }
+                        impl_path.segments = new_segments;
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+}
+
+// Whole-word substring: does `code` reference the token `word` at an
+// identifier boundary? The lite-table gate runs this over generated arm
+// code to disqualify literal arms that still name `req`.
+fn indexOfWord(code: []const u8, word: []const u8) ?usize {
+    if (word.len == 0 or code.len < word.len) return null;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, code, i, word)) |hit| {
+        const before_ok = hit == 0 or
+            !(std.ascii.isAlphanumeric(code[hit - 1]) or code[hit - 1] == '_');
+        const after = hit + word.len;
+        const after_ok = after >= code.len or
+            !(std.ascii.isAlphanumeric(code[after]) or code[after] == '_');
+        if (before_ok and after_ok) return hit;
+        i = hit + 1;
+    }
+    return null;
+}
+
 ~proc router|zig {
     const ast_mod = @import("ast");
     const ast_functional = @import("ast_functional");
@@ -1197,6 +1290,76 @@ fn headerPrefixKeepAlive(status: u16) ?[]const u8 {
             break :blk method_names.items.len - 1;
         };
         method_groups.items[idx].append(allocator, pi) catch unreachable;
+    }
+
+    // handler-lite table — the pre-Request dispatch. A route arm that is a
+    // `-> { ... }` literal (a `.branch_constructor` produce) is request-free
+    // by construction UNLESS its body still names `req` — checked on the
+    // generated code, not the AST, so a `req.path` inside a field literal
+    // quietly disqualifies the arm instead of silently dispatching past it.
+    // A literal arm joins the table only when no earlier pattern in its own
+    // method group could match its path — earlier dynamic routes keep their
+    // first-match semantics because lite-miss falls through to the full
+    // chain, which still contains every route in order.
+    var lite_route_pis: std.ArrayList(usize) = .empty;
+    {
+        for (method_names.items, 0..) |_, mi| {
+            for (method_groups.items[mi].items, 0..) |pi, gi| {
+                const pp = &parsed_patterns.items[pi];
+                // Exact-path patterns only: a ':' or '*' pattern is a shape,
+                // not a fixed answer.
+                if (pp.params.len != 0) continue;
+                var path_iter_chk = std.mem.splitScalar(u8, pp.path, '/');
+                var has_star = false;
+                while (path_iter_chk.next()) |seg| {
+                    if (seg.len == 1 and seg[0] == '*') has_star = true;
+                }
+                if (has_star) continue;
+
+                // Literal arm check + req-independence, on the generated code.
+                const cont = find_cont: {
+                    for (pattern_conts.items) |pc| {
+                        if (std.mem.eql(u8, pc.pattern, pp.raw)) break :find_cont pc.cont;
+                    }
+                    break :find_cont null;
+                };
+                const pc_node = if (cont) |c| c.node else null;
+                const is_literal = if (pc_node) |n| n == .branch_constructor else false;
+                if (!is_literal) continue;
+
+                var lite_counter: usize = 0;
+                const arm_code = continuation_codegen.generateContinuationChainWithItems(
+                    allocator,
+                    cont.?,
+                    program.main_module_name,
+                    &lite_counter,
+                    2,
+                    program.items,
+                ) catch unreachable;
+                if (indexOfWord(arm_code, req_expr) != null) continue;
+
+                // Shadow check: an earlier pattern in this method group that
+                // is not itself an admitted literal route must not be able to
+                // match this route's exact path — in the full chain it wins
+                // first-match, and lite must not reorder past it.
+                var shadowed = false;
+                for (method_groups.items[mi].items[0..gi]) |pji| {
+                    var earlier_in_lite = false;
+                    for (lite_route_pis.items) |lpi| {
+                        if (lpi == pji) earlier_in_lite = true;
+                    }
+                    if (earlier_in_lite) continue;
+                    const pp2 = &parsed_patterns.items[pji];
+                    if (patternMatchesLiteral(pp2.path, pp.path)) {
+                        shadowed = true;
+                        break;
+                    }
+                }
+                if (shadowed) continue;
+
+                lite_route_pis.append(allocator, pi) catch unreachable;
+            }
+        }
     }
 
     // The catch-all body is generated once and emitted inside every method
@@ -1459,6 +1622,49 @@ fn headerPrefixKeepAlive(status: u16) ?[]const u8 {
         _generated_dispatch;
     std.debug.print("[ROUTER TRANSFORM] Generated inline dispatch:\n{s}\n", .{inline_body_str});
 
+    // Emit the handler-lite body over admitted literal routes — a flat
+    // first-match chain on (method, path), the same order the full dispatch
+    // emits them. Each arm regenerates its code under its own counter; the
+    // emitted `result_` names live in a different function than the main
+    // chain's, so nothing collides.
+    var lite_body_str: ?[]const u8 = null;
+    if (lite_route_pis.items.len > 0) {
+        var lb: std.ArrayList(u8) = .empty;
+        lb.appendSlice(allocator, "//@koru:inline_stmt\n") catch unreachable;
+        for (lite_route_pis.items, 0..) |pi, li| {
+            const pp = &parsed_patterns.items[pi];
+            const cont = find_cont: {
+                for (pattern_conts.items) |pc| {
+                    if (std.mem.eql(u8, pc.pattern, pp.raw)) break :find_cont pc.cont;
+                }
+                break :find_cont null;
+            };
+            lb.appendSlice(allocator, if (li == 0) "    if (" else "    else if (") catch unreachable;
+            lb.appendSlice(allocator, "std.mem.eql(u8, method, \"") catch unreachable;
+            lb.appendSlice(allocator, pp.method) catch unreachable;
+            lb.appendSlice(allocator, "\") and std.mem.eql(u8, path, \"") catch unreachable;
+            lb.appendSlice(allocator, pp.path) catch unreachable;
+            lb.appendSlice(allocator, "\")) {\n") catch unreachable;
+            var lite_counter2: usize = 0;
+            const arm_code = if (cont) |lite_cont|
+                continuation_codegen.generateContinuationChainWithItems(
+                    allocator,
+                    lite_cont,
+                    program.main_module_name,
+                    &lite_counter2,
+                    2,
+                    program.items,
+                ) catch unreachable
+            else
+                continue;
+            lb.appendSlice(allocator, arm_code) catch unreachable;
+            lb.appendSlice(allocator, "    }\n") catch unreachable;
+        }
+        lb.appendSlice(allocator, "    return null;\n") catch unreachable;
+        lite_body_str = lb.toOwnedSlice(allocator) catch unreachable;
+        std.debug.print("[ROUTER TRANSFORM] Generated handler-lite dispatch ({} routes):\n{s}\n", .{ lite_route_pis.items.len, lite_body_str.? });
+    }
+
     if (!is_pointer_top) {
         // NESTED CASE: replace the invocation node with inline_code, not the whole flow.
         // Strip the //@koru:inline_stmt prefix — inline_code nodes emit raw code.
@@ -1514,6 +1720,44 @@ fn headerPrefixKeepAlive(status: u16) ?[]const u8 {
     if (maybe_new_program) |new_program_val| {
         const result = allocator.create(ast_mod.Program) catch unreachable;
         result.* = new_program_val;
+
+        if (lite_body_str) |lite_body| {
+            // Synthesize `orisha:handler-lite` — an impl flow carrying the
+            // pre-Request dispatch. resolve_abstract_impl ran at parse time,
+            // before this impl existed, so orisha's default impl is still
+            // named handler-lite; renameLiteDefault applies the same rename
+            // resolve would have done had the override been in the source.
+            const lite_segments = allocator.alloc([]const u8, 1) catch unreachable;
+            lite_segments[0] = "handler-lite";
+            const lite_path = ast_mod.DottedPath{
+                .module_qualifier = "orisha",
+                .segments = lite_segments,
+            };
+            const lite_args = allocator.alloc(ast_mod.Arg, 2) catch unreachable;
+            lite_args[0] = .{ .name = "method", .value = "method" };
+            lite_args[1] = .{ .name = "path", .value = "path" };
+            const lite_invocation = ast_mod.Invocation{
+                .path = lite_path,
+                .args = lite_args,
+                .source_module = program.main_module_name,
+            };
+            const empty_lite_conts = allocator.alloc(ast_mod.Continuation, 0) catch unreachable;
+            const lite_flow = ast_mod.Flow{
+                .body = ast_mod.rootSite(lite_invocation, empty_lite_conts, flow.location),
+                .impl_of = lite_path,
+                .is_impl = true,
+                .inline_body = lite_body,
+                .module = program.main_module_name,
+            };
+
+            const grown = allocator.alloc(ast_mod.Item, result.items.len + 1) catch unreachable;
+            @memcpy(grown[0..result.items.len], result.items);
+            grown[result.items.len] = .{ .flow = lite_flow };
+            result.items = grown;
+
+            renameLiteDefault(result.items, allocator);
+        }
+
         return .{ .whole_program = result };
     } else {
         std.debug.print("ERROR: Router transform failed - flow not found in program\n", .{});
