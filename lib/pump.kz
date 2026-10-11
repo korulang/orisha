@@ -1916,6 +1916,15 @@ fn disableNagle(fd: posix.fd_t) void {
     posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, std.mem.asBytes(&enable)) catch {};
 }
 
+// Let the kernel poll the device queue for this socket's packets for 50µs
+// before sleeping — the same window zix arms by default. Busy-poll trades a
+// bounded slice of CPU for skipping the wakeup path on a connection that is
+// about to deliver, which is every connection under pipelined load.
+fn armBusyPoll(fd: posix.fd_t) void {
+    const usecs: i32 = 50;
+    posix.setsockopt(fd, posix.SOL.SOCKET, std.os.linux.SO.BUSY_POLL, std.mem.asBytes(&usecs)) catch {};
+}
+
 // Write the whole thing, and treat "would block" as what it is — a request to
 // come back later, not a failure and not a license to sleep.
 //
@@ -3541,6 +3550,7 @@ fn workerCount() usize {
                 if (cqe.res >= 0) {
                     const cfd: $mod.posix.fd_t = @intCast(cqe.res);
                     $mod.disableNagle(cfd);
+                    $mod.armBusyPoll(cfd);
                     // Multishot recv terminates at the first delivery on a
                     // blocking fd — the kernel cannot wait for more without
                     // a poll arm. O_NONBLOCK keeps it armed across CQEs.
