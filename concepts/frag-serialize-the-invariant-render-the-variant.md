@@ -338,6 +338,25 @@ gcannon at `-c800 -t8` is itself ~30% parse-bound and the VM swings ±30%
 run to run; interleaved A/Bs read as noise. The mechanism claims are
 profile-verified; the rps claim awaits a server-bound instrument.
 
+## What the instrument said — twelfth pass (2026-10-11, the epoch check)
+
+One level deeper, the same move: callee-graph perf put `time` +
+`clock_gettime` at **5.1% of server CPU** inside `writevAllConn` — every
+response read the wall clock to learn whether the Date second had flipped.
+The header itself can only express seconds, so a per-request read measures
+nothing it can print. `stampHttpDateLine` now runs once per event-loop
+wakeup (all five pumps: kqueue ×2, epoll, io_uring, unikraft poll) and
+`httpDateLine` returns the stamped line in one branch; a thread with no
+tick keeps the refresh-per-call behavior it always had, so an unstamped
+pump degrades to the old path rather than serving a frozen Date. The
+29-byte `formatHttpDate` slice came along — it was a second per-response
+`time()` on the composed-head path, now `line[6..35]`.
+
+Post-change perf: `clock_gettime` absent, `writevAllConn` inclusive
+27.3% → 14.8%. Interleaved A/B at `-c800 -t8 -p16` leaned +7% (3/4 pairs)
+inside the VM noise — mechanism verified by profile, throughput still
+unpriced.
+
 ## Open questions
 
 - Whether the fused front-end buys throughput on a server-bound regime —

@@ -2019,6 +2019,7 @@ fn workerCount() usize {
         while (true) {
             const n = $mod.libc.kevent(kq, &no_changes, 0, &events, $mod.MAX_EVENTS, null);
             if (n <= 0) continue;
+            @import("root").koru_orisha.stampHttpDateLine();
 
             for (events[0..@intCast(n)]) |event| {
                 const fd: $mod.posix.fd_t = @intCast(event.ident);
@@ -2664,6 +2665,7 @@ fn workerCount() usize {
             while (true) {
                 const n = $mod.libc.kevent(kq, &no_changes, 0, &events, $mod.MAX_EVENTS, null);
                 if (n <= 0) continue;
+                @import("root").koru_orisha.stampHttpDateLine();
 
                 for (events[0..@intCast(n)]) |event| {
                     const fd: $mod.posix.fd_t = @intCast(event.ident);
@@ -2923,6 +2925,7 @@ fn workerCount() usize {
                 const n_rc = linux.epoll_wait(epfd, &events, $mod.MAX_EVENTS, -1);
                 const n: i32 = @bitCast(@as(u32, @truncate(n_rc)));
                 if (n <= 0) continue;
+                @import("root").koru_orisha.stampHttpDateLine();
 
                 for (events[0..@intCast(n)]) |event| {
                     const fd: $mod.posix.fd_t = event.data.fd;
@@ -3955,6 +3958,7 @@ fn workerCount() usize {
             while (true) {
                 _ = w.ring.submit_and_wait(1) catch continue;
                 const got = w.ring.copy_cqes(&cqes, 0) catch continue;
+                @import("root").koru_orisha.stampHttpDateLine();
                 var i: usize = 0;
                 for (cqes[0..got]) |cqe| {
                     i += 1;
@@ -4017,6 +4021,7 @@ fn workerCount() usize {
         }
 
         const ready = $mod.poll(&pfds, @intCast(n), $mod.POLL_TICK_MS);
+        @import("root").koru_orisha.stampHttpDateLine();
 
         // Time passes whether or not anything arrived, so the sweep runs here.
         const now = $mod.wallClockSeconds(null);

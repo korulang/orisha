@@ -844,30 +844,29 @@ fn statusText(status: u16) []const u8 {
 }
 
 /// `Sun, 09 Aug 2026 14:41:49 GMT` — exactly 29 bytes, the only shape RFC 9110
-/// allows in a Date header. Calendar arithmetic rather than strftime, so this
-/// needs one C symbol (`time`) instead of three, and works on a target whose
-/// libc has a clock and nothing else.
-threadlocal var cached_date_epoch: i64 = -1;
-threadlocal var cached_date_buf: [29]u8 = undefined;
-
+/// allows in a Date header. Sliced out of the stamped line, so the value is
+/// as fresh as the last pump tick rather than a clock read of its own.
 fn formatHttpDate(buf: *[29]u8) void {
-    const epoch = time(null);
-    if (epoch != cached_date_epoch) {
-        cached_date_epoch = epoch;
-        formatHttpDateFromEpoch(&cached_date_buf, epoch);
-    }
-    @memcpy(buf[0..29], cached_date_buf[0..29]);
+    @memcpy(buf[0..29], httpDateLine()[6..35]);
 }
 
 /// The whole `Date: …\r\n` line (37 bytes) as a stable threadlocal slice, for
 /// callers that splice the header into a baked message — the send path's
-/// `date_hole` iovec points straight at this. Same second-granularity cache
-/// as `formatHttpDate`: Date varies on the clock, not per request, so the
-/// hot path does a lookup, never a format.
+/// `date_hole` iovec points straight at this. The line is refreshed by a
+/// stamp, not by the call: a pump's drive loop stamps once per wakeup, and
+/// Date's second granularity means the stamped line is always fresh enough —
+/// a per-response clock read measures nothing the header can express.
 threadlocal var cached_line_epoch: i64 = -1;
 threadlocal var date_line_buf: [37]u8 = undefined;
+// True once this thread has stamped — the flag, not a timestamp, is what
+// tells httpDateLine whether anyone is ticking. A thread with no pump loop
+// never flips it and gets the refresh-on-every-call behavior it always had.
+threadlocal var date_stamped = false;
 
-pub fn httpDateLine() *const [37]u8 {
+/// Read the wall clock and reformat the Date line if the second flipped.
+/// Call once per event-loop wakeup; the batch of responses that wakeup
+/// produces all borrow the one stamped line.
+pub fn stampHttpDateLine() void {
     const epoch = time(null);
     if (epoch != cached_line_epoch) {
         cached_line_epoch = epoch;
@@ -877,6 +876,13 @@ pub fn httpDateLine() *const [37]u8 {
         @memcpy(date_line_buf[6..35], &v);
         @memcpy(date_line_buf[35..37], "\r\n");
     }
+    date_stamped = true;
+}
+
+pub fn httpDateLine() *const [37]u8 {
+    // Outside a pump there is no tick, so a call on an unstamped thread
+    // refreshes here — same behavior it always had. Once stamped, one branch.
+    if (!date_stamped) stampHttpDateLine();
     return &date_line_buf;
 }
 
