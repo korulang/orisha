@@ -340,6 +340,38 @@ fn pumpAlloc() std.mem.Allocator {
     return pump_arena_state.?.allocator();
 }
 
+// A refcounted output frame. One allocation carries the byte buffer (websocket
+// header + payload); its reference count tracks how many connection queues
+// still point at it. A broadcast allocates the frame ONCE and every
+// subscriber's `pending` holds a reference, so N subscribers share one payload
+// buffer instead of each copying it. The buffer frees when the last reference
+// drops — `fetchSub(.acq_rel)` returning 1 on that final decref makes the free
+// happen-after every other thread's reads of `bytes`.
+pub const Frame = struct {
+    refcount: std.atomic.Value(u32),
+    bytes: []u8,
+};
+
+// One entry in a connection's pending FIFO: a shared frame plus how many of
+// its bytes the owner has already written. Single-conn sends (http replies,
+// ws-send-fd) use a private frame of refcount 1 — same queue, no special case.
+const PendingSeg = struct {
+    frame: *Frame,
+    off: usize,
+};
+
+// One node in a hosted ws conn's lock-free broadcast queue. Producers (the
+// drainer threads) append via the atomic tail; the owner pops. Strict FIFO —
+// each conn has exactly ONE broadcast producer (its fd-shard's drainer), so
+// the broadcast path is SPSC; the owner's own replies and `ws-send-fd` still
+// ride the mutex-guarded `pending` (control frames, not the fan-out). `off`
+// is the owner's write cursor across partial writes.
+const WsSeg = struct {
+    frame: *Frame,
+    off: usize,
+    next: std.atomic.Value(?*WsSeg) = .init(null),
+};
+
 pub const ConnState = struct {
     fd: c_int = -1,
     ssl: ?*ServerTls = null,
@@ -370,12 +402,28 @@ pub const ConnState = struct {
     // This replaces a single accept thread doing every SSL_accept
     // synchronously, which serialised all handshake crypto onto one core.
     tls_hs: bool = false,
-    // Output accepted from the app faster than the socket took it. Writes
-    // append at the tail, a readiness-for-write event drains from
-    // pending_off, and the queue keeps ordering without a copy: nothing a
-    // later answer writes can overtake it.
-    pending: std.ArrayListUnmanaged(u8) = .{},
-    pending_off: usize = 0,
+    // Owner-side output queue (http replies, the 101 head, `ws-send-fd` and
+    // the owner's ws control frames): a bounded FIFO of refcounted frames.
+    // Writes append a frame at the tail, a readiness-for-write event drains
+    // from the head segment's `off`, and the queue keeps ordering without a
+    // payload copy. ws-mode appends serialize through ws_mu (`ws-send-fd`
+    // writes from a pusher); http-mode is owner-thread-only. Broadcasts take
+    // the lock-free `wsq` beside it, never this queue.
+    pending: std.ArrayListUnmanaged(PendingSeg) = .{},
+    pending_head: usize = 0,
+    // Lock-free broadcast handoff (hosted pumps only; io-uring conns use
+    // `pending`). A Vyukov MPSC queue: `wsq_head` is the owner's sentinel
+    // (the last drained node, or the embedded stub), `wsq_tail` is where
+    // producers append, and `wsq_bytes` is the atomic MAX_PENDING counter
+    // (the ArrayList `pending` has no atomic counterpart — it is owner-only).
+    wsq_stub: WsSeg = .{ .frame = undefined, .off = 0 },
+    wsq_head: ?*WsSeg = null,
+    wsq_tail: std.atomic.Value(?*WsSeg) = .init(null),
+    wsq_bytes: std.atomic.Value(usize) = .init(0),
+    // Active cross-thread producers (wsPublishFrame) hold a reference;
+    // releaseConn frees the ConnState only when the last one drops. Starts at
+    // 1 — the conn_states table's own reference.
+    refs: std.atomic.Value(u32) = .init(1),
     // Dispatch-loop batching: while the request loop runs, replies append to
     // pending WITHOUT flushing — a pipelined batch of N answers leaves in one
     // write instead of N writev syscalls. Owner-thread only; ws-mode appends
@@ -390,6 +438,17 @@ pub const ConnState = struct {
     // pusher thread that stalls must re-arm write readiness on the owner,
     // or the queued tail would wait for traffic that may never come.
     owner_q: i32 = -1,
+    // Write-readiness handshake (atomic; shared by every producer and the
+    // owner). INVARIANT: true iff a WRITE arm is live on the owner's reactor
+    // — on kqueue that is a separate EVFILT.WRITE ONESHOT filter, so a READ
+    // event cannot consume it; on epoll ONESHOT is per-fd, so every epoll
+    // re-arm re-derives this from the mask it installs (OUT bit present). A
+    // producer appends and then does `swap(true)` — arming ONLY when it saw
+    // false; the owner stores false the moment its WRITE-event drain empties
+    // the queues, then re-checks for a push that landed in the gap. The
+    // swap-after-push / store-then-recheck pairing closes the lost-wakeup
+    // race without ws_mu (see flushPendingOwned + kqueueRearm).
+    armed: std.atomic.Value(bool) = .init(false),
     // io_uring pump bookkeeping — inert on every other pump. owner_ring marks
     // a ring-owned conn (opaque so this struct still compiles off-Linux).
     // send_buf is staged output a send SQE can own outright: while a send is
@@ -482,6 +541,8 @@ fn connState(fd: posix.fd_t) ?*ConnState {
     if (conn_states[idx]) |s| return s;
     const s = pumpAlloc().create(ConnState) catch return null;
     s.* = .{ .fd = fd };
+    s.wsq_head = &s.wsq_stub;
+    s.wsq_tail.store(&s.wsq_stub, .monotonic);
     conn_states[idx] = s;
     return s;
 }
@@ -509,11 +570,14 @@ fn releaseConn(fd: posix.fd_t) void {
     conn_states_mu.unlock();
     if (s) |st| {
         // A `ws-send-fd` already mid-write holds ws_mu; teardown waits for it
-        // rather than freeing the ConnState out from under its frame.
+        // before closing the fd — the fd must not close under a concurrent
+        // inline write, and a reissued descriptor must not inherit the old
+        // conn's kqueue filters. The memory free waits for every in-flight
+        // wsPublishFrame producer via connUnref.
         st.ws_mu.lock();
-        closeConn(st);
+        closeConnWire(st);
         st.ws_mu.unlock();
-        pumpAlloc().destroy(st);
+        connUnref(st);
     } else {
         posix.close(@intCast(fd));
     }
@@ -559,7 +623,8 @@ fn closeConnWire(st: *ConnState) void {
 
 fn closeConnMem(st: *ConnState) void {
     st.ws_msg.deinit(pumpAlloc());
-    st.pending.deinit(pumpAlloc());
+    pendingClear(st);
+    wsqClear(st);
     st.tls_plain.deinit(pumpAlloc());
     st.recv_hold.deinit(pumpAlloc());
     if (st.send_buf.len > 0) {
@@ -578,6 +643,19 @@ fn closeConn(st: *ConnState) void {
     closeConnMem(st);
 }
 
+// Drop one ConnState reference; the last drop frees the queues and the struct.
+// The conn_states table holds the initial reference (1); every in-flight
+// wsPublishFrame producer holds one more. releaseConn drops the table's ref
+// after detaching; a producer that was still pushing drops its own after the
+// push. The final fetchSub runs closeConnMem on whichever thread wins, after
+// every producer has finished touching the queues.
+fn connUnref(st: *ConnState) void {
+    if (st.refs.fetchSub(1, .acq_rel) == 1) {
+        closeConnMem(st);
+        pumpAlloc().destroy(st);
+    }
+}
+
 fn shutdownConn(st: *ConnState) void {
     if (st.fd >= 0) {
         posix.shutdown(@intCast(st.fd), .both) catch {};
@@ -592,36 +670,300 @@ const MAX_PENDING: usize = 1 << 20;
 
 const Flush = enum { drained, stalled, dead };
 
+// Total unwritten bytes across the queued frames — the memory this conn holds
+// against MAX_PENDING, and the predicate every drain/arm/close site asks.
 fn pendingLen(st: *ConnState) usize {
-    return st.pending.items.len - st.pending_off;
+    var total: usize = 0;
+    for (st.pending.items[st.pending_head..]) |seg| {
+        total += seg.frame.bytes.len - seg.off;
+    }
+    return total;
 }
+
+// A private frame owning `len` bytes (refcount 1) — the single-conn append
+// path. The caller's slices are copied in, so they stay valid to free.
+fn frameAlloc(len: usize) ?*Frame {
+    const f = pumpAlloc().create(Frame) catch return null;
+    const bytes = pumpAlloc().alloc(u8, len) catch {
+        pumpAlloc().destroy(f);
+        return null;
+    };
+    f.* = .{ .refcount = std.atomic.Value(u32).init(1), .bytes = bytes };
+    return f;
+}
+
+fn frameIncref(f: *Frame) void {
+    _ = f.refcount.fetchAdd(1, .monotonic);
+}
+
+fn frameDecref(f: *Frame) void {
+    if (f.refcount.fetchSub(1, .acq_rel) == 1) {
+        pumpAlloc().free(f.bytes);
+        pumpAlloc().destroy(f);
+    }
+}
+
+// Drop every queued reference (teardown). Runs under ws_mu for ws conns, so
+// it cannot race the owner's drain on the same queue.
+fn pendingClear(st: *ConnState) void {
+    for (st.pending.items[st.pending_head..]) |seg| frameDecref(seg.frame);
+    st.pending.deinit(pumpAlloc());
+    st.pending_head = 0;
+}
+
+// Total broadcast bytes queued (atomic; readable from any thread). Producers
+// add a full frame on push and roll back when over MAX_PENDING; the owner
+// subtracts exactly what it writes.
+fn wsqBytes(st: *ConnState) usize {
+    return st.wsq_bytes.load(.monotonic);
+}
+
+// MPSC append (Vyukov). Producers only; the owner never pushes here.
+fn wsqPush(st: *ConnState, node: *WsSeg) void {
+    node.next.store(null, .release);
+    const prev = st.wsq_tail.swap(node, .acq_rel);
+    if (prev) |p| p.next.store(node, .release);
+}
+
+// MPSC pop — owner only. Advances the sentinel past the oldest node; the
+// retired sentinel is freed here (one pop late), and the returned node becomes
+// the new sentinel — its node is freed on the NEXT pop, so the caller must not
+// free the returned node itself, only its frame (on drain completion).
+fn wsqPop(st: *ConnState) ?*WsSeg {
+    const head = st.wsq_head orelse return null;
+    const next = head.next.load(.acquire) orelse return null;
+    st.wsq_head = next;
+    if (head != &st.wsq_stub) pumpAlloc().destroy(head);
+    return next;
+}
+
+// Drop every remaining broadcast node (teardown). Runs when the refcount hits
+// zero — no producer can be appending.
+fn wsqClear(st: *ConnState) void {
+    const head = st.wsq_head orelse return;
+    var node: ?*WsSeg = head.next.load(.acquire);
+    while (node) |n| {
+        const next = n.next.load(.acquire);
+        frameDecref(n.frame);
+        pumpAlloc().destroy(n);
+        node = next;
+    }
+    if (head != &st.wsq_stub) pumpAlloc().destroy(head);
+    st.wsq_head = null;
+    st.wsq_tail.store(null, .monotonic);
+}
+
+// Push one refcounted broadcast frame into the lock-free queue, respecting
+// MAX_PENDING via the atomic byte counter. The caller already holds a
+// reference it will drop; this appends one more (the queue's), which the
+// owner's drain drops on completion.
+fn wsqPushFrame(st: *ConnState, f: *Frame) bool {
+    const add = f.bytes.len;
+    if (st.wsq_bytes.fetchAdd(add, .monotonic) + add > MAX_PENDING) {
+        _ = st.wsq_bytes.fetchSub(add, .monotonic);
+        return false;
+    }
+    const node = pumpAlloc().create(WsSeg) catch {
+        _ = st.wsq_bytes.fetchSub(add, .monotonic);
+        return false;
+    };
+    node.* = .{ .frame = f, .off = 0 };
+    frameIncref(f);
+    wsqPush(st, node);
+    return true;
+}
+
+// Append one contiguous byte slice as a private frame (single-conn path).
+fn pendingAppendBytes(st: *ConnState, bytes: []const u8) bool {
+    if (bytes.len == 0) return true;
+    const f = frameAlloc(bytes.len) orelse return false;
+    @memcpy(f.bytes, bytes);
+    st.pending.append(pumpAlloc(), .{ .frame = f, .off = 0 }) catch {
+        frameDecref(f);
+        return false;
+    };
+    return true;
+}
+
+// Append several slices as ONE private frame — the ordered tail of a stalled
+// write becomes a single buffer, exactly as the flat queue used to.
+fn pendingAppendSegs(st: *ConnState, segments: []const []const u8) bool {
+    var need: usize = 0;
+    for (segments) |seg| need += seg.len;
+    if (need == 0) return true;
+    const f = frameAlloc(need) orelse return false;
+    var o: usize = 0;
+    for (segments) |seg| {
+        @memcpy(f.bytes[o..][0..seg.len], seg);
+        o += seg.len;
+    }
+    st.pending.append(pumpAlloc(), .{ .frame = f, .off = 0 }) catch {
+        frameDecref(f);
+        return false;
+    };
+    return true;
+}
+
+// How many pending segments one writev gathers. Bounded so the stack iovec
+// stays small; the outer loop re-gathers when the queue is deeper.
+const IOVEC_BATCH = 64;
 
 // Push what the socket will take right now, no waiting. `stalled` leaves the
 // tail in pending for a write-ready event; the rearm that follows every
-// dispatch is what asks the reactor for it.
+// dispatch is what asks the reactor for it. Partial writes advance the head
+// segment's `off` only — no memmove, no compaction — and a completed segment
+// drops its reference. Cleartext gathers the queued frames into ONE writev so
+// a backlog of broadcasts leaves in one syscall instead of one per frame; TLS
+// has no scatter write, so it drains one segment per sslWriteSome.
 fn flushPending(st: *ConnState) Flush {
-    while (st.pending_off < st.pending.items.len) {
+    while (st.pending_head < st.pending.items.len) {
         if (HAS_OPENSSL) {
             if (st.ssl) |tls| {
+                const seg = &st.pending.items[st.pending_head];
                 const mod = @import("root").koru_koru.koru_openssl;
                 const s = tls.ssl orelse return .dead;
-                switch (mod.sslWriteSome(s, st.pending.items[st.pending_off..])) {
-                    .wrote => |n| st.pending_off += n,
+                switch (mod.sslWriteSome(s, seg.frame.bytes[seg.off..])) {
+                    .wrote => |w| {
+                        seg.off += w;
+                        if (seg.off == seg.frame.bytes.len) {
+                            frameDecref(seg.frame);
+                            st.pending_head += 1;
+                        }
+                    },
                     .want_read, .want_write => return .stalled,
                     .failed => return .dead,
                 }
                 continue;
             }
         }
-        const n = posix.write(@intCast(st.fd), st.pending.items[st.pending_off..]) catch |err| switch (err) {
+        var iov: [IOVEC_BATCH]posix.iovec_const = undefined;
+        var count: usize = 0;
+        for (st.pending.items[st.pending_head..]) |seg| {
+            if (count == iov.len) break;
+            iov[count] = .{ .base = seg.frame.bytes.ptr + seg.off, .len = seg.frame.bytes.len - seg.off };
+            count += 1;
+        }
+        const n = posix.writev(@intCast(st.fd), iov[0..count]) catch |err| switch (err) {
             error.WouldBlock => return .stalled,
             else => return .dead,
         };
         if (n == 0) return .dead;
-        st.pending_off += n;
+        var rem = n;
+        while (rem > 0 and st.pending_head < st.pending.items.len) {
+            const seg = &st.pending.items[st.pending_head];
+            const left = seg.frame.bytes.len - seg.off;
+            if (rem >= left) {
+                rem -= left;
+                seg.off = seg.frame.bytes.len;
+                frameDecref(seg.frame);
+                st.pending_head += 1;
+            } else {
+                seg.off += rem;
+                rem = 0;
+            }
+        }
     }
     st.pending.clearRetainingCapacity();
-    st.pending_off = 0;
+    st.pending_head = 0;
+    return .drained;
+}
+
+// The owner's broadcast drain — lock-free, single consumer. Mirrors
+// flushPending's segment walk over the linked wsq instead of the ArrayList:
+// partial writes advance the head node's `off` only, a completed node drops
+// its frame reference (its heap node is freed one pop later by the advance),
+// and cleartext gathers up to IOVEC_BATCH nodes into one writev. TLS has no
+// scatter write, so it drains one node per sslWriteSome.
+fn flushWsq(st: *ConnState) Flush {
+    while (true) {
+        const head = st.wsq_head orelse break;
+        const cur = head.next.load(.acquire) orelse break;
+        if (HAS_OPENSSL) {
+            if (st.ssl) |tls| {
+                const mod = @import("root").koru_koru.koru_openssl;
+                const s = tls.ssl orelse return .dead;
+                switch (mod.sslWriteSome(s, cur.frame.bytes[cur.off..])) {
+                    .wrote => |w| {
+                        cur.off += w;
+                        _ = st.wsq_bytes.fetchSub(w, .monotonic);
+                        if (cur.off == cur.frame.bytes.len) {
+                            frameDecref(cur.frame);
+                            st.wsq_head = cur;
+                            if (head != &st.wsq_stub) pumpAlloc().destroy(head);
+                        }
+                    },
+                    .want_read, .want_write => return .stalled,
+                    .failed => return .dead,
+                }
+                continue;
+            }
+        }
+        var iov: [IOVEC_BATCH]posix.iovec_const = undefined;
+        var count: usize = 0;
+        var node: ?*WsSeg = cur;
+        while (node) |n| {
+            if (count == iov.len) break;
+            iov[count] = .{ .base = n.frame.bytes.ptr + n.off, .len = n.frame.bytes.len - n.off };
+            count += 1;
+            node = n.next.load(.acquire);
+        }
+        const n = posix.writev(@intCast(st.fd), iov[0..count]) catch |err| switch (err) {
+            error.WouldBlock => return .stalled,
+            else => return .dead,
+        };
+        if (n == 0) return .dead;
+        _ = st.wsq_bytes.fetchSub(n, .monotonic);
+        var rem = n;
+        while (rem > 0) {
+            const h2 = st.wsq_head orelse break;
+            const c2 = h2.next.load(.acquire) orelse break;
+            const left = c2.frame.bytes.len - c2.off;
+            if (rem >= left) {
+                rem -= left;
+                c2.off = c2.frame.bytes.len;
+                frameDecref(c2.frame);
+                st.wsq_head = c2;
+                if (h2 != &st.wsq_stub) pumpAlloc().destroy(h2);
+            } else {
+                c2.off += rem;
+                rem = 0;
+            }
+        }
+    }
+    return .drained;
+}
+
+// The owner reactor's drain. `flushPending` is caller-locked: ws-mode callers
+// hold ws_mu (the owner's inline paths and `ws-send-fd` both write `pending`
+// under it). The broadcast queue (`wsq`) is lock-free and drained separately.
+// `armed` is cleared atomically on every outcome; the final `hasWork` re-check
+// reports `.stalled` when a producer pushed after our last pop, so the caller
+// re-arms instead of dropping back to read — the store-then-recheck pairing
+// against the producer's swap-after-push closes the lost-wakeup race.
+fn hasWork(st: *ConnState) bool {
+    return pendingLen(st) > 0 or wsqBytes(st) > 0;
+}
+
+fn flushPendingOwned(st: *ConnState) Flush {
+    // ws_mu serializes the owner's socket writes (pending + wsq drains) against
+    // `ws-send-fd`'s inline write from a pusher thread. The broadcast PRODUCER
+    // (wsPublishFrame) never takes ws_mu — it pushes wsq lock-free — so this is
+    // not the hot path. http-mode pending is owner-thread-only (no ws_mu).
+    if (st.mode == .ws) st.ws_mu.lock();
+    defer if (st.mode == .ws) st.ws_mu.unlock();
+    const pr = flushPending(st);
+    if (pr == .dead) {
+        st.armed.store(false, .release);
+        return .dead;
+    }
+    if (pr == .stalled) {
+        st.armed.store(false, .release);
+        return .stalled;
+    }
+    const wr = flushWsq(st);
+    st.armed.store(false, .release);
+    if (wr == .dead) return .dead;
+    if (hasWork(st)) return .stalled;
     return .drained;
 }
 
@@ -664,17 +1006,13 @@ fn appendPending(st: *ConnState, segments: []const []const u8) bool {
             return true;
         }
         if (pendingLen(st) + need > MAX_PENDING) return false;
-        st.pending.ensureUnusedCapacity(pumpAlloc(), need) catch return false;
-        for (segments) |seg| st.pending.appendSliceAssumeCapacity(seg);
-        return true;
+        return pendingAppendSegs(st, segments);
     }
-    if (st.pending.items.len + need > MAX_PENDING) {
+    if (pendingLen(st) + need > MAX_PENDING) {
         if (flushPending(st) == .dead) return false;
-        if (st.pending.items.len + need > MAX_PENDING) return false;
+        if (pendingLen(st) + need > MAX_PENDING) return false;
     }
-    st.pending.ensureUnusedCapacity(pumpAlloc(), need) catch return false;
-    for (segments) |seg| st.pending.appendSliceAssumeCapacity(seg);
-    return true;
+    return pendingAppendSegs(st, segments);
 }
 
 fn planRecord(st: *ConnState, entry: SendPlanEntry) void {
@@ -760,19 +1098,13 @@ fn appendPair(st: *ConnState, a: []const u8, b: []const u8) bool {
             return true;
         }
         if (pendingLen(st) + need > MAX_PENDING) return false;
-        st.pending.ensureUnusedCapacity(pumpAlloc(), need) catch return false;
-        st.pending.appendSliceAssumeCapacity(a);
-        st.pending.appendSliceAssumeCapacity(b);
-        return true;
+        return pendingAppendSegs(st, &.{ a, b });
     }
-    if (st.pending.items.len + need > MAX_PENDING) {
+    if (pendingLen(st) + need > MAX_PENDING) {
         if (flushPending(st) == .dead) return false;
-        if (st.pending.items.len + need > MAX_PENDING) return false;
+        if (pendingLen(st) + need > MAX_PENDING) return false;
     }
-    st.pending.ensureUnusedCapacity(pumpAlloc(), need) catch return false;
-    st.pending.appendSliceAssumeCapacity(a);
-    st.pending.appendSliceAssumeCapacity(b);
-    return true;
+    return pendingAppendSegs(st, &.{ a, b });
 }
 
 // Segments that arrive after the plan filled are newer than the window's —
@@ -784,9 +1116,7 @@ fn spillToPending(st: *ConnState, segments: []const []const u8) bool {
     var need: usize = 0;
     for (segments) |seg| need += seg.len;
     if (pendingLen(st) + need > MAX_PENDING) return false;
-    st.pending.ensureUnusedCapacity(pumpAlloc(), need) catch return false;
-    for (segments) |seg| st.pending.appendSliceAssumeCapacity(seg);
-    return true;
+    return pendingAppendSegs(st, segments);
 }
 
 // One planned segment: immortal memory records a raw-pointer entry, anything
@@ -887,9 +1217,8 @@ pub fn ringRenderTarget(fd: posix.fd_t, min_len: usize) ?[]u8 {
 fn queueAndFlush(st: *ConnState, segments: []const []const u8) bool {
     var need: usize = 0;
     for (segments) |seg| need += seg.len;
-    if (st.pending.items.len + need > MAX_PENDING) return false;
-    st.pending.ensureUnusedCapacity(pumpAlloc(), need) catch return false;
-    for (segments) |seg| st.pending.appendSliceAssumeCapacity(seg);
+    if (pendingLen(st) + need > MAX_PENDING) return false;
+    if (!pendingAppendSegs(st, segments)) return false;
     return flushPending(st) != .dead;
 }
 
@@ -908,13 +1237,20 @@ fn tlsWriteOrQueue(st: *ConnState, segments: []const []const u8) bool {
                 .wrote => |n| off += n,
                 .want_read, .want_write => {
                     // Queue the unwritten remainder — this segment's tail plus
-                    // every segment after it.
+                    // every segment after it — as one private frame.
                     var need: usize = seg.len - off;
                     for (segments[si + 1 ..]) |rest| need += rest.len;
-                    if (st.pending.items.len + need > MAX_PENDING) return false;
-                    st.pending.ensureUnusedCapacity(pumpAlloc(), need) catch return false;
-                    st.pending.appendSliceAssumeCapacity(seg[off..]);
-                    for (segments[si + 1 ..]) |rest| st.pending.appendSliceAssumeCapacity(rest);
+                    if (pendingLen(st) + need > MAX_PENDING) return false;
+                    var tail: [8][]const u8 = undefined;
+                    var tn: usize = 0;
+                    tail[tn] = seg[off..];
+                    tn += 1;
+                    for (segments[si + 1 ..]) |rest| {
+                        if (tn >= tail.len) return false;
+                        tail[tn] = rest;
+                        tn += 1;
+                    }
+                    if (!pendingAppendSegs(st, tail[0..tn])) return false;
                     return true;
                 },
                 .failed => return false,
@@ -1332,8 +1668,9 @@ fn wsSendFrameRaw(st: *ConnState, opcode: u8, payload: []const u8) bool {
         std.mem.writeInt(u64, hdr[2..10], payload.len, .big);
         hlen = 10;
     }
-    if (!writeAllConn(st, hdr[0..hlen])) return false;
-    return payload.len == 0 or writeAllConn(st, payload);
+    // head+payload in ONE writev — two write()s per frame doubled the
+    // syscall count on broadcast paths (fan-out pays it per subscriber).
+    return writevAllConn(st, hdr[0..hlen], payload, 0, false, false);
 }
 
 fn wsSendFrame(st: *ConnState, opcode: u8, payload: []const u8) bool {
@@ -1364,25 +1701,197 @@ fn wsSendFd(fd: usize, opcode: u8, payload: []const u8) bool {
     defer st.ws_mu.unlock();
     const ok = wsSendFrameRaw(st, opcode, payload);
     // A stalled queue written from off the owning worker needs the owner's
-    // write-readiness armed explicitly — nobody else will.
-    if (pendingLen(st) > 0) armOwnerWrite(st);
+    // write-readiness armed explicitly — nobody else will. Skip when a WRITE
+    // arm is already live (a broadcast armed it); the live arm will drain.
+    if (pendingLen(st) > 0 and !st.armed.swap(true, .acq_rel)) {
+        armOwnerWrite(st);
+    }
     return ok;
+}
+
+// Queue-mode variant of the bulk send: append the frame to each conn's
+// pending and arm the owner's write readiness — NO inline socket write.
+// Broadcast fan-outs stop paying a writev per subscriber on the request
+// path; the owning reactor flushes whole queued bursts in one write(),
+// which is where the real syscall batching happens. Ordering: appends
+// serialize per conn under ws_mu, and the caller serializes broadcasts,
+// so every subscriber sees publishes in the same order.
+// Build one refcounted frame holding the websocket header + payload — the
+// buffer every subscriber of a broadcast shares. The header is baked in front,
+// so the frame is one contiguous buffer the owner drains straight to the wire.
+fn wsFrameAlloc(opcode: u8, payload: []const u8) ?*Frame {
+    const hlen: usize = if (payload.len < 126) 2 else if (payload.len <= 0xFFFF) 4 else 10;
+    const f = frameAlloc(hlen + payload.len) orelse return null;
+    const bytes = f.bytes;
+    bytes[0] = 0x80 | opcode;
+    if (payload.len < 126) {
+        bytes[1] = @intCast(payload.len);
+    } else if (payload.len <= 0xFFFF) {
+        bytes[1] = 126;
+        std.mem.writeInt(u16, bytes[2..4], @intCast(payload.len), .big);
+    } else {
+        bytes[1] = 127;
+        std.mem.writeInt(u64, bytes[2..10], payload.len, .big);
+    }
+    @memcpy(bytes[hlen..], payload);
+    return f;
+}
+
+// One owner-arm entry: the reactor the conn is armed on plus the socket to
+// arm — captured under conn_states_mu during the resolution pass (releaseConn
+// detaches under the same lock, so the fd is this conn's at capture and cannot
+// be closed mid-capture). The batched kevent below uses the captured values,
+// so it never touches a ConnState after the lock drops.
+const Arm = struct { q: i32, fd: posix.fd_t };
+
+// The broadcast fan-out — lock-free on the producer side. One wsFrameAlloc
+// builds header+payload; each subscriber gets one `incref` and one push into
+// its lock-free `wsq` (no payload copy, no ws_mu). The producer never writes
+// the socket: the owning reactor's EVFILT.WRITE drain (flushPendingOwned →
+// flushWsq) does the writes, so the producer pays O(#owners) batched kevents
+// and zero socket writes.
+//
+// Ordering: each conn has exactly ONE broadcast producer (its fd-shard's
+// drainer — fd % K == shard_id), so the per-conn queue is SPSC and preserves
+// the drainer's FIFO. Lifetime: each held st is incref'd under conn_states_mu
+// and unref'd after the push+arm, so releaseConn cannot free it mid-push; the
+// arm info (owner_q, fd) is captured under the same lock, so a reissued
+// descriptor cannot be armed on the wrong owner.
+//
+// A queue at the cap (wsq_bytes + frame > MAX_PENDING) skips the conn — the
+// owner's drain brings the backlog down for the next publish, exactly as the
+// ws_mu version did. io-uring conns (owner_ring != null) keep the old
+// ws_mu-guarded `pending` push: the ring's advance() coalesces `pending`, not
+// `wsq`, and it owns the socket.
+fn wsPublishFrame(fds: []const usize, opcode: u8, payload: []const u8) usize {
+    const f = wsFrameAlloc(opcode, payload) orelse return 0;
+    defer frameDecref(f);
+    const Held = struct { st: *ConnState, q: i32, fd: posix.fd_t, ring: bool };
+    var held: [64]Held = undefined;
+    var n: usize = 0;
+    conn_states_mu.lock();
+    for (fds[0..@min(fds.len, held.len)]) |fd| {
+        if (fd >= MAX_TRACKED_FD) continue;
+        const st = conn_states[fd] orelse continue;
+        if (st.mode != .ws) continue;
+        if (st.owner_ring != null) {
+            st.ws_mu.lock();
+            held[n] = .{ .st = st, .q = st.owner_q, .fd = st.fd, .ring = true };
+        } else {
+            _ = st.refs.fetchAdd(1, .monotonic);
+            held[n] = .{ .st = st, .q = st.owner_q, .fd = st.fd, .ring = false };
+        }
+        n += 1;
+    }
+    conn_states_mu.unlock();
+    var arms: [64]Arm = undefined;
+    var arms_n: usize = 0;
+    var queued: usize = 0;
+    for (held[0..n]) |h| {
+        if (h.ring) {
+            const st = h.st;
+            var pushed = false;
+            if (pendingLen(st) + f.bytes.len <= MAX_PENDING) {
+                frameIncref(f);
+                st.pending.append(pumpAlloc(), .{ .frame = f, .off = 0 }) catch {
+                    frameDecref(f);
+                    st.ws_mu.unlock();
+                    continue;
+                };
+                pushed = true;
+            }
+            if (pushed) {
+                queued += 1;
+                if (!st.armed.swap(true, .acq_rel)) {
+                    if (st.owner_q >= 0 and arms_n < arms.len) {
+                        arms[arms_n] = .{ .q = st.owner_q, .fd = st.fd };
+                        arms_n += 1;
+                    }
+                }
+            }
+            st.ws_mu.unlock();
+            continue;
+        }
+        if (!wsqPushFrame(h.st, f)) {
+            connUnref(h.st);
+            continue;
+        }
+        queued += 1;
+        if (!h.st.armed.swap(true, .acq_rel)) {
+            if (h.q >= 0 and arms_n < arms.len) {
+                arms[arms_n] = .{ .q = h.q, .fd = h.fd };
+                arms_n += 1;
+            }
+        }
+        connUnref(h.st);
+    }
+    armOwnerWritesBatched(arms[0..arms_n]);
+    return queued;
+}
+
+// Arm write-readiness on the owner reactors for every conn that just got a
+// queued frame. kqueue takes a changelist, so all conns owned by one worker
+// arm in a single kevent(); epoll_ctl is one fd per call, so Linux keeps the
+// per-conn arm. One syscall per distinct owner.
+fn armOwnerWritesBatched(arms: []const Arm) void {
+    if (@import("builtin").os.tag == .linux) {
+        for (arms) |a| armOwnerWriteFd(a.q, a.fd);
+        return;
+    }
+    var owners: [64]i32 = undefined;
+    var o_n: usize = 0;
+    for (arms) |a| {
+        var found = false;
+        for (owners[0..o_n]) |o| {
+            if (o == a.q) {
+                found = true;
+                break;
+            }
+        }
+        if (!found and o_n < owners.len) {
+            owners[o_n] = a.q;
+            o_n += 1;
+        }
+    }
+    var changes: [64]libc.Kevent = undefined;
+    var none: [0]libc.Kevent = undefined;
+    for (owners[0..o_n]) |q| {
+        var cnt: usize = 0;
+        for (arms) |a| {
+            if (a.q != q) continue;
+            if (cnt == changes.len) break;
+            changes[cnt] = .{
+                .ident = @intCast(a.fd),
+                .filter = libc.EVFILT.WRITE,
+                .flags = libc.EV.ADD | libc.EV.ONESHOT,
+                .fflags = 0,
+                .data = 0,
+                .udata = undefined,
+            };
+            cnt += 1;
+        }
+        if (cnt > 0) _ = libc.kevent(q, &changes, @intCast(cnt), &none, 0, null);
+    }
 }
 
 // Re-arm write readiness on whatever reactor owns this conn — used by
 // cross-thread sends (ws-send-fd) that left bytes in the queue. The pump is
 // comptime-selected per binary, so `owner_q` means exactly one thing.
 fn armOwnerWrite(st: *ConnState) void {
-    if (st.owner_q < 0) return;
+    armOwnerWriteFd(st.owner_q, st.fd);
+}
+
+fn armOwnerWriteFd(q: i32, fd: posix.fd_t) void {
+    if (q < 0) return;
     if (@import("builtin").os.tag == .linux) {
         const linux = std.os.linux;
         var wait = linux.epoll_event{
             .events = linux.EPOLL.IN | linux.EPOLL.OUT | linux.EPOLL.ONESHOT,
-            .data = .{ .fd = st.fd },
+            .data = .{ .fd = fd },
         };
-        _ = linux.epoll_ctl(st.owner_q, linux.EPOLL.CTL_MOD, st.fd, &wait);
+        _ = linux.epoll_ctl(q, linux.EPOLL.CTL_MOD, fd, &wait);
     } else {
-        armKqueueFilter(st.owner_q, st.fd, libc.EVFILT.WRITE);
+        armKqueueFilter(q, fd, libc.EVFILT.WRITE);
     }
 }
 
@@ -1589,7 +2098,7 @@ fn kqueueRearm(kq: i32, fd: posix.fd_t, st: *ConnState) void {
         };
         count += 1;
     }
-    if (st.pending_off < st.pending.items.len) {
+    if (hasWork(st) and !st.armed.swap(true, .acq_rel)) {
         changes[count] = .{
             .ident = @intCast(fd),
             .filter = libc.EVFILT.WRITE,
@@ -1721,9 +2230,7 @@ fn ringStageWire(st: *ConnState, ct: []const u8) bool {
         return true;
     }
     if (pendingLen(st) + ct.len > MAX_PENDING) return false;
-    st.pending.ensureUnusedCapacity(pumpAlloc(), ct.len) catch return false;
-    st.pending.appendSliceAssumeCapacity(ct);
-    return true;
+    return pendingAppendBytes(st, ct);
 }
 
 // Count app-epoch records in a span of drained ciphertext. The parser runs
@@ -1910,8 +2417,20 @@ fn epollMask(st: *ConnState) u32 {
     const linux = std.os.linux;
     var mask: u32 = linux.EPOLL.ONESHOT;
     if (!st.close_when_drained) mask |= linux.EPOLL.IN;
-    if (st.pending_off < st.pending.items.len) mask |= linux.EPOLL.OUT;
+    if (hasWork(st)) mask |= linux.EPOLL.OUT;
     return mask;
+}
+
+// epoll re-arm that keeps `armed` honest. ONESHOT is per-fd here — not per
+// filter like kqueue — so ANY event (READ or WRITE) consumes the whole
+// registration, and the mask we install next is the entire truth. `armed`
+// tracks whether that mask carries OUT; the producer's skip then means "OUT
+// is already registered", which is exactly when skipping the arm is safe.
+fn epollMod(epfd: i32, fd: posix.fd_t, events: u32, st: *ConnState) void {
+    const linux = std.os.linux;
+    var wait = linux.epoll_event{ .events = events, .data = .{ .fd = fd } };
+    _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &wait);
+    st.armed.store((events & linux.EPOLL.OUT) != 0, .release);
 }
 
 // ---------------------------------------------------------------------------
@@ -2104,6 +2623,8 @@ fn workerCount() usize {
             @import("root").koru_orisha.stampHttpDateLine();
 
             for (events[0..@intCast(n)]) |event| {
+                if (event.filter == $mod.libc.EVFILT.WRITE) continue;
+
                 const fd: $mod.posix.fd_t = @intCast(event.ident);
 
                 const st = $mod.connState(fd) orelse {
@@ -2131,33 +2652,6 @@ fn workerCount() usize {
                             continue;
                         },
                     }
-                }
-
-                // Write-ready drains whatever earlier sends could not
-                // deliver; a conn closing behind a queue ends here.
-                if (event.filter == $mod.libc.EVFILT.WRITE) {
-                    switch ($mod.flushPending(st)) {
-                        .dead => {
-                            if ($mod.connIsWs(fd)) closed(@intCast(fd));
-                            $mod.releaseConn(fd);
-                            continue;
-                        },
-                        .stalled => {
-                            $mod.kqueueRearm(kq, fd, st);
-                            continue;
-                        },
-                        .drained => {
-                            if (st.close_when_drained) {
-                                if ($mod.connIsWs(fd)) closed(@intCast(fd));
-                                $mod.releaseConn(fd);
-                                continue;
-                            }
-                        },
-                    }
-                    // A WRITE event carries no request bytes — back to read
-                    // readiness for the next one.
-                    $mod.armKqueueFilter(kq, fd, $mod.libc.EVFILT.READ);
-                    continue;
                 }
 
                 switch ($mod.fill_event.handler(.{ .st = st })) {
@@ -2204,7 +2698,7 @@ fn workerCount() usize {
                     st.len = $mod.retainTail(&st.buf, st.len, ws_consumed);
                     if (ws_alive and st.len == st.buf.len) ws_alive = false;
                     if (!ws_alive) {
-                        if ($mod.pendingLen(st) > 0) {
+                        if ($mod.hasWork(st)) {
                             st.close_when_drained = true;
                             $mod.armKqueueFilter(kq, fd, $mod.libc.EVFILT.WRITE);
                             continue;
@@ -2245,7 +2739,7 @@ fn workerCount() usize {
                 if (alive and st.len == st.buf.len) alive = false;
 
                 if (!alive) {
-                    if ($mod.pendingLen(st) > 0) {
+                    if ($mod.hasWork(st)) {
                         st.close_when_drained = true;
                         $mod.armKqueueFilter(kq, fd, $mod.libc.EVFILT.WRITE);
                         continue;
@@ -2257,6 +2751,65 @@ fn workerCount() usize {
 
                 // ONESHOT disarms on delivery — re-arm for the next request.
                 $mod.kqueueRearm(kq, fd, st);
+            }
+            // Pass 2 — write drains, deferred so no drain fronts a request in
+            // the same batch. Same dead/stalled/drained semantics, the
+            // close_when_drained / releaseConn / kqueueRearm calls verbatim.
+            for (events[0..@intCast(n)]) |event| {
+                if (event.filter != $mod.libc.EVFILT.WRITE) continue;
+
+                const fd: $mod.posix.fd_t = @intCast(event.ident);
+
+                const st = $mod.connState(fd) orelse {
+                    $mod.posix.close(fd);
+                    continue;
+                };
+
+                // The conn registers before its handshake finishes — step it
+                // once per readiness event so a thousand concurrent
+                // handshakes spread over every worker, and trust no bytes as
+                // requests until the cipher is up.
+                if (st.tls_hs) {
+                    switch ($mod.driveTlsHandshake(st)) {
+                        .ready => st.tls_hs = false,
+                        .want_read => {
+                            $mod.armKqueueFilter(kq, fd, $mod.libc.EVFILT.READ);
+                            continue;
+                        },
+                        .want_write => {
+                            $mod.armKqueueFilter(kq, fd, $mod.libc.EVFILT.WRITE);
+                            continue;
+                        },
+                        .failed => {
+                            $mod.releaseConn(fd);
+                            continue;
+                        },
+                    }
+                }
+
+                // Write-ready drains whatever earlier sends could not
+                // deliver; a conn closing behind a queue ends here.
+                switch ($mod.flushPendingOwned(st)) {
+                    .dead => {
+                        if ($mod.connIsWs(fd)) closed(@intCast(fd));
+                        $mod.releaseConn(fd);
+                        continue;
+                    },
+                    .stalled => {
+                        $mod.kqueueRearm(kq, fd, st);
+                        continue;
+                    },
+                    .drained => {
+                        if (st.close_when_drained) {
+                            if ($mod.connIsWs(fd)) closed(@intCast(fd));
+                            $mod.releaseConn(fd);
+                            continue;
+                        }
+                    },
+                }
+                // A WRITE event carries no request bytes — back to read
+                // readiness for the next one.
+                $mod.armKqueueFilter(kq, fd, $mod.libc.EVFILT.READ);
             }
         }
     }
@@ -2750,6 +3303,8 @@ fn workerCount() usize {
                 @import("root").koru_orisha.stampHttpDateLine();
 
                 for (events[0..@intCast(n)]) |event| {
+                    if (event.filter == $mod.libc.EVFILT.WRITE) continue;
+
                     const fd: $mod.posix.fd_t = @intCast(event.ident);
 
                     const st = $mod.connState(fd) orelse {
@@ -2777,33 +3332,6 @@ fn workerCount() usize {
                                 continue;
                             },
                         }
-                    }
-
-                    // Write-ready drains whatever earlier sends could not
-                    // deliver; a conn closing behind a queue ends here.
-                    if (event.filter == $mod.libc.EVFILT.WRITE) {
-                        switch ($mod.flushPending(st)) {
-                            .dead => {
-                                if ($mod.connIsWs(fd)) closed(@intCast(fd));
-                                $mod.releaseConn(fd);
-                                continue;
-                            },
-                            .stalled => {
-                                $mod.kqueueRearm(kq, fd, st);
-                                continue;
-                            },
-                            .drained => {
-                                if (st.close_when_drained) {
-                                    if ($mod.connIsWs(fd)) closed(@intCast(fd));
-                                    $mod.releaseConn(fd);
-                                    continue;
-                                }
-                            },
-                        }
-                        // A WRITE event carries no request bytes — back to
-                        // read readiness for the next one.
-                        $mod.armKqueueFilter(kq, fd, $mod.libc.EVFILT.READ);
-                        continue;
                     }
 
                     switch ($mod.fill_event.handler(.{ .st = st })) {
@@ -2849,7 +3377,7 @@ fn workerCount() usize {
                         st.len = $mod.retainTail(&st.buf, st.len, ws_consumed);
                         if (ws_alive and st.len == st.buf.len) ws_alive = false;
                         if (!ws_alive) {
-                            if ($mod.pendingLen(st) > 0) {
+                            if ($mod.hasWork(st)) {
                                 st.close_when_drained = true;
                                 $mod.armKqueueFilter(kq, fd, $mod.libc.EVFILT.WRITE);
                                 continue;
@@ -2892,7 +3420,7 @@ fn workerCount() usize {
                     if (!alive) {
                         // A closing answer still in the queue drains first —
                         // releasing here would cut it mid-flight.
-                        if ($mod.pendingLen(st) > 0) {
+                        if ($mod.hasWork(st)) {
                             st.close_when_drained = true;
                             $mod.armKqueueFilter(kq, fd, $mod.libc.EVFILT.WRITE);
                             continue;
@@ -2904,6 +3432,65 @@ fn workerCount() usize {
 
                     // ONESHOT disarms on delivery — re-arm for the next request.
                     $mod.kqueueRearm(kq, fd, st);
+                }
+                // Pass 2 — write drains, deferred so no drain fronts a request in
+                // the same batch. Same dead/stalled/drained semantics, the
+                // close_when_drained / releaseConn / kqueueRearm calls verbatim.
+                for (events[0..@intCast(n)]) |event| {
+                    if (event.filter != $mod.libc.EVFILT.WRITE) continue;
+
+                    const fd: $mod.posix.fd_t = @intCast(event.ident);
+
+                    const st = $mod.connState(fd) orelse {
+                        $mod.posix.close(fd);
+                        continue;
+                    };
+
+                    // The conn registers before its handshake finishes —
+                    // step it once per readiness event so a thousand
+                    // concurrent handshakes spread over every worker, and
+                    // trust no bytes as requests until the cipher is up.
+                    if (st.tls_hs) {
+                        switch ($mod.driveTlsHandshake(st)) {
+                            .ready => st.tls_hs = false,
+                            .want_read => {
+                                $mod.armKqueueFilter(kq, fd, $mod.libc.EVFILT.READ);
+                                continue;
+                            },
+                            .want_write => {
+                                $mod.armKqueueFilter(kq, fd, $mod.libc.EVFILT.WRITE);
+                                continue;
+                            },
+                            .failed => {
+                                $mod.releaseConn(fd);
+                                continue;
+                            },
+                        }
+                    }
+
+                    // Write-ready drains whatever earlier sends could not
+                    // deliver; a conn closing behind a queue ends here.
+                    switch ($mod.flushPendingOwned(st)) {
+                        .dead => {
+                            if ($mod.connIsWs(fd)) closed(@intCast(fd));
+                            $mod.releaseConn(fd);
+                            continue;
+                        },
+                        .stalled => {
+                            $mod.kqueueRearm(kq, fd, st);
+                            continue;
+                        },
+                        .drained => {
+                            if (st.close_when_drained) {
+                                if ($mod.connIsWs(fd)) closed(@intCast(fd));
+                                $mod.releaseConn(fd);
+                                continue;
+                            }
+                        },
+                    }
+                    // A WRITE event carries no request bytes — back to
+                    // read readiness for the next one.
+                    $mod.armKqueueFilter(kq, fd, $mod.libc.EVFILT.READ);
                 }
             }
         }
@@ -3048,18 +3635,14 @@ fn workerCount() usize {
                     // Write-ready drains whatever earlier sends could not
                     // deliver; a conn closing behind a queue ends here.
                     if (event.events & linux.EPOLL.OUT != 0) {
-                        switch ($mod.flushPending(st)) {
+                        switch ($mod.flushPendingOwned(st)) {
                             .dead => {
                                 if ($mod.connIsWs(fd)) closed(@intCast(fd));
                                 $mod.releaseConn(fd);
                                 continue;
                             },
                             .stalled => {
-                                var wait = linux.epoll_event{
-                                    .events = $mod.epollMask(st),
-                                    .data = .{ .fd = fd },
-                                };
-                                _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &wait);
+                                $mod.epollMod(epfd, fd, $mod.epollMask(st), st);
                                 continue;
                             },
                             .drained => {
@@ -3071,11 +3654,7 @@ fn workerCount() usize {
                             },
                         }
                         if (event.events & linux.EPOLL.IN == 0) {
-                            var wait = linux.epoll_event{
-                                .events = linux.EPOLL.IN | linux.EPOLL.ONESHOT,
-                                .data = .{ .fd = fd },
-                            };
-                            _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &wait);
+                            $mod.epollMod(epfd, fd, linux.EPOLL.IN | linux.EPOLL.ONESHOT, st);
                             continue;
                         }
                     }
@@ -3083,11 +3662,7 @@ fn workerCount() usize {
                     switch ($mod.fill_event.handler(.{ .st = st })) {
                         .more => {},
                         .idle => {
-                            var wait = linux.epoll_event{
-                                .events = $mod.epollMask(st),
-                                .data = .{ .fd = fd },
-                            };
-                            _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &wait);
+                            $mod.epollMod(epfd, fd, $mod.epollMask(st), st);
                             continue;
                         },
                         .gone => {
@@ -3125,24 +3700,16 @@ fn workerCount() usize {
                         st.len = $mod.retainTail(&st.buf, st.len, ws_consumed);
                         if (ws_alive and st.len == st.buf.len) ws_alive = false;
                         if (!ws_alive) {
-                            if ($mod.pendingLen(st) > 0) {
+                            if ($mod.hasWork(st)) {
                                 st.close_when_drained = true;
-                                var wait = linux.epoll_event{
-                                    .events = linux.EPOLL.OUT | linux.EPOLL.ONESHOT,
-                                    .data = .{ .fd = fd },
-                                };
-                                _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &wait);
+                                $mod.epollMod(epfd, fd, linux.EPOLL.OUT | linux.EPOLL.ONESHOT, st);
                                 continue;
                             }
                             if ($mod.connIsWs(fd)) closed(@intCast(fd));
                             $mod.releaseConn(fd);
                             continue;
                         }
-                        var ws_rearm = linux.epoll_event{
-                            .events = $mod.epollMask(st),
-                            .data = .{ .fd = fd },
-                        };
-                        _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &ws_rearm);
+                        $mod.epollMod(epfd, fd, $mod.epollMask(st), st);
                         continue;
                     }
 
@@ -3172,13 +3739,9 @@ fn workerCount() usize {
                     if (!alive) {
                         // A closing answer still in the queue drains first —
                         // releasing here would cut it mid-flight.
-                        if ($mod.pendingLen(st) > 0) {
+                        if ($mod.hasWork(st)) {
                             st.close_when_drained = true;
-                            var wait = linux.epoll_event{
-                                .events = linux.EPOLL.OUT | linux.EPOLL.ONESHOT,
-                                .data = .{ .fd = fd },
-                            };
-                            _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &wait);
+                            $mod.epollMod(epfd, fd, linux.EPOLL.OUT | linux.EPOLL.ONESHOT, st);
                             continue;
                         }
                         if ($mod.connIsWs(fd)) closed(@intCast(fd));
@@ -3186,11 +3749,7 @@ fn workerCount() usize {
                         continue;
                     }
 
-                    var rearm = linux.epoll_event{
-                        .events = $mod.epollMask(st),
-                        .data = .{ .fd = fd },
-                    };
-                    _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &rearm);
+                    $mod.epollMod(epfd, fd, $mod.epollMask(st), st);
                 }
             }
         }
@@ -3467,13 +4026,16 @@ fn workerCount() usize {
         // last response before the fd drops.
         fn advance(w: *@This(), st: *$mod.ConnState) void {
             if (st.send_len != 0 or st.send_iov_n != 0) return;
-            const pn = $mod.pendingLen(st);
             // Bytes spilled while a plan window was open are NEWER than the
-            // plan's — this window drains only up to the spill mark.
-            const drain_n = if (st.spill_mark == std.math.maxInt(usize))
-                pn
+            // plan's — this window drains only up to the spill mark, which is
+            // a segment index: spillToPending marks items.len before appending.
+            const drain_end = if (st.spill_mark == std.math.maxInt(usize))
+                st.pending.items.len
             else
-                @min(pn, st.spill_mark -| st.pending_off);
+                @min(st.pending.items.len, st.spill_mark);
+            var drain_n: usize = 0;
+            for (st.pending.items[st.pending_head..drain_end]) |seg|
+                drain_n += seg.frame.bytes.len - seg.off;
             var drained_lo: usize = 0;
             var drained_n: usize = 0;
             if (drain_n > 0) {
@@ -3490,13 +4052,20 @@ fn workerCount() usize {
                     if (st.send_buf.len > 0) $mod.pumpAlloc().free(st.send_buf);
                     st.send_buf = nb;
                 }
-                @memcpy(st.send_buf[st.send_staged..][0..drain_n], st.pending.items[st.pending_off..][0..drain_n]);
-                st.send_staged += drain_n;
-                drained_n = drain_n;
-                st.pending_off += drain_n;
-                if (st.pending_off == st.pending.items.len) {
+                var o = st.send_staged;
+                while (st.pending_head < drain_end) {
+                    const seg = &st.pending.items[st.pending_head];
+                    const n = seg.frame.bytes.len - seg.off;
+                    @memcpy(st.send_buf[o..][0..n], seg.frame.bytes[seg.off..]);
+                    o += n;
+                    $mod.frameDecref(seg.frame);
+                    st.pending_head += 1;
+                }
+                st.send_staged = o;
+                drained_n = o - drained_lo;
+                if (st.pending_head == st.pending.items.len) {
                     st.pending.clearRetainingCapacity();
-                    st.pending_off = 0;
+                    st.pending_head = 0;
                 }
                 if (st.mode == .ws) st.ws_mu.unlock();
             }
@@ -4284,7 +4853,7 @@ fn workerCount() usize {
         // conn's ring_dead flag (set by the reader on !keep_alive) routes it
         // through advance's drain-then-teardown path instead.
         if (st.owner_ring == null) {
-            if (pendingLen(st) > 0) {
+            if (hasWork(st)) {
                 st.close_when_drained = true;
             } else {
                 $mod.shutdownConn(st);
