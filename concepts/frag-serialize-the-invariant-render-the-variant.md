@@ -357,6 +357,22 @@ Post-change perf: `clock_gettime` absent, `writevAllConn` inclusive
 inside the VM noise — mechanism verified by profile, throughput still
 unpriced.
 
+## What the instrument said — thirteenth pass (2026-10-11, the wire itself)
+
+Both servers' pipelined profiles are kernel-bound with nearly identical
+shapes (~30% `io_send`/`tcp_sendmsg`), so the remaining zix gap was never
+parse speed — it was **bytes moved per response**: ~121B versus ~63B on
+the same 2-byte body. The audit of our head found the pure-noise line:
+`Connection: keep-alive`, 25 bytes of redundancy under HTTP/1.1 (keep-alive
+is the default; `wants_close` already keys only on `Connection: close`,
+and no HTTP/1.0 path exists to change semantics). It is gone from all six
+emission sites — baked literal, composed heads, hydration builder,
+`response_304`. Wire per pipeline response: ~121B → ~102B; the residual
+delta to zix's ~63B is our Date line and self-id headers — features we
+keep deliberately, not oversights. Interleaved A/B `-c800 -t8 -p16`:
+3/4 pairs to the slim build, mean ~11.33M vs ~11.20M — inside the VM's
+noise band; priced verdict belongs to the server-bound droplet.
+
 ## Open questions
 
 - Whether the fused front-end buys throughput on a server-bound regime —
@@ -368,15 +384,14 @@ unpriced.
 - Whether the terminal-CQE pass can do less (deferred-free batching) —
   the second half of the named surgery, not yet attempted; churn profiles
   need a stronger generator than a 4-vCPU box to price it.
-- Whether kTLS actually engaged on the race hardware — the mem-BIO
-  fallback is silent; `st.ktls_on` instrumentation is a one-line check.
-  Local engagement is *impossible*, measured: the LinuxKit kernel
-  (6.12.76, arm64) has `CONFIG_TLS` unset — `ss -ti` shows no `ulp` on
-  live :8081 conns and `TCP_ULP` attach returns EOPNOTSUPP, so the
-  `.unsupported` arm parks every conn on mem-BIO by design. The install
-  path itself was code-verified (quiet-point conditions, RX-before-TX
-  ordering, cipher map) and was live-verified on an earlier droplet;
-  race-run engagement is unrecoverable — the box is gone. Fold a
-  `ktls_on` counter into the next droplet run.
+- kTLS engagement — ANSWERED on the 2026-10-11 droplet race box
+  (kernel 6.12.111+deb13-amd64): `ss -ti` showed `tcp-ulp-tls version:
+  1.3 cipher: aes-gcm-256` on **513/513** established conns under `wrk
+  -c512`, so engagement is universal under load, not a quiet-point fluke.
+  That reframes the json-tls deficit: kTLS is live on every conn, and
+  zix's binary carries no `TCP_ULP` strings at all — their edge is
+  userspace-TLS path efficiency, not offload. Local engagement remains
+  impossible (LinuxKit arm64, `CONFIG_TLS` unset); the droplet is the
+  only honest instrument for TLS questions.
 - The heap `Stringify` fallback for overflow counts is unchanged and
   unmeasured for speed — it only needs to be correct.

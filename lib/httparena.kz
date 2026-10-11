@@ -58,7 +58,7 @@ const Impl = struct {
 
         // Pre-rendered: answer() emits the whole message verbatim (no Date/X-Powered-By tax).
         const pipeline_response =
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok";
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok";
 
         // The response item as the wire carries it — the dataset fields plus
         // the per-request total. Serialized by Stringify on every request:
@@ -113,7 +113,7 @@ const Impl = struct {
         fn finishHttp(content_type: []const u8, body: []const u8) ?[]const u8 {
             return std.fmt.bufPrint(
                 &http_out,
-                "HTTP/1.1 200 OK\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n{s}",
+                "HTTP/1.1 200 OK\r\nContent-Type: {s}\r\nContent-Length: {d}\r\n\r\n{s}",
                 .{ content_type, body.len, body },
             ) catch null;
         }
@@ -150,7 +150,7 @@ const Impl = struct {
             // so the baked-head contract finds the field already present and
             // emits the message as one unspliced segment.
             const hs = std.fmt.bufPrint(&hdr,
-                "HTTP/1.1 200 OK\r\n{s}Content-Type: application/json\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n",
+                "HTTP/1.1 200 OK\r\n{s}Content-Type: application/json\r\nContent-Length: {d}\r\n\r\n",
                 .{ orisha.httpDateLine(), body_len }) catch return null;
             if (hs.len > HEAD_RESERVE) return null;
             const start = HEAD_RESERVE - hs.len;
