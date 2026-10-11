@@ -3654,7 +3654,7 @@ fn workerCount() usize {
                             },
                         }
                         if (event.events & linux.EPOLL.IN == 0) {
-                            $mod.epollMod(epfd, fd, linux.EPOLL.IN | linux.EPOLL.ONESHOT, st);
+                            $mod.epollMod(epfd, fd, $mod.epollMask(st), st);
                             continue;
                         }
                     }
