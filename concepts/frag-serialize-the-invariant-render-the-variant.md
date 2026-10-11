@@ -315,6 +315,29 @@ overflow case — `Accept-Encoding` at header position 71 found through
 `unstored_tail`, gzip negotiated, body decompresses to valid JSON.
 HttpArena `validate.sh orisha`: **37/37 pass** on the fused code.
 
+## What the instrument said — eleventh pass (2026-10-11, the send-path bake)
+
+The same belief reached the head. A baked-route response is `head[0..hole] +
+Date + head[hole..] + body` — four segments through `appendPending` per
+request, three copies into `send_buf`. Everything but the Date is rodata,
+and the Date flips once a second: the wire message is *invariant per
+(second, head-ptr)*. `bakedSegment` composes it once into a 4-slot
+direct-mapped threadlocal bake keyed on `head.ptr` + the line's bytes —
+per request the send pays one ~150B copy instead of three splices. A
+non-static or oversized head composes uncached or keeps the three-segment
+path. The mechanism also removed the last lazy lookups: `scanRequest`
+captures `accept-encoding`/`if-none-match` offsets inline (first-char +
+length dispatch before `eqlIgnoreCase`), `answer` consumes them, and
+`headValueParsed` leaves the hot profile entirely; `indexOfLineEnd` went
+`inline` and `requestPathKey`'s second `?` scan folded into
+`pathKeyDecoded`.
+
+Profile under `-p16 -c800` (LinuxKit): `headValueParsed` gone (was ~6%),
+`requestPathKey` 6.9% → `pathKeyDecoded` 2.2%. Throughput: **unpriced** —
+gcannon at `-c800 -t8` is itself ~30% parse-bound and the VM swings ±30%
+run to run; interleaved A/Bs read as noise. The mechanism claims are
+profile-verified; the rps claim awaits a server-bound instrument.
+
 ## Open questions
 
 - Whether the fused front-end buys throughput on a server-bound regime —

@@ -67,6 +67,14 @@ pub const Head = struct {
     // Byte offset of the first header line not stored in `pairs` (the cap
     // overflow point), or 0 when every header fit.
     unstored_tail: u32 = 0,
+    // Captured during the scan for the two headers `answer` always wants —
+    // one line walk yields them instead of two post-walks over `pairs`, and
+    // they are found even past the pairs cap. `off != 0` means present (a
+    // value can never sit at byte 0 of the head); `len` may be 0.
+    accept_encoding_off: u32 = 0,
+    accept_encoding_len: u32 = 0,
+    if_none_match_off: u32 = 0,
+    if_none_match_len: u32 = 0,
     chunked: bool = false,
     wants_close: bool = false,
 };
@@ -128,7 +136,7 @@ const URING_ACCEPT_TLS: u64 = URING_ACCEPT - 1;
 // A "\r\n" terminator as one vectorized scalar scan + a check, not a
 // substring search — line-end is the hot path (once per header line per
 // request) and indexOfPos costs ~4x indexOfScalarPos for a 2-byte needle.
-fn indexOfLineEnd(buf: []const u8, pos: usize) ?usize {
+inline fn indexOfLineEnd(buf: []const u8, pos: usize) ?usize {
     var i = pos;
     while (std.mem.indexOfScalarPos(u8, buf, i, '\n')) |nl| {
         if (nl > pos and buf[nl - 1] == '\r') return nl - 1;
@@ -165,6 +173,8 @@ fn scanRequest(buf: []const u8, head: *Head) ?usize {
     var cl_seen = false;
     var te_seen = false;
     var conn_seen = false;
+    var ae_seen = false;
+    var inm_seen = false;
     var pos: usize = 0;
     var first_line = true;
     while (true) {
@@ -210,32 +220,58 @@ fn scanRequest(buf: []const u8, head: *Head) ?usize {
         } else if (head.unstored_tail == 0) {
             head.unstored_tail = @intCast(line_start);
         }
-        if (std.ascii.eqlIgnoreCase(name, "content-length")) {
-            // First wins — the helpers this replaces returned the first match.
-            // Malformed stays null so transfer-encoding is still consulted,
-            // exactly as the old contentLength() fall-through did.
-            if (!cl_seen) {
-                cl_seen = true;
-                content_len = std.fmt.parseInt(usize, value, 10) catch null;
-            }
-        } else if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
-            if (!te_seen) {
-                te_seen = true;
-                var lower_buf: [128]u8 = undefined;
-                if (value.len <= lower_buf.len) {
-                    const lower = std.ascii.lowerString(&lower_buf, value);
-                    if (std.mem.indexOf(u8, lower, "chunked") != null) head.chunked = true;
+        // Name dispatch on (first char, len) — the five names we resolve
+        // here all differ on both. Every other header pays two compares
+        // instead of up to five case-insensitive walks.
+        const c0 = if (name.len == 0) 0 else std.ascii.toLower(name[0]);
+        switch (c0) {
+            'c' => {
+                if (name.len == 14 and std.ascii.eqlIgnoreCase(name, "content-length")) {
+                    // First wins — the helpers this replaces returned the
+                    // first match. Malformed stays null so transfer-encoding
+                    // is still consulted, as the old fall-through did.
+                    if (!cl_seen) {
+                        cl_seen = true;
+                        content_len = std.fmt.parseInt(usize, value, 10) catch null;
+                    }
+                } else if (name.len == 10 and std.ascii.eqlIgnoreCase(name, "connection")) {
+                    if (!conn_seen) {
+                        conn_seen = true;
+                        var lower_buf: [64]u8 = undefined;
+                        if (value.len <= lower_buf.len) {
+                            const lower = std.ascii.lowerString(&lower_buf, value);
+                            if (std.mem.indexOf(u8, lower, "close") != null) head.wants_close = true;
+                        }
+                    }
                 }
-            }
-        } else if (std.ascii.eqlIgnoreCase(name, "connection")) {
-            if (!conn_seen) {
-                conn_seen = true;
-                var lower_buf: [64]u8 = undefined;
-                if (value.len <= lower_buf.len) {
-                    const lower = std.ascii.lowerString(&lower_buf, value);
-                    if (std.mem.indexOf(u8, lower, "close") != null) head.wants_close = true;
+            },
+            't' => {
+                if (name.len == 17 and std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
+                    if (!te_seen) {
+                        te_seen = true;
+                        var lower_buf: [128]u8 = undefined;
+                        if (value.len <= lower_buf.len) {
+                            const lower = std.ascii.lowerString(&lower_buf, value);
+                            if (std.mem.indexOf(u8, lower, "chunked") != null) head.chunked = true;
+                        }
+                    }
                 }
-            }
+            },
+            'a' => {
+                if (name.len == 15 and !ae_seen and std.ascii.eqlIgnoreCase(name, "accept-encoding")) {
+                    ae_seen = true;
+                    head.accept_encoding_off = @intCast(@intFromPtr(value.ptr) - @intFromPtr(buf.ptr));
+                    head.accept_encoding_len = @intCast(value.len);
+                }
+            },
+            'i' => {
+                if (name.len == 13 and !inm_seen and std.ascii.eqlIgnoreCase(name, "if-none-match")) {
+                    inm_seen = true;
+                    head.if_none_match_off = @intCast(@intFromPtr(value.ptr) - @intFromPtr(buf.ptr));
+                    head.if_none_match_len = @intCast(value.len);
+                }
+            },
+            else => {},
         }
     }
 }
@@ -863,6 +899,47 @@ fn writeAllOrQueue(st: *ConnState, data: []const u8) bool {
 // Below a page the copy is the fast path; above it, skipping it is.
 const SCATTER_MIN: usize = 4096;
 
+// A holed static head needs its Date line spliced per send — composing
+// head+line+tail into one flat segment once per (head, second) turns three
+// appendPending copies into one per response. The bake lives per worker in
+// threadlocal: rodata head pointers are stable keys and the line flips once
+// a second, so a tiny direct-mapped cache amortizes the splice over the
+// million sends a hot route does in that second. Bigger-than-cap heads take
+// the ordinary three-segment path.
+const BAKE_SLOTS = 4;
+const BAKE_CAP = 4096;
+threadlocal var bake_ptr: [BAKE_SLOTS]?[*]const u8 = .{ null, null, null, null };
+threadlocal var bake_line: [BAKE_SLOTS][37]u8 = undefined;
+threadlocal var bake_len: [BAKE_SLOTS]usize = .{ 0, 0, 0, 0 };
+threadlocal var bake_buf: [BAKE_SLOTS][BAKE_CAP]u8 = undefined;
+
+fn bakedSegment(head: []const u8, date_hole: usize, date_line: []const u8, head_static: bool) ?[]const u8 {
+    const need = head.len + date_line.len;
+    if (need > BAKE_CAP or date_line.len > 37) return null;
+    if (head_static) {
+        const slot: usize = (@intFromPtr(head.ptr) >> 6) & (BAKE_SLOTS - 1);
+        if (bake_ptr[slot] == head.ptr and bake_len[slot] == need and
+            std.mem.eql(u8, bake_line[slot][0..date_line.len], date_line))
+        {
+            return bake_buf[slot][0..need];
+        }
+        @memcpy(bake_buf[slot][0..date_hole], head[0..date_hole]);
+        @memcpy(bake_buf[slot][date_hole..][0..date_line.len], date_line);
+        @memcpy(bake_buf[slot][date_hole + date_line.len ..][0 .. head.len - date_hole], head[date_hole..]);
+        @memcpy(bake_line[slot][0..date_line.len], date_line);
+        bake_ptr[slot] = head.ptr;
+        bake_len[slot] = need;
+        return bake_buf[slot][0..need];
+    }
+    // Not cacheable — compose into slot 0 anyway so the send still leaves as
+    // one flat copy; the next request may overwrite it, which is safe: the
+    // caller hands it to appendPending, which copies synchronously.
+    @memcpy(bake_buf[0][0..date_hole], head[0..date_hole]);
+    @memcpy(bake_buf[0][date_hole..][0..date_line.len], date_line);
+    @memcpy(bake_buf[0][date_hole + date_line.len ..][0 .. head.len - date_hole], head[date_hole..]);
+    return bake_buf[0][0..need];
+}
+
 fn writevAllConn(st: *ConnState, head: []const u8, body: []const u8, date_hole: usize, head_static: bool, body_static: bool) bool {
     const date_line: []const u8 = if (date_hole != 0) @import("root").koru_orisha.httpDateLine() else "";
     // Handler-vouched immortal memory rides the send SQE as iovecs instead
@@ -872,6 +949,12 @@ fn writevAllConn(st: *ConnState, head: []const u8, body: []const u8, date_hole: 
     const big = (head_static and head.len >= SCATTER_MIN) or (body_static and body.len >= SCATTER_MIN);
     if (big and st.owner_ring != null and st.mode != .ws and st.send_len == 0 and st.send_iov_n == 0 and st.ssl == null)
         return stageIovStatic(st, head, body, date_hole, date_line, head_static, body_static);
+    // A holed head composes once per second — one flat segment beats three
+    // small copies through appendPending.
+    if (date_hole != 0 and (st.batching or st.owner_ring != null)) {
+        if (bakedSegment(head, date_hole, date_line, head_static)) |flat|
+            return appendPending(st, &.{ flat, body });
+    }
     const segs: [4][]const u8 = if (date_hole != 0)
         .{ head[0..date_hole], date_line, head[date_hole..], body }
     else

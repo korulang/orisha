@@ -345,8 +345,12 @@ fn requestAllocator() std.mem.Allocator {
 // the site's own `?status=` lesson filter — landed on the fallback.
 fn requestPathKey(allocator: std.mem.Allocator, target: []const u8) []const u8 {
     // A query string addresses the same resource.
-    const without_query = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[0..q] else target;
+    return pathKeyDecoded(allocator, if (std.mem.indexOfScalar(u8, target, '?')) |q| target[0..q] else target);
+}
 
+// The path part with the query already split off — `answer` has the '?'
+// index in hand from the query extraction, so it skips a second scan.
+fn pathKeyDecoded(allocator: std.mem.Allocator, without_query: []const u8) []const u8 {
     // Common case allocates nothing.
     if (std.mem.indexOfScalar(u8, without_query, '%') == null) return without_query;
 
@@ -561,8 +565,10 @@ const RESPONSE_500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\
             const target = raw[h.target_off..][0..h.target_len];
             if (std.mem.indexOfScalar(u8, target, '?')) |q| {
                 query = target[q + 1 ..];
+                path = $mod.pathKeyDecoded(req_allocator, target[0..q]);
+            } else {
+                path = $mod.pathKeyDecoded(req_allocator, target);
             }
-            path = $mod.requestPathKey(req_allocator, target);
         }
     } else {
         // A dispatch path that never scanned (none today — every pump
@@ -588,15 +594,22 @@ const RESPONSE_500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\
     // Header names are case-insensitive. The Vercel adapter used to omit this
     // header entirely; once it forwards it, browsers send `If-None-Match` in
     // whatever casing their stack picked, and a literal search would miss.
-    if ($mod.headValueParsed(parsed, raw, "if-none-match")) |etag_raw| {
-        if (etag_raw.len >= 2 and etag_raw[0] == '"' and etag_raw[etag_raw.len - 1] == '"') {
-            client_etag = etag_raw[1 .. etag_raw.len - 1];
+    const etag_raw: ?[]const u8 = if (parsed) |h|
+        (if (h.if_none_match_off != 0) raw[h.if_none_match_off..][0..h.if_none_match_len] else null)
+    else
+        $mod.headValueParsed(parsed, raw, "if-none-match");
+    if (etag_raw) |tag| {
+        if (tag.len >= 2 and tag[0] == '"' and tag[tag.len - 1] == '"') {
+            client_etag = tag[1 .. tag.len - 1];
         } else {
-            client_etag = etag_raw;
+            client_etag = tag;
         }
     }
 
-    const accept_encoding = $mod.headValueParsed(parsed, raw, "accept-encoding");
+    const accept_encoding: ?[]const u8 = if (parsed) |h|
+        (if (h.accept_encoding_off != 0) raw[h.accept_encoding_off..][0..h.accept_encoding_len] else null)
+    else
+        $mod.headValueParsed(parsed, raw, "accept-encoding");
 
     var body: ?[]const u8 = null;
     var headers_block: ?[]const u8 = null;
