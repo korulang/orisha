@@ -1,7 +1,8 @@
 // HttpArena HTTP/1.1 endpoints — validate.sh is the spec.
 
 const std = @import("std");
-const ha_zlib = @cImport({
+const ha_freestanding = @import("builtin").target.os.tag == .freestanding;
+const ha_zlib = if (ha_freestanding) struct {} else @cImport({
     @cInclude("zlib.h");
 });
 
@@ -9,12 +10,16 @@ const ha_zlib = @cImport({
 // threadlocal and grow to the largest body seen. Every request is still
 // serialized and compressed fresh; only the allocation is shared. The
 // returned slices are borrowed and must not be freed.
-threadlocal var gz_strm: ha_zlib.z_stream = std.mem.zeroes(ha_zlib.z_stream);
+// Freestanding has no zlib to cImport: gzipBody returns null and callers
+// answer identity — a legal response where compression is negotiated, not
+// promised.
+threadlocal var gz_strm: if (ha_freestanding) struct {} else ha_zlib.z_stream = if (ha_freestanding) .{} else std.mem.zeroes(ha_zlib.z_stream);
 threadlocal var gz_strm_init = false;
 threadlocal var gz_buf: []u8 = &.{};
 threadlocal var json_scratch: []u8 = &.{};
 
 fn gzipBody(allocator: std.mem.Allocator, content: []const u8) ?[]u8 {
+    if (ha_freestanding) return null;
     if (!gz_strm_init) {
         if (ha_zlib.deflateInit2(&gz_strm, ha_zlib.Z_BEST_SPEED, ha_zlib.Z_DEFLATED, 15 + 16, 8, ha_zlib.Z_DEFAULT_STRATEGY) != ha_zlib.Z_OK) return null;
         gz_strm_init = true;
@@ -136,7 +141,7 @@ const Impl = struct {
         fn jsonResponse(source: []const DatasetItem, count: usize, m: i64, fd: usize) ?[]const u8 {
             const items = responseItems(source, count, m) orelse return null;
             const bound = HEAD_RESERVE + count * 256 + 64;
-            const dst: []u8 = if (fd != 0)
+            const dst: []u8 = if (fd != 0 and !ha_freestanding)
                 (orisha.koru_pump.ringRenderTarget(@intCast(fd), bound) orelse
                     (if (body_work.len >= bound) body_work[0..] else return null))
             else
@@ -177,8 +182,17 @@ const Impl = struct {
             return w.buffered();
         }
 
+        // Freestanding has no filesystem and no env: the dataset the file
+        // would hold is baked into the image instead. Same parsed result,
+        // one less machine to ask for it.
+        const dataset_baked: []const u8 = if (ha_freestanding) @embedFile("data/dataset.json") else &.{};
+
         fn datasetItems() ![]const DatasetItem {
             if (dataset_parsed) |parsed| return parsed.value;
+            if (ha_freestanding) {
+                dataset_parsed = try std.json.parseFromSlice([]DatasetItem, alloc, dataset_baked, .{ .allocate = .alloc_always });
+                return dataset_parsed.?.value;
+            }
             const path = std.posix.getenv("DATASET_PATH") orelse "/data/dataset.json";
             dataset_bytes = try std.fs.cwd().readFileAlloc(alloc, path, 16 * 1024 * 1024);
             dataset_parsed = try std.json.parseFromSlice([]DatasetItem, alloc, dataset_bytes.?, .{ .allocate = .alloc_always });

@@ -1,0 +1,14 @@
+.unikraft/
+.zig-cache/
+libkoruapp.a
+a.out
+output_emitted.zig
+backend.zig
+backend_output_emitted.zig
+build.zig
+build_backend.zig
+build_output.zig
+program.ast.json
+compiler_env.zig
+compiler_env.json
+.config.*

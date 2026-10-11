@@ -17,6 +17,11 @@ pub const std_options: std.Options = .{
     .page_size_max = 4096,
 };
 
+// Emitted pump code reaches `@import("root").koru_orisha` for the shared
+// module surface (the once-per-wakeup Date stamp, et al). On hosted builds the
+// emitted file IS the root; here wrapper is, so re-export.
+pub const koru_orisha = app.koru_orisha;
+
 export fn koru_main() void {
     app.main_module.koru_start_flow();
     app.main_module.flow0();
