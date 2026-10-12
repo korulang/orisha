@@ -1378,7 +1378,7 @@ fn armOwnerWrite(st: *ConnState) void {
         const linux = std.os.linux;
         var wait = linux.epoll_event{
             .events = linux.EPOLL.IN | linux.EPOLL.OUT | linux.EPOLL.ONESHOT,
-            .data = .{ .fd = st.fd },
+            .data = .{ .ptr = @intFromPtr(st) },
         };
         _ = linux.epoll_ctl(st.owner_q, linux.EPOLL.CTL_MOD, st.fd, &wait);
     } else {
@@ -1881,7 +1881,8 @@ fn registerClient(client_fd: posix.fd_t, ssl: ?*ServerTls, kq: i32) void {
 fn registerClientEpoll(client_fd: posix.fd_t, ssl: ?*ServerTls, epfd: i32) void {
     const linux = std.os.linux;
     disableNagle(client_fd);
-    markNonBlocking(client_fd);
+    // Callers hand us an already-nonblocking fd — accept4(SOCK.NONBLOCK) on the
+    // hot path, markNonBlocking in the TLS accept loop for its blocking accept.
     const st = connState(client_fd) orelse {
         if (HAS_OPENSSL) {
             if (ssl) |tls| {
@@ -1898,7 +1899,7 @@ fn registerClientEpoll(client_fd: posix.fd_t, ssl: ?*ServerTls, epfd: i32) void 
     st.owner_q = epfd;
     var client_event = linux.epoll_event{
         .events = linux.EPOLL.IN | linux.EPOLL.ONESHOT,
-        .data = .{ .fd = client_fd },
+        .data = .{ .ptr = @intFromPtr(st) },
     };
     _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_ADD, client_fd, &client_event);
 }
@@ -2138,7 +2139,7 @@ fn workerCount() usize {
                 if (event.filter == $mod.libc.EVFILT.WRITE) {
                     switch ($mod.flushPending(st)) {
                         .dead => {
-                            if ($mod.connIsWs(fd)) closed(@intCast(fd));
+                            if (st.mode == .ws) closed(@intCast(fd));
                             $mod.releaseConn(fd);
                             continue;
                         },
@@ -2148,7 +2149,7 @@ fn workerCount() usize {
                         },
                         .drained => {
                             if (st.close_when_drained) {
-                                if ($mod.connIsWs(fd)) closed(@intCast(fd));
+                                if (st.mode == .ws) closed(@intCast(fd));
                                 $mod.releaseConn(fd);
                                 continue;
                             }
@@ -2169,7 +2170,7 @@ fn workerCount() usize {
                         continue;
                     },
                     .gone => {
-                        if ($mod.connIsWs(fd)) closed(@intCast(fd));
+                        if (st.mode == .ws) closed(@intCast(fd));
                         $mod.releaseConn(fd);
                         continue;
                     },
@@ -2209,7 +2210,7 @@ fn workerCount() usize {
                             $mod.armKqueueFilter(kq, fd, $mod.libc.EVFILT.WRITE);
                             continue;
                         }
-                        if ($mod.connIsWs(fd)) closed(@intCast(fd));
+                        if (st.mode == .ws) closed(@intCast(fd));
                         $mod.releaseConn(fd);
                         continue;
                     }
@@ -2250,7 +2251,7 @@ fn workerCount() usize {
                         $mod.armKqueueFilter(kq, fd, $mod.libc.EVFILT.WRITE);
                         continue;
                     }
-                    if ($mod.connIsWs(fd)) closed(@intCast(fd));
+                    if (st.mode == .ws) closed(@intCast(fd));
                     $mod.releaseConn(fd);
                     continue;
                 }
@@ -2784,7 +2785,7 @@ fn workerCount() usize {
                     if (event.filter == $mod.libc.EVFILT.WRITE) {
                         switch ($mod.flushPending(st)) {
                             .dead => {
-                                if ($mod.connIsWs(fd)) closed(@intCast(fd));
+                                if (st.mode == .ws) closed(@intCast(fd));
                                 $mod.releaseConn(fd);
                                 continue;
                             },
@@ -2794,7 +2795,7 @@ fn workerCount() usize {
                             },
                             .drained => {
                                 if (st.close_when_drained) {
-                                    if ($mod.connIsWs(fd)) closed(@intCast(fd));
+                                    if (st.mode == .ws) closed(@intCast(fd));
                                     $mod.releaseConn(fd);
                                     continue;
                                 }
@@ -2815,7 +2816,7 @@ fn workerCount() usize {
                             continue;
                         },
                         .gone => {
-                            if ($mod.connIsWs(fd)) closed(@intCast(fd));
+                            if (st.mode == .ws) closed(@intCast(fd));
                             $mod.releaseConn(fd);
                             continue;
                         },
@@ -2854,7 +2855,7 @@ fn workerCount() usize {
                                 $mod.armKqueueFilter(kq, fd, $mod.libc.EVFILT.WRITE);
                                 continue;
                             }
-                            if ($mod.connIsWs(fd)) closed(@intCast(fd));
+                            if (st.mode == .ws) closed(@intCast(fd));
                             $mod.releaseConn(fd);
                             continue;
                         }
@@ -2897,7 +2898,7 @@ fn workerCount() usize {
                             $mod.armKqueueFilter(kq, fd, $mod.libc.EVFILT.WRITE);
                             continue;
                         }
-                        if ($mod.connIsWs(fd)) closed(@intCast(fd));
+                        if (st.mode == .ws) closed(@intCast(fd));
                         $mod.releaseConn(fd);
                         continue;
                     }
@@ -2970,15 +2971,8 @@ fn workerCount() usize {
         return .{ .failed = err_msg };
     }
 
-    var server = $mod.openListener(port) orelse return .{ .failed = "Failed to listen" };
-
     const n_workers = $mod.workerCount();
 
-    // The listener is NOT in anybody's readiness set. This thread does nothing
-    // but accept, and it blocks while it waits — which is why the listener is
-    // left blocking where the connections are not. Multiplexing the listener
-    // into a worker's epoll would make one worker answer every new connection
-    // as well as its own traffic.
     // ONE readiness instance, shared by every worker.
     //
     // This was one epoll per worker, with each connection assigned at accept
@@ -3010,12 +3004,12 @@ fn workerCount() usize {
                 @import("root").koru_orisha.stampHttpDateLine();
 
                 for (events[0..@intCast(n)]) |event| {
-                    const fd: $mod.posix.fd_t = event.data.fd;
-
-                    const st = $mod.connState(fd) orelse {
-                        $mod.posix.close(fd);
-                        continue;
-                    };
+                    // The epoll set carries *ConnState in data.ptr — no fd→state
+                    // table lookup, no conn_states_mu on the dispatch path. ONESHOT
+                    // guarantees only one worker holds a conn at a time, so the
+                    // pointer cannot be freed under us: release happens here.
+                    const st: *$mod.ConnState = @ptrFromInt(event.data.ptr);
+                    const fd: $mod.posix.fd_t = st.fd;
 
                     // The conn registers before its handshake finishes —
                     // step it once per readiness event so a thousand
@@ -3033,7 +3027,7 @@ fn workerCount() usize {
                                 const dir: u32 = if (w == .want_read) linux.EPOLL.IN else linux.EPOLL.OUT;
                                 var wait = linux.epoll_event{
                                     .events = dir | linux.EPOLL.ONESHOT,
-                                    .data = .{ .fd = fd },
+                                    .data = .{ .ptr = @intFromPtr(st) },
                                 };
                                 _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &wait);
                                 continue;
@@ -3050,21 +3044,21 @@ fn workerCount() usize {
                     if (event.events & linux.EPOLL.OUT != 0) {
                         switch ($mod.flushPending(st)) {
                             .dead => {
-                                if ($mod.connIsWs(fd)) closed(@intCast(fd));
+                                if (st.mode == .ws) closed(@intCast(fd));
                                 $mod.releaseConn(fd);
                                 continue;
                             },
                             .stalled => {
                                 var wait = linux.epoll_event{
                                     .events = $mod.epollMask(st),
-                                    .data = .{ .fd = fd },
+                                    .data = .{ .ptr = @intFromPtr(st) },
                                 };
                                 _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &wait);
                                 continue;
                             },
                             .drained => {
                                 if (st.close_when_drained) {
-                                    if ($mod.connIsWs(fd)) closed(@intCast(fd));
+                                    if (st.mode == .ws) closed(@intCast(fd));
                                     $mod.releaseConn(fd);
                                     continue;
                                 }
@@ -3073,7 +3067,7 @@ fn workerCount() usize {
                         if (event.events & linux.EPOLL.IN == 0) {
                             var wait = linux.epoll_event{
                                 .events = linux.EPOLL.IN | linux.EPOLL.ONESHOT,
-                                .data = .{ .fd = fd },
+                                .data = .{ .ptr = @intFromPtr(st) },
                             };
                             _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &wait);
                             continue;
@@ -3085,13 +3079,13 @@ fn workerCount() usize {
                         .idle => {
                             var wait = linux.epoll_event{
                                 .events = $mod.epollMask(st),
-                                .data = .{ .fd = fd },
+                                .data = .{ .ptr = @intFromPtr(st) },
                             };
                             _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &wait);
                             continue;
                         },
                         .gone => {
-                            if ($mod.connIsWs(fd)) closed(@intCast(fd));
+                            if (st.mode == .ws) closed(@intCast(fd));
                             $mod.releaseConn(fd);
                             continue;
                         },
@@ -3129,18 +3123,18 @@ fn workerCount() usize {
                                 st.close_when_drained = true;
                                 var wait = linux.epoll_event{
                                     .events = linux.EPOLL.OUT | linux.EPOLL.ONESHOT,
-                                    .data = .{ .fd = fd },
+                                    .data = .{ .ptr = @intFromPtr(st) },
                                 };
                                 _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &wait);
                                 continue;
                             }
-                            if ($mod.connIsWs(fd)) closed(@intCast(fd));
+                            if (st.mode == .ws) closed(@intCast(fd));
                             $mod.releaseConn(fd);
                             continue;
                         }
                         var ws_rearm = linux.epoll_event{
                             .events = $mod.epollMask(st),
-                            .data = .{ .fd = fd },
+                            .data = .{ .ptr = @intFromPtr(st) },
                         };
                         _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &ws_rearm);
                         continue;
@@ -3176,19 +3170,19 @@ fn workerCount() usize {
                             st.close_when_drained = true;
                             var wait = linux.epoll_event{
                                 .events = linux.EPOLL.OUT | linux.EPOLL.ONESHOT,
-                                .data = .{ .fd = fd },
+                                .data = .{ .ptr = @intFromPtr(st) },
                             };
                             _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &wait);
                             continue;
                         }
-                        if ($mod.connIsWs(fd)) closed(@intCast(fd));
+                        if (st.mode == .ws) closed(@intCast(fd));
                         $mod.releaseConn(fd);
                         continue;
                     }
 
                     var rearm = linux.epoll_event{
                         .events = $mod.epollMask(st),
-                        .data = .{ .fd = fd },
+                        .data = .{ .ptr = @intFromPtr(st) },
                     };
                     _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &rearm);
                 }
@@ -3212,6 +3206,7 @@ fn workerCount() usize {
                 while (true) {
                     const conn = tls_listener.accept() catch continue;
                     const client_fd = conn.stream.handle;
+                    $mod.markNonBlocking(client_fd);
                     // Only the SSL object is made here — the handshake runs
                     // in the worker loop, one step per readiness event.
                     const ssl = $mod.beginTlsHandshake(@intCast(client_fd)) orelse continue;
@@ -3223,17 +3218,41 @@ fn workerCount() usize {
             return .{ .failed = "Failed to spawn TLS accept thread" };
     }
 
+    // Accept was a single thread doing accept + setsockopt + 2×fcntl + a locked
+    // ConnState alloc + epoll_ctl per conn — one serial path capping churn near
+    // ~10-20K conns/s while -r25-style workloads demand ~T/25 new conns every
+    // second. REUSEPORT gives each acceptor its own listener, the kernel hashes
+    // flows across them, and the whole post-accept path runs in parallel.
+    // accept4 takes NONBLOCK|CLOEXEC here so the fd arrives already configured —
+    // the fcntl pair lives in the TLS accept loop instead, the only caller
+    // whose accept still returns a blocking descriptor.
+    const Acceptor = struct {
+        fn loop(lfd: $mod.posix.fd_t, epfd: i32) void {
+            while (true) {
+                const client_fd = $mod.posix.accept(lfd, null, null, $mod.posix.SOCK.NONBLOCK | $mod.posix.SOCK.CLOEXEC) catch continue;
+                $mod.registerClientEpoll(client_fd, null, epfd);
+            }
+        }
+    };
+    var lfds: [$mod.MAX_WORKERS]$mod.posix.fd_t = undefined;
+    var n_listeners: usize = 0;
+    for (0..n_workers) |i| {
+        lfds[i] = $mod.openReusePortListener(port) orelse break;
+        n_listeners += 1;
+    }
+    if (n_listeners == 0) return .{ .failed = "Failed to listen" };
+    for (lfds[1..n_listeners]) |lfd| {
+        _ = std.Thread.spawn(.{}, Acceptor.loop, .{ lfd, shared_epfd }) catch
+            return .{ .failed = "Failed to spawn acceptor" };
+    }
+
     std.debug.print("Orisha listening on http://0.0.0.0:{}\n", .{port});
     if ($mod.tls_server_ctx != null) {
         std.debug.print("Orisha listening on https://0.0.0.0:{}\n", .{$mod.tls_listen_port});
     }
-    std.debug.print("Pump: epoll, {} workers on one shared queue, keep-alive, TCP_NODELAY\n", .{n_workers});
+    std.debug.print("Pump: epoll, {} workers on one shared queue, {} accept listeners, keep-alive, TCP_NODELAY\n", .{ n_workers, n_listeners });
 
-    while (true) {
-        const conn = server.accept() catch continue;
-        const client_fd = conn.stream.handle;
-        $mod.registerClientEpoll(client_fd, null, shared_epfd);
-    }
+    Acceptor.loop(lfds[0], shared_epfd);
 
     return .{ .stopped = "Server stopped" };
 }
