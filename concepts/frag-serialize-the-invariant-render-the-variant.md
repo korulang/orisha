@@ -424,3 +424,30 @@ instead of adding a probe.
   only honest instrument for TLS questions.
 - The heap `Stringify` fallback for overflow counts is unchanged and
   unmeasured for speed — it only needs to be correct.
+
+## What the instrument said — fourteenth pass (2026-10-12, the schema writer)
+
+Phase counters in the emitted server put the number on the generic writer:
+on the gzip json path, `jsonBodyScratch` was 20.7µs of a 48µs request —
+`std.json.Stringify` routing every int through `writer.print` and every
+field through comptime-reflected runtime dispatch. The ninth pass's honesty
+rule stands: every byte is still rendered fresh per request (no memoized
+prefix, no body cache — `total` is computed live). What changed is *how*
+the fresh render happens: `jsonWrite(T)` resolves the entire walk at
+comptime — literal keys as `@memcpy`, a digit writer for ints, one
+escape-scan per string, `Stringify`'s escape table as the byte oracle.
+
+Verified, not assumed: 8.4KB and 383B bodies byte-identical to the
+`Stringify` output they replaced; 23 hostile cases (every C0 control,
+quotes, backslashes, UTF-8, i64 min/max, optionals, enums, nested slices)
+zero-mismatch against `Stringify` itself. Isolated: 20.7µs → 5.9µs
+(3.4×). Under 12-worker gcannon load: dispatch 47.9µs → 32.1µs, the
+whole delta attributable to the serializer — compression and plumbing
+unchanged.
+
+The belief tightens again: the request-dependence boundary is still the
+rule, but the tax the generic writer charged *inside* the live render was
+never inherent to freshness — it was the cost of re-discovering a known
+schema at runtime. A schema-directed writer is the honest end of that
+spectrum: same bytes, same per-request work, the discovery paid once at
+compile time.

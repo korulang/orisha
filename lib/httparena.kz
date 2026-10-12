@@ -134,9 +134,9 @@ const Impl = struct {
                     (if (body_work.len >= bound) body_work[0..] else return null))
             else
                 (if (body_work.len >= bound) body_work[0..] else return null);
-            var w = std.Io.Writer.fixed(dst[HEAD_RESERVE..]);
-            std.json.Stringify.value(Body{ .items = items, .count = count }, .{}, &w) catch return null;
-            const body_len = w.end;
+            var body_pos: usize = 0;
+            if (!jsonWrite(Body, dst[HEAD_RESERVE..], &body_pos, .{ .items = items, .count = count })) return null;
+            const body_len = body_pos;
             var hdr: [200]u8 = undefined;
             // The Date line is embedded at render time — httpDateLine() is
             // the per-second threadlocal the send path splices in anyway —
@@ -155,8 +155,170 @@ const Impl = struct {
             return dst[start .. start + msg_len];
         }
 
-        // Serialize {"items":[...],"count":N} per request through Stringify
-        // into the reusable scratch buffer. Null on overflow → heap fallback.
+        // Schema-directed JSON writer — the walk over the type happens at
+        // comptime, so the emitted code is a straight run of literal @memcpy
+        // keys, a digit writer for ints, and one escape-scan per string.
+        // Byte-identical to std.json.Stringify.value at default options —
+        // that byte-for-byte contract is the oracle this was verified
+        // against, including the escape table ({\" \\ \b \f \n \r \t}
+        // short forms, other C0 controls as \u00xx).
+        const jw_forbidden =
+            "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f" ++
+            "\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\"\\";
+
+        fn jwByte(dst: []u8, pos: *usize, c: u8) bool {
+            if (pos.* >= dst.len) return false;
+            dst[pos.*] = c;
+            pos.* += 1;
+            return true;
+        }
+
+        fn jwLit(dst: []u8, pos: *usize, comptime s: []const u8) bool {
+            if (pos.* + s.len > dst.len) return false;
+            @memcpy(dst[pos.* .. pos.* + s.len], s);
+            pos.* += s.len;
+            return true;
+        }
+
+        fn jwInt(dst: []u8, pos: *usize, v: anytype) bool {
+            var tmp: [20]u8 = undefined;
+            var n: usize = tmp.len;
+            var uv = @abs(v);
+            while (true) {
+                n -= 1;
+                tmp[n] = '0' + @as(u8, @intCast(uv % 10));
+                uv /= 10;
+                if (uv == 0) break;
+            }
+            const neg = v < 0;
+            const len = tmp.len - n + @intFromBool(neg);
+            if (pos.* + len > dst.len) return false;
+            if (neg) {
+                dst[pos.*] = '-';
+                pos.* += 1;
+            }
+            @memcpy(dst[pos.* .. pos.* + tmp.len - n], tmp[n..]);
+            pos.* += tmp.len - n;
+            return true;
+        }
+
+        fn jwStr(dst: []u8, pos: *usize, s: []const u8) bool {
+            if (!jwByte(dst, pos, '"')) return false;
+            if (std.mem.indexOfAny(u8, s, jw_forbidden)) |first| {
+                var last: usize = 0;
+                var i: usize = first;
+                while (true) {
+                    if (pos.* + i - last > dst.len) return false;
+                    @memcpy(dst[pos.* .. pos.* + i - last], s[last..i]);
+                    pos.* += i - last;
+                    const esc: []const u8 = switch (s[i]) {
+                        '"' => "\\\"",
+                        '\\' => "\\\\",
+                        0x08 => "\\b",
+                        0x0C => "\\f",
+                        '\n' => "\\n",
+                        '\r' => "\\r",
+                        '\t' => "\\t",
+                        else => "",
+                    };
+                    if (esc.len > 0) {
+                        if (pos.* + esc.len > dst.len) return false;
+                        @memcpy(dst[pos.* .. pos.* + esc.len], esc);
+                        pos.* += esc.len;
+                    } else {
+                        if (pos.* + 6 > dst.len) return false;
+                        const hex = "0123456789abcdef";
+                        dst[pos.*] = '\\';
+                        dst[pos.* + 1] = 'u';
+                        dst[pos.* + 2] = '0';
+                        dst[pos.* + 3] = '0';
+                        dst[pos.* + 4] = hex[s[i] >> 4];
+                        dst[pos.* + 5] = hex[s[i] & 0xF];
+                        pos.* += 6;
+                    }
+                    if (std.mem.indexOfAnyPos(u8, s, i + 1, jw_forbidden)) |next| {
+                        last = i + 1;
+                        i = next;
+                    } else {
+                        last = i + 1;
+                        break;
+                    }
+                }
+                if (pos.* + s.len - last > dst.len) return false;
+                @memcpy(dst[pos.* .. pos.* + s.len - last], s[last..]);
+                pos.* += s.len - last;
+            } else {
+                if (pos.* + s.len > dst.len) return false;
+                @memcpy(dst[pos.* .. pos.* + s.len], s);
+                pos.* += s.len;
+            }
+            return jwByte(dst, pos, '"');
+        }
+
+        fn jsonWrite(comptime T: type, dst: []u8, pos: *usize, v: T) bool {
+            switch (@typeInfo(T)) {
+                .bool => {
+                    if (v) return jwLit(dst, pos, "true");
+                    return jwLit(dst, pos, "false");
+                },
+                .int, .comptime_int => return jwInt(dst, pos, v),
+                .null => return jwLit(dst, pos, "null"),
+                .optional => {
+                    if (v) |u| return jsonWrite(@TypeOf(u), dst, pos, u);
+                    return jwLit(dst, pos, "null");
+                },
+                .@"enum" => return jwStr(dst, pos, @tagName(v)),
+                .pointer => |P| {
+                    if (P.child == u8 and (P.size == .slice or P.size == .many)) {
+                        return jwStr(dst, pos, v);
+                    }
+                    if (P.size == .slice) {
+                        if (!jwByte(dst, pos, '[')) return false;
+                        for (v, 0..) |e, i| {
+                            if (i > 0) if (!jwByte(dst, pos, ',')) return false;
+                            if (!jsonWrite(P.child, dst, pos, e)) return false;
+                        }
+                        return jwByte(dst, pos, ']');
+                    }
+                    if (P.size == .one) {
+                        return jsonWrite(P.child, dst, pos, v.*);
+                    }
+                    @compileError("jsonWrite: unsupported pointer " ++ @typeName(T));
+                },
+                .array => |A| {
+                    if (A.child == u8) return jwStr(dst, pos, &v);
+                    if (!jwByte(dst, pos, '[')) return false;
+                    for (v, 0..) |e, i| {
+                        if (i > 0) if (!jwByte(dst, pos, ',')) return false;
+                        if (!jsonWrite(A.child, dst, pos, e)) return false;
+                    }
+                    return jwByte(dst, pos, ']');
+                },
+                .@"struct" => |S| {
+                    if (S.is_tuple) {
+                        if (!jwByte(dst, pos, '[')) return false;
+                        inline for (S.fields, 0..) |f, i| {
+                            if (i > 0) if (!jwByte(dst, pos, ',')) return false;
+                            if (!jsonWrite(f.type, dst, pos, @field(v, f.name))) return false;
+                        }
+                        return jwByte(dst, pos, ']');
+                    }
+                    if (!jwByte(dst, pos, '{')) return false;
+                    inline for (S.fields, 0..) |f, i| {
+                        if (i > 0) if (!jwByte(dst, pos, ',')) return false;
+                        if (!jwLit(dst, pos, "\"" ++ f.name ++ "\":")) return false;
+                        if (!jsonWrite(f.type, dst, pos, @field(v, f.name))) return false;
+                    }
+                    return jwByte(dst, pos, '}');
+                },
+                else => @compileError("jsonWrite: unsupported " ++ @typeName(T)),
+            }
+            return true;
+        }
+
+        // Serialize {"items":[...],"count":N} per request into the reusable
+        // scratch buffer — schema-directed, no writer indirection.
+        // Null on overflow → heap fallback.
         fn jsonBodyScratch(source: []const DatasetItem, count: usize, m: i64) ?[]const u8 {
             const items = responseItems(source, count, m) orelse return null;
             const need = count * 256 + 64;
@@ -165,9 +327,9 @@ const Impl = struct {
                 if (json_scratch.len > 0) alloc.free(json_scratch);
                 json_scratch = nb;
             }
-            var w = std.Io.Writer.fixed(json_scratch);
-            std.json.Stringify.value(Body{ .items = items, .count = count }, .{}, &w) catch return null;
-            return w.buffered();
+            var pos: usize = 0;
+            if (!jsonWrite(Body, json_scratch, &pos, .{ .items = items, .count = count })) return null;
+            return json_scratch[0..pos];
         }
 
         // Freestanding has no filesystem and no env: the dataset the file
