@@ -5,56 +5,27 @@
 const std = @import("std");
 const ha_compress = @import("root").koru_std.koru_compress;
 const ha_freestanding = @import("builtin").target.os.tag == .freestanding;
-const ha_zlib = if (ha_freestanding) struct {} else @cImport({
-    @cInclude("zlib.h");
-});
 
-// Reusable gzip machinery — the deflate stream and both scratch buffers are
-// threadlocal and grow to the largest body seen. Every request is still
-// serialized and compressed fresh; only the allocation is shared. The
-// returned slices are borrowed and must not be freed.
-// Freestanding has no zlib to cImport: gzipBody returns null and callers
-// answer identity — a legal response where compression is negotiated, not
-// promised.
-threadlocal var gz_strm: if (ha_freestanding) struct {} else ha_zlib.z_stream = if (ha_freestanding) .{} else std.mem.zeroes(ha_zlib.z_stream);
-threadlocal var gz_strm_init = false;
+// Reusable gzip machinery — the scratch buffer is threadlocal and grows to
+// the largest body seen. Every request is still serialized and compressed
+// fresh; only the allocation is shared. The returned slices are borrowed
+// and must not be freed. std/compress covers every input size on every
+// target (multi-block past 64KB) — there is no zlib left in this path.
 threadlocal var gz_buf: []u8 = &.{};
 threadlocal var json_scratch: []u8 = &.{};
 
 fn gzipBody(allocator: std.mem.Allocator, content: []const u8) ?[]u8 {
-    // std/compress is the default on every target: dynamic Huffman with
-    // a per-worker cached tree, an ARM-CRC trailer, tighter output than zlib
-    // at BEST_SPEED and a faster encode measured both per-call and
-    // end-to-end. zlib remains only for bodies past the single-block cap —
-    // there is no zlib to cImport on freestanding, and none needed here.
-    if (content.len < ha_compress.INPUT_CAP) {
-        const need = ha_compress.gzipBound(content.len);
-        if (gz_buf.len < need) {
-            const nb = allocator.alloc(u8, need) catch return null;
-            if (gz_buf.len > 0) allocator.free(gz_buf);
-            gz_buf = nb;
-        }
-        return gz_buf[0..ha_compress.gzipInto(content, gz_buf)];
-    }
-    if (ha_freestanding) return null;
-    if (!gz_strm_init) {
-        if (ha_zlib.deflateInit2(&gz_strm, ha_zlib.Z_BEST_SPEED, ha_zlib.Z_DEFLATED, 15 + 16, 8, ha_zlib.Z_DEFAULT_STRATEGY) != ha_zlib.Z_OK) return null;
-        gz_strm_init = true;
-    } else if (ha_zlib.deflateReset(&gz_strm) != ha_zlib.Z_OK) {
-        return null;
-    }
-    const need: usize = ha_zlib.compressBound(@intCast(content.len));
+    // std/compress is the whole path on every target: dynamic Huffman with
+    // a per-worker cached tree, slicing-by-8 CRC trailer, tighter output
+    // than zlib at BEST_SPEED and a faster encode measured both per-call
+    // and end-to-end.
+    const need = ha_compress.gzipBound(content.len);
     if (gz_buf.len < need) {
         const nb = allocator.alloc(u8, need) catch return null;
         if (gz_buf.len > 0) allocator.free(gz_buf);
         gz_buf = nb;
     }
-    gz_strm.next_in = @constCast(content.ptr);
-    gz_strm.avail_in = @intCast(content.len);
-    gz_strm.next_out = gz_buf.ptr;
-    gz_strm.avail_out = @intCast(gz_buf.len);
-    if (ha_zlib.deflate(&gz_strm, ha_zlib.Z_FINISH) != ha_zlib.Z_STREAM_END) return null;
-    return gz_buf[0 .. gz_buf.len - gz_strm.avail_out];
+    return gz_buf[0..ha_compress.gzipInto(content, gz_buf)];
 }
 
 const orisha = @import("root").koru_orisha;
