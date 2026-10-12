@@ -370,6 +370,17 @@ pub const ConnState = struct {
     // This replaces a single accept thread doing every SSL_accept
     // synchronously, which serialised all handshake crypto onto one core.
     tls_hs: bool = false,
+    // io_uring pump only: a socket-BIO TLS conn — OpenSSL owns the wire and
+    // the ring drives it with poll_add SQEs rather than recv/send. Set for
+    // the conn's whole userspace-crypto life: handshake flights and records
+    // all flow through SSL_accept/SSL_read/SSL_write on the fd. Cleared when
+    // ENABLE_KTLS hands the record layer to the kernel — the SSL is freed
+    // and the conn goes cleartext from that point.
+    tls_sockbio: bool = false,
+    // A poll_add SQE naming this conn is in flight. Same teardown role as
+    // recv_armed: the free waits for the terminal CQE, because its
+    // user_data still dereferences this struct.
+    poll_armed: bool = false,
     // Output accepted from the app faster than the socket took it. Writes
     // append at the tail, a readiness-for-write event drains from
     // pending_off, and the queue keeps ordering without a copy: nothing a
@@ -642,14 +653,15 @@ fn appendPending(st: *ConnState, segments: []const []const u8) bool {
         // send_buf/pending below. Once kTLS owns the socket the SSL is gone
         // and this leg stops matching — plaintext stages like cleartext.
         if (HAS_OPENSSL) {
-            if (st.ssl != null) return tlsRingWrite(st, segments);
+            if (st.ssl != null and !st.tls_sockbio) return tlsRingWrite(st, segments);
         }
         // No send in flight means send_buf is unpinned and can grow under us;
         // with one in flight the kernel owns it, so bytes queue in pending
         // instead. ws conns always take the pending leg: a foreign pusher
         // shares only that region under ws_mu, never the buffer a submit is
-        // about to pin.
-        if (st.send_len == 0 and st.send_iov_n == 0 and st.mode != .ws) {
+        // about to pin. Socket-BIO TLS conns take pending too: their wire is
+        // OpenSSL's, so send_buf must never see their plaintext.
+        if (st.send_len == 0 and st.send_iov_n == 0 and st.mode != .ws and !st.tls_sockbio) {
             // Plan mode: once any segment in this window was staged as an
             // iovec, every later byte must be plan-recorded too — wire order
             // is the plan's, not the buffer's. A seg that arrives when the
@@ -743,9 +755,9 @@ fn appendPair(st: *ConnState, a: []const u8, b: []const u8) bool {
     const need = a.len + b.len;
     if (st.owner_ring != null) {
         if (HAS_OPENSSL) {
-            if (st.ssl != null) return tlsRingWrite(st, &.{ a, b });
+            if (st.ssl != null and !st.tls_sockbio) return tlsRingWrite(st, &.{ a, b });
         }
-        if (st.send_len == 0 and st.send_iov_n == 0 and st.mode != .ws) {
+        if (st.send_len == 0 and st.send_iov_n == 0 and st.mode != .ws and !st.tls_sockbio) {
             const plan_mode = st.send_plan_n > 0;
             if (a.len != 0) {
                 if (plan_mode and st.send_plan_n == SEND_PLAN_MAX)
@@ -1444,6 +1456,7 @@ const POLLIN: c_short = 0x001;
 const POLLERR: c_short = 0x008;
 const POLLHUP: c_short = 0x010;
 const POLLNVAL: c_short = 0x020;
+const POLLOUT: c_short = 0x004;
 extern fn poll(fds: [*]PollFd, nfds: c_ulong, timeout: c_int) c_int;
 
 // One in-flight connection per slot, each owning the request it has not
@@ -1676,6 +1689,37 @@ fn driveTlsHandshake(st: *ConnState) TlsStep {
 // `tls_plain` is the one place plaintext waits, for a cipher that wants more
 // input before it will take more output.
 const TLS_IN_CAP: usize = 64 * 1024;
+
+// Socket-BIO accept — the io_uring pump's TLS shape. OpenSSL owns the fd:
+// handshake flights leave through its own writes, records through SSL_read/
+// SSL_write, and ENABLE_KTLS on the ctx lets it hand the record layer to the
+// kernel at handshake end. The ring never sees ciphertext — it supplies
+// readiness via poll_add and, once offloaded, plaintext recv/send SQEs.
+fn beginTlsHandshakeSock(client_fd: c_int) ?*ServerTls {
+    if (HAS_OPENSSL) {
+        const openssl = @import("root").koru_koru.koru_openssl;
+        const ctx = tls_server_ctx orelse return null;
+        const begun = openssl.acceptBegin(ctx, @intCast(client_fd), std.heap.page_allocator);
+        return switch (begun) {
+            .ok => |ssl| blk: {
+                const conn = std.heap.page_allocator.create(openssl.Tls) catch {
+                    openssl.releaseServerSsl(ssl);
+                    posix.close(@intCast(client_fd));
+                    return null;
+                };
+                conn.* = .{ .ssl = ssl, .ctx = ctx.ctx, .owns_ctx = false, .fd = client_fd, .allocator = std.heap.page_allocator };
+                break :blk conn;
+            },
+            .err => {
+                posix.close(@intCast(client_fd));
+                return null;
+            },
+        };
+    } else {
+        posix.close(@intCast(client_fd));
+    }
+    return null;
+}
 
 fn beginTlsHandshakeMem(client_fd: c_int) ?*ServerTls {
     if (HAS_OPENSSL) {
@@ -3352,6 +3396,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
 
     const W = struct {
         const TAG_SEND: u64 = 1;
+        const TAG_POLL: u64 = 2;
         const CQE_BATCH = 512;
         const SUBMIT_STRIDE = 16; // push staged SQEs every N completions in a deep batch
         // Coalesced completion wait: a hot worker asks for up to this many
@@ -3458,7 +3503,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
 
         fn maybeFreeRing(w: *@This(), st: *$mod.ConnState) void {
             _ = w;
-            if (!st.ring_closing or st.recv_armed or st.send_len != 0) return;
+            if (!st.ring_closing or st.recv_armed or st.poll_armed or st.send_len != 0) return;
             // Nothing can still reference st: recv folded, no send in flight,
             // fd already detached and closed. A `ws-send-fd` pusher could be
             // mid-write — same wait releaseConn does. The unlock must precede
@@ -3469,11 +3514,28 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
             $mod.pumpAlloc().destroy(st);
         }
 
+        // Readiness for a socket-BIO TLS conn — the only SQE kind it takes,
+        // since the wire belongs to OpenSSL. poll_armed plays recv_armed's
+        // teardown role: the free waits for this CQE before releasing st.
+        fn submitPoll(w: *@This(), st: *$mod.ConnState, mask: u32) bool {
+            st.poll_armed = true;
+            _ = w.ring.poll_add(@intFromPtr(st) | TAG_POLL, st.fd, mask) catch {
+                _ = w.ring.submit() catch {};
+                _ = w.ring.poll_add(@intFromPtr(st) | TAG_POLL, st.fd, mask) catch {
+                    st.poll_armed = false;
+                    return false;
+                };
+            };
+            return true;
+        }
+
         fn submitRecv(w: *@This(), st: *$mod.ConnState) bool {
             // TLS conns receive ciphertext into tls_in at the residual offset
             // — a record split across CQEs stays buffered until it completes.
             // st.buf is where plaintext accumulates once rbio has been fed.
-            if ($mod.HAS_OPENSSL and st.ssl != null) {
+            // Socket-BIO conns never arm a recv: the wire is OpenSSL's, and
+            // their bytes arrive through poll_add + SSL_read instead.
+            if ($mod.HAS_OPENSSL and st.ssl != null and !st.tls_sockbio) {
                 const buf = st.tls_in[st.tls_in_used..];
                 _ = w.ring.recv(@intFromPtr(st), st.fd, .{ .buffer = buf }, 0) catch {
                     _ = w.ring.submit() catch {};
@@ -3523,6 +3585,12 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
         // send, and a conn answered `keep_alive = false` still flushes its
         // last response before the fd drops.
         fn advance(w: *@This(), st: *$mod.ConnState) void {
+            // Socket-BIO TLS conns own none of the ring's send machinery —
+            // output leaves through SSL_write and readiness is poll_add.
+            if (st.tls_sockbio) {
+                w.advanceSockBio(st);
+                return;
+            }
             if (st.send_len != 0 or st.send_iov_n != 0) return;
             const pn = $mod.pendingLen(st);
             // Bytes spilled while a plan window was open are NEWER than the
@@ -3559,9 +3627,10 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
             }
             // TLS: owed plaintext through the cipher, close_notify once if the
             // conn is dying, wbio's ciphertext onto the tail of the wire queue
-            // — after pending, because pending's bytes are older.
+            // — after pending, because pending's bytes are older. Socket-BIO
+            // conns returned early above; this leg is the mem-BIO path.
             if ($mod.HAS_OPENSSL) {
-                if (st.ssl != null) {
+                if (st.ssl != null and !st.tls_sockbio) {
                     if (!$mod.tlsRingDrain(st)) st.ring_dead = true;
                 }
             }
@@ -3619,7 +3688,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
             // parks the conn on its proven mem-BIO path forever.
             if ($mod.HAS_OPENSSL) {
                 if (st.ssl) |tls| {
-                    if (!st.tls_no_ktls and !st.tls_hs and !w.ktls_dead and st.tls_in_used == 0 and st.len < st.buf.len) {
+                    if (!st.tls_sockbio and !st.tls_no_ktls and !st.tls_hs and !w.ktls_dead and st.tls_in_used == 0 and st.len < st.buf.len) {
                         const mod = @import("root").koru_koru.koru_openssl;
                         if (tls.ssl) |s| {
                             if (mod.sslRbioPending(s) == 0 and mod.sslMemPendingIn(s) == 0 and !mod.sslHasUnprocessed(s)) {
@@ -3672,24 +3741,30 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                         st.owner_ring = @ptrCast(w);
                         var ready = true;
                         if (is_tls) {
-                            // Memory-BIO SSL — the ring keeps the wire, the
-                            // cipher gets buffers. The fd is dead to SSL.
-                            st.ssl = $mod.beginTlsHandshakeMem(@intCast(cfd));
+                            // Socket-BIO SSL — OpenSSL keeps the wire, the
+                            // ring supplies readiness. ENABLE_KTLS on the ctx
+                            // hands the record layer to the kernel at
+                            // handshake end where the host supports it.
+                            st.ssl = $mod.beginTlsHandshakeSock(@intCast(cfd));
                             if (st.ssl == null) {
                                 // A failed begin already closed cfd — keep
                                 // teardown from closing it twice.
                                 st.fd = -1;
                                 ready = false;
                             } else {
-                                st.tls_in = $mod.pumpAlloc().alloc(u8, $mod.TLS_IN_CAP) catch &.{};
-                                if (st.tls_in.len == 0) ready = false;
                                 st.tls_hs = true;
+                                st.tls_sockbio = true;
                             }
                         }
-                        // The recv buffer lives in the conn's own heap state —
-                        // the kernel writes into it before we are told.
+                        // A TLS conn's first op is a poll arm for the
+                        // handshake's next flight; cleartext goes straight
+                        // to the recv pool.
                         if (ready) {
-                            if (!w.submitRecv(st)) w.teardown(st);
+                            if (st.tls_sockbio) {
+                                if (!w.submitPoll(st, @intCast($mod.POLLIN))) w.teardown(st);
+                            } else if (!w.submitRecv(st)) {
+                                w.teardown(st);
+                            }
                         } else {
                             w.teardown(st);
                         }
@@ -3759,6 +3834,12 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                 st.send_len = 0;
                 st.send_off = 0;
                 w.advance(st);
+                return;
+            }
+
+            if (ud & TAG_POLL != 0) {
+                st.poll_armed = false;
+                w.pollCqe(st, cqe);
                 return;
             }
 
@@ -3932,6 +4013,133 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
             const consumed = w.dispatchHttpSlice(st, st.buf[0..st.len]);
             st.len = $mod.retainTail(&st.buf, st.len, consumed);
             if (!st.ring_dead and st.len == st.buf.len) st.ring_dead = true;
+        }
+
+        // A poll CQE on a socket-BIO TLS conn. Handshake-era CQEs step
+        // SSL_accept; at `.ready` the ctx's ENABLE_KTLS option has already
+        // tried the offload — sslKtlsState reads what the kernel kept.
+        // Offloaded: free the SSL, the conn goes cleartext and advance arms
+        // the buffer pool. Still userspace: the conn lives on poll +
+        // SSL_read/SSL_write, with owed output flushed before new reads —
+        // the same ordering advance() keeps for cleartext.
+        fn pollCqe(w: *@This(), st: *$mod.ConnState, cqe: linux.io_uring_cqe) void {
+            if (st.ring_dead or cqe.res < 0) {
+                w.teardown(st);
+                return;
+            }
+            const revents: u32 = @intCast(cqe.res);
+            if (st.tls_hs) {
+                const mod = @import("root").koru_koru.koru_openssl;
+                switch ($mod.driveTlsHandshake(st)) {
+                    .ready => {
+                        st.tls_hs = false;
+                        if (mod.sslKtlsState(@intCast(st.fd)) == .offloaded) {
+                            // A request pipelined inside the handshake flight
+                            // may already sit decrypted in OpenSSL's buffers —
+                            // freeing the SSL would drop those bytes and hang
+                            // the conn. Drain before the cleartext transition;
+                            // want_read means OpenSSL is holding nothing.
+                            const tls = st.ssl.?;
+                            if (tls.ssl) |s| {
+                                while (st.len < st.buf.len) {
+                                    switch (mod.sslMemRead(s, st.buf[st.len..])) {
+                                        .read => |n| st.len += n,
+                                        else => break,
+                                    }
+                                }
+                                mod.sslFreeNoShutdown(s);
+                            }
+                            tls.allocator.destroy(tls);
+                            st.ssl = null;
+                            st.tls_sockbio = false;
+                            st.ktls_on = true;
+                            if (st.len > 0) w.dispatchReadable(st);
+                            w.advance(st);
+                            return;
+                        }
+                    },
+                    .want_read => {
+                        if (!w.submitPoll(st, @intCast($mod.POLLIN))) w.teardown(st);
+                        return;
+                    },
+                    .want_write => {
+                        if (!w.submitPoll(st, @intCast($mod.POLLIN | $mod.POLLOUT))) w.teardown(st);
+                        return;
+                    },
+                    .failed => {
+                        w.teardown(st);
+                        return;
+                    },
+                }
+            }
+            // Steady state on userspace crypto. Output owed to the cipher
+            // goes first — the queue's ordering is the wire's.
+            if ($mod.pendingLen(st) > 0) {
+                switch ($mod.flushPending(st)) {
+                    .dead => {
+                        w.teardown(st);
+                        return;
+                    },
+                    .stalled => {
+                        if (!w.submitPoll(st, @intCast($mod.POLLIN | $mod.POLLOUT))) w.teardown(st);
+                        return;
+                    },
+                    .drained => {},
+                }
+            }
+            // Error bits without POLLIN still need a read attempt: SSL_read
+            // is how EOF and peer errors surface to the conn at all — skipping
+            // it would re-arm a dead fd's poll forever.
+            if (revents & @as(u32, @intCast($mod.POLLIN | $mod.POLLHUP | $mod.POLLERR | $mod.POLLNVAL)) != 0)
+                w.sockbioRead(st);
+            w.advance(st);
+        }
+
+        // SSL_read until the cipher wants more wire — st.buf fills with
+        // plaintext exactly as a cleartext recv would leave it, so the
+        // shared dispatch sees one shape. sslMemRead is SSL_read with a
+        // count; the name is a leftover from the memory-BIO pump.
+        fn sockbioRead(w: *@This(), st: *$mod.ConnState) void {
+            const mod = @import("root").koru_koru.koru_openssl;
+            const s = st.ssl.?.ssl orelse {
+                st.ring_dead = true;
+                return;
+            };
+            while (st.len < st.buf.len) {
+                switch (mod.sslMemRead(s, st.buf[st.len..])) {
+                    .read => |n| st.len += n,
+                    .want_read => break,
+                    .gone, .failed => {
+                        st.ring_dead = true;
+                        break;
+                    },
+                }
+            }
+            w.dispatchReadable(st);
+        }
+
+        // A socket-BIO conn's next op: queued plaintext through SSL_write,
+        // then a poll arm. There is no send SQE — OpenSSL owns the fd —
+        // so "send in flight" is a stalled flush, not an outstanding CQE.
+        fn advanceSockBio(w: *@This(), st: *$mod.ConnState) void {
+            if ($mod.pendingLen(st) > 0) {
+                switch ($mod.flushPending(st)) {
+                    .dead => {
+                        w.teardown(st);
+                        return;
+                    },
+                    .stalled => {
+                        if (!w.submitPoll(st, @intCast($mod.POLLIN | $mod.POLLOUT))) w.teardown(st);
+                        return;
+                    },
+                    .drained => {},
+                }
+            }
+            if (st.ring_dead or st.len == st.buf.len) {
+                w.teardown(st);
+                return;
+            }
+            if (!w.submitPoll(st, @intCast($mod.POLLIN))) w.teardown(st);
         }
 
         // The request-dispatch loop, source-agnostic: `bytes` may be the
