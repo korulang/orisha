@@ -334,9 +334,13 @@ const orisha_freestanding = koru_builtin.target.os.tag == .freestanding;
 // it, so it cannot be a stack local in requestAllocator.
 threadlocal var request_arena_buf: [64 * 1024]u8 = undefined;
 threadlocal var request_arena_state: std.heap.FixedBufferAllocator = undefined;
+threadlocal var request_arena_started: bool = false;
 
 fn requestAllocator() std.mem.Allocator {
-    request_arena_state = std.heap.FixedBufferAllocator.init(&request_arena_buf);
+    if (!request_arena_started) {
+        request_arena_state = std.heap.FixedBufferAllocator.init(&request_arena_buf);
+        request_arena_started = true;
+    } else request_arena_state.reset();
     return request_arena_state.allocator();
 }
 
