@@ -13,6 +13,13 @@
 #   ./bench-httparena.sh [framework...]     provision, build, gate, measure
 #   ./bench-httparena.sh --keep             leave the pair up afterwards
 #   PROFILES="baseline,pipelined,limited-conn,json-comp" ./bench-httparena.sh
+#   PROFILES="json-tls" ./bench-httparena.sh          # wrk over :8081, not gcannon
+#
+# json-tls swaps the generator for wrk (same invocation as
+# scripts/lib/tools/wrk.sh: -t 64 -c 4096 -d 5s + json-tls-rotate.lua against
+# https://:8081) and additionally samples /proc/net/tls_stat mid-run — whether
+# the kernel's TLS record layer owns the conn is the difference between
+# "TLS is our serializer's overhead" and "TLS is a separate wall".
 #
 # The court refuses to run dirty: before any timing it proves
 #   - exactly ONE process owns the bench port's listeners (SO_REUSEPORT
@@ -50,6 +57,7 @@ profile_spec() {
 	pipelined)    echo "pipeline|4096|16|0" ;;
 	limited-conn) echo "|4096|1|10" ;;
 	json-comp)    echo "json-compressed|4096,16384|1|25" ;;
+	json-tls)     echo "json-tls|4096|1|0" ;;
 	*) fail "unknown profile '$1'" ;;
 	esac
 }
@@ -87,10 +95,17 @@ say "staging HttpArena @ $(cd "$HA_REPO" && git rev-parse --short HEAD)"
 ( cd "$HA_REPO" && tar rf "$STAGE/ha.tar" frameworks/orisha frameworks/orisha-uring 2>/dev/null ) || true
 $SSH "root@$SERVER_PUB" 'mkdir -p /root/bench/ha'
 $SSH "root@$LOAD_PUB"   'mkdir -p /root/bench/ha /root/bench/requests'
-$SCP -q "$STAGE/ha.tar" "root@$SERVER_PUB:/root/bench/ha.tar"
-$SCP -q "$STAGE/ha.tar" "root@$LOAD_PUB:/root/bench/ha.tar"
+# On a reused pair the tar is usually byte-identical — a remote size+sha
+# match skips the 279MB transatlantic push entirely.
+LOCAL_SHA="$(shasum -a 256 "$STAGE/ha.tar" | awk '{print $1}')"
+for ip in "$SERVER_PUB" "$LOAD_PUB"; do
+	remote_sha="$($SSH "root@$ip" 'sha256sum /root/bench/ha.tar 2>/dev/null | cut -d" " -f1')"
+	if [ "$remote_sha" != "$LOCAL_SHA" ]; then
+		$SCP -q "$STAGE/ha.tar" "root@$ip:/root/bench/ha.tar"
+	fi
+done
 $SSH "root@$SERVER_PUB" 'cd /root/bench/ha && tar xf /root/bench/ha.tar'
-$SSH "root@$LOAD_PUB"   'cd /root/bench/ha && tar xf /root/bench/ha.tar && cp requests/*.raw /root/bench/requests/'
+$SSH "root@$LOAD_PUB"   'cd /root/bench/ha && tar xf /root/bench/ha.tar && cp requests/*.raw requests/*.lua /root/bench/requests/'
 
 # ── 3. Build: framework images on the server box, gcannon on the load box ────
 say "building gcannon on the load box"
@@ -98,7 +113,17 @@ $SSH "root@$LOAD_PUB" 'set -e
   command -v docker >/dev/null || { apt-get update -qq && apt-get install -y -qq docker.io >/dev/null; }
   cd /root/bench/ha && docker build -q -t gcannon:latest -f docker/gcannon.Dockerfile docker \
     --build-arg CACHE_BUST='"$(date +%s)"' >/dev/null && docker image inspect gcannon:latest -f "{{.Id}}"'
+
+if [[ ",$PROFILES," == *",json-tls,"* ]]; then
+	say "building wrk on the load box (json-tls generator)"
+	$SSH "root@$LOAD_PUB" 'set -e
+	  cd /root/bench/ha && docker build -q -t wrk:local -f docker/wrk.Dockerfile docker >/dev/null \
+	    && docker image inspect wrk:local -f "{{.Id}}"'
+fi
 $SSH "root@$LOAD_PUB" 'apt-get install -y -qq curl python3 >/dev/null 2>&1 || true'
+if [[ ",$PROFILES," == *",json-tls,"* ]]; then
+	$SSH "root@$SERVER_PUB" 'apt-get install -y -qq linux-perf >/dev/null 2>&1 || apt-get install -y -qq perf >/dev/null 2>&1; command -v perf || ls /usr/bin/perf_* 2>/dev/null | head -1' >/dev/null 2>&1 || true
+fi
 
 say "building framework images on the server box"
 for fw in "${FRAMEWORKS[@]}"; do
@@ -119,6 +144,17 @@ up()   { $SSH "root@$SERVER_PUB" "docker rm -f live >/dev/null 2>&1 || true; \
     -v /root/bench/ha/certs:/certs:ro \
     httparena-$1 >/dev/null"; }
 down() { $SSH "root@$SERVER_PUB" 'docker rm -f live >/dev/null 2>&1' || true; sleep 1; }
+
+# ── kTLS feasibility probe — once, before timing ─────────────────────────────
+# The board court answered "is kTLS live" only indirectly; here we ask the
+# kernel directly. modprobe succeeds iff the host's module dir ships tls.ko —
+# if it loads and TlsCurrTxSw still reads zero during a run, the install path
+# itself is what never engages.
+if [[ ",$PROFILES," == *",json-tls,"* ]]; then
+	say "kTLS probe on the server box"
+	$SSH "root@$SERVER_PUB" 'modprobe tls 2>&1; echo "modprobe_rc=$?"; ls /proc/net/tls_stat 2>/dev/null || echo "tls_stat absent after modprobe"; lsmod | grep -i "^tls" || true' \
+		| tee "$OUT/ktls-probe.txt"
+fi
 
 court_check() { # framework -> refuses (exit 1) unless the court is clean
 	local fw="$1" i
@@ -151,6 +187,33 @@ court_check() { # framework -> refuses (exit 1) unless the court is clean
 	  'http://$SERVER_PRIV:$PORT/json/25?m=4' | gzip -dc | python3 -c 'import json,sys; json.load(sys.stdin)'" \
 		|| { echo "GATE|$fw|FAIL /json/25?m=4 did not return inflating JSON"; return 1; }
 	echo "GATE|$fw|correctness=200+gzip+json over $SERVER_PRIV"
+	if [[ ",$PROFILES," == *",json-tls,"* ]]; then
+		# the TLS port is part of the measured surface — same owner, same pid
+		local tpids
+		tpids="$($SSH "root@$SERVER_PUB" "ss -tlnp 'sport = :8081' | grep -oP 'pid=\K[0-9]+' | sort -u")"
+		[ "$tpids" = "$pid" ] \
+			|| { echo "GATE|$fw|FAIL :8081 owned by pids: $(echo "$tpids" | tr '\n' ' ')"; return 1; }
+		local tready=0 ti
+		for ti in $(seq 1 8); do
+			if $SSH "root@$LOAD_PUB" "curl -skf --max-time 10 \
+			  --resolve 'bench.localhost:8081:$SERVER_PRIV' \
+			  'https://bench.localhost:8081/json/25?m=4' | python3 -c 'import json,sys; json.load(sys.stdin)'" 2>/dev/null; then
+				tready=1; break
+			fi
+			sleep 1.5
+		done
+		if [ "$tready" != 1 ]; then
+			$SSH "root@$LOAD_PUB" "curl -skv --max-time 10 \
+			  --resolve 'bench.localhost:8081:$SERVER_PRIV' \
+			  'https://bench.localhost:8081/json/25?m=4' -o /dev/null 2>&1 | tail -15" \
+				2>/dev/null | sed "s/^/GATE|$fw|curl|/"
+			$SSH "root@$SERVER_PUB" 'docker logs --tail 15 live 2>&1' \
+				| sed "s/^/GATE|$fw|logs|/"
+			echo "GATE|$fw|FAIL https /json/25?m=4 not valid JSON after 8 tries"
+			return 1
+		fi
+		echo "GATE|$fw|tls=8081 same pid, https+200+json verified"
+	fi
 	return 0
 }
 
@@ -186,6 +249,13 @@ say "timing: ${RUNNERS[*]}"
 
 parse_rps() { sed -n 's/.*2xx=\([0-9][0-9]*\).*/\1/p' <<<"$1" | head -1; }
 parse_dur() { sed -n 's/.*requests in \([0-9.]*\).*/\1/p' <<<"$1" | head -1; }
+# wrk: "Requests/sec:  36323.61" — and "Socket errors: connect 0, read 0,
+# write 0, timeout 0" plus optional "Non-2xx or 3xx responses: N"
+parse_wrk_rps() { sed -n 's/ *Requests\/sec: *\([0-9.]*\).*/\1/p' <<<"$1" | head -1; }
+parse_wrk_errs() {
+	sed -n 's/.*Socket errors: connect \([0-9]*\), read \([0-9]*\), write \([0-9]*\), timeout \([0-9]*\).*/\1 \2 \3 \4/p' \
+		<<<"$1" | awk '{s=0; for(i=1;i<=NF;i++) s+=$i; print s}'
+}
 
 IFS=',' read -ra PROF_ARR <<<"$PROFILES"
 for p in "${PROF_ARR[@]}"; do
@@ -196,22 +266,49 @@ for p in "${PROF_ARR[@]}"; do
 			for fw in "${RUNNERS[@]}"; do
 				up "$fw"; sleep 4
 				s0=$(steal "$SERVER_PUB"); s_stat=($(cpustat "$SERVER_PUB")); l_stat=($(cpustat "$LOAD_PUB"))
-				args="$(gcannon_args "$ep" "$conns" "$pipe" "$rpc")"
-				out="$($SSH "root@$LOAD_PUB" "timeout 90 docker run --rm --network host --security-opt seccomp=unconfined \
-				  --ulimit memlock=-1:-1 --ulimit nofile=1048576:1048576 \
-				  -v $REQ_DIR:$REQ_DIR:ro \
-				  gcannon:latest $args" 2>&1)"
-				s1=$(steal "$SERVER_PUB"); s_stat2=($(cpustat "$SERVER_PUB")); l_stat2=($(cpustat "$LOAD_PUB"))
-				scpu=$(busy_pct "${s_stat[@]}" "${s_stat2[@]}"); lcpu=$(busy_pct "${l_stat[@]}" "${l_stat2[@]}")
-				ok=$(parse_rps "$out"); dur_s=$(parse_dur "$out")
-				rps="$(awk -v ok="${ok:-0}" -v d="${dur_s:-1}" 'BEGIN{printf "%d", ok/d}')"
-				err4=$(sed -n 's/.*4xx=\([0-9][0-9]*\).*/\1/p' <<<"$out" | head -1)
-				err5=$(sed -n 's/.*5xx=\([0-9][0-9]*\).*/\1/p' <<<"$out" | head -1)
-				errs=$(( ${err4:-0} + ${err5:-0} ))
-				flag=""; [ "${lcpu:-0}" -gt 92 ] && flag="LOADBOUND"
-				echo "RESULT|$fw|$p|c$conns|r$r|rps=$rps|2xx=${ok:-0}|errs=$errs|servercpu=${scpu:-?}|loadcpu=${lcpu:-?}|steal=$((s1-s0))${flag:+|$flag}" \
-					| tee -a "$OUT/raw.txt"
-				echo "$out" >> "$OUT/gcannon-$fw-$p-c$conns-r$r.log"
+				if [ "$ep" = "json-tls" ]; then
+					# mid-run kTLS census: does the kernel own the record layer,
+					# or is every byte still paying the mem-BIO toll?
+					ktlsfile="$OUT/tlsstat-$fw-r$r.txt"
+					( $SSH "root@$SERVER_PUB" 'sleep 3; cat /proc/net/tls_stat 2>/dev/null || echo NO_TLS_STAT' >"$ktlsfile" ) &
+					( $SSH "root@$SERVER_PUB" 'PERF=$(command -v perf || ls /usr/bin/perf_* 2>/dev/null | head -1); [ -n "$PERF" ] || { echo NO_PERF; exit 0; }; sleep 1; pid=$(docker inspect live -f "{{.State.Pid}}"); "$PERF" record -F 199 -g -p "$pid" -o /tmp/perf.$$ -- sleep 3 >/dev/null 2>&1 && "$PERF" report -i /tmp/perf.$$ --stdio 2>/dev/null | head -45; rm -f /tmp/perf.$$' >"$OUT/perf-$fw-r$r.txt" ) &
+					out="$($SSH "root@$LOAD_PUB" "timeout 90 docker run --rm --network host \
+					  --ulimit nofile=1048576:1048576 \
+					  --add-host bench.localhost:$SERVER_PRIV \
+					  -v $REQ_DIR:$REQ_DIR:ro \
+					  wrk:local -t $THREADS -c $conns -d $DUR \
+					  -s $REQ_DIR/json-tls-rotate.lua https://bench.localhost:8081" 2>&1)"
+					wait
+					rps="$(parse_wrk_rps "$out")"; rps="${rps%%.*}"
+					ok=$(sed -n 's/.* \([0-9][0-9]*\) requests in .*/\1/p' <<<"$out" | head -1)
+					sockerrs="$(parse_wrk_errs "$out")"
+					non2xx=$(sed -n 's/.*Non-2xx or 3xx responses: \([0-9]*\).*/\1/p' <<<"$out" | head -1)
+					errs=$(( ${sockerrs:-0} + ${non2xx:-0} ))
+					ktls=$(awk '/TlsCurrTxSw/{print $NF}' "$ktlsfile" 2>/dev/null | head -1)
+					s1=$(steal "$SERVER_PUB"); s_stat2=($(cpustat "$SERVER_PUB")); l_stat2=($(cpustat "$LOAD_PUB"))
+					scpu=$(busy_pct "${s_stat[@]}" "${s_stat2[@]}"); lcpu=$(busy_pct "${l_stat[@]}" "${l_stat2[@]}")
+					flag=""; [ "${lcpu:-0}" -gt 92 ] && flag="LOADBOUND"
+					echo "RESULT|$fw|$p|c$conns|r$r|rps=${rps:-0}|2xx=${ok:-0}|errs=$errs|servercpu=${scpu:-?}|loadcpu=${lcpu:-?}|steal=$((s1-s0))|ktls_tx=${ktls:-none}${flag:+|$flag}" \
+						| tee -a "$OUT/raw.txt"
+					echo "$out" >> "$OUT/wrk-$fw-$p-c$conns-r$r.log"
+				else
+					args="$(gcannon_args "$ep" "$conns" "$pipe" "$rpc")"
+					out="$($SSH "root@$LOAD_PUB" "timeout 90 docker run --rm --network host --security-opt seccomp=unconfined \
+					  --ulimit memlock=-1:-1 --ulimit nofile=1048576:1048576 \
+					  -v $REQ_DIR:$REQ_DIR:ro \
+					  gcannon:latest $args" 2>&1)"
+					s1=$(steal "$SERVER_PUB"); s_stat2=($(cpustat "$SERVER_PUB")); l_stat2=($(cpustat "$LOAD_PUB"))
+					scpu=$(busy_pct "${s_stat[@]}" "${s_stat2[@]}"); lcpu=$(busy_pct "${l_stat[@]}" "${l_stat2[@]}")
+					ok=$(parse_rps "$out"); dur_s=$(parse_dur "$out")
+					rps="$(awk -v ok="${ok:-0}" -v d="${dur_s:-1}" 'BEGIN{printf "%d", ok/d}')"
+					err4=$(sed -n 's/.*4xx=\([0-9][0-9]*\).*/\1/p' <<<"$out" | head -1)
+					err5=$(sed -n 's/.*5xx=\([0-9][0-9]*\).*/\1/p' <<<"$out" | head -1)
+					errs=$(( ${err4:-0} + ${err5:-0} ))
+					flag=""; [ "${lcpu:-0}" -gt 92 ] && flag="LOADBOUND"
+					echo "RESULT|$fw|$p|c$conns|r$r|rps=$rps|2xx=${ok:-0}|errs=$errs|servercpu=${scpu:-?}|loadcpu=${lcpu:-?}|steal=$((s1-s0))${flag:+|$flag}" \
+						| tee -a "$OUT/raw.txt"
+					echo "$out" >> "$OUT/gcannon-$fw-$p-c$conns-r$r.log"
+				fi
 				down
 			done
 		done
