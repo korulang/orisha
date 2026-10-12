@@ -190,6 +190,17 @@ pub tor fd { req: *Request } -> usize
 pub tor ws-accept { req: *Request } -> ?string
 
 // ============================================================================
+// GENERATION-BUMP — the page cache's invalidation signal
+// ============================================================================
+// A GET 200 whose Response sets `cacheable` is stored post-render (keyed on
+// method + target + cookie + host + negotiated encoding) and hits skip
+// dispatch. One bump retires every stored page — call it from the write
+// paths the pages must reflect. Pages never decide this themselves: the
+// app knows which writes matter, the cache only keeps the ledger.
+
+pub tor generation-bump {}
+
+// ============================================================================
 // PLATFORM SELECTION
 // ============================================================================
 // One line per platform. The pump is what changes; serve never does.
