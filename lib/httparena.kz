@@ -18,8 +18,285 @@ threadlocal var gz_strm_init = false;
 threadlocal var gz_buf: []u8 = &.{};
 threadlocal var json_scratch: []u8 = &.{};
 
+// Fast gzip for small bodies: greedy LZ over a single-probe hash table,
+// fixed-Huffman coding, one final block. Several times faster than driving
+// zlib for dynamic-response bodies — no stream state, no dynamic trees, no
+// matcher, emission through precomputed bit-reversed tables into a 64-bit
+// accumulator. Ported from zix's src/utils/compression/flate_fast.zig; the
+// output is ordinary RFC 1952 gzip, every decoder accepts it.
+// Freestanding has no zlib to cImport — this path needs nothing but Zig, so
+// the unikernel compresses for real instead of answering identity.
+const FF_HASH_BITS = 13;
+const FF_HASH_SIZE = 1 << FF_HASH_BITS;
+const FF_MIN_MATCH = 4;
+const FF_MAX_MATCH = 258;
+const FF_INPUT_CAP = 65535;
+const FF_WRAP_SLACK = 64;
+
+fn gzipFastBound(input_len: usize) usize {
+    return input_len + input_len / 8 + FF_WRAP_SLACK;
+}
+
+fn bitReverse(value: u16, bits: u4) u16 {
+    var out: u16 = 0;
+    var i: u4 = 0;
+    while (i < bits) : (i += 1) {
+        out = (out << 1) | ((value >> @intCast(i)) & 1);
+    }
+    return out;
+}
+
+const FfLitCode = struct { code: u16, bits: u4 };
+
+// Fixed-Huffman literal codes (RFC 1951 3.2.6), bit-reversed for LSB-first
+// emission: 0-143 are 8-bit codes from 0x30, 144-255 are 9-bit from 0x190.
+const ff_lit_codes = blk: {
+    @setEvalBranchQuota(20000);
+    var table: [256]FfLitCode = undefined;
+    for (0..144) |lit| {
+        table[lit] = .{ .code = bitReverse(0x30 + @as(u16, @intCast(lit)), 8), .bits = 8 };
+    }
+    for (144..256) |lit| {
+        table[lit] = .{ .code = bitReverse(0x190 + @as(u16, @intCast(lit - 144)), 9), .bits = 9 };
+    }
+    break :blk table;
+};
+
+const FfLenCode = struct { pattern: u32, bits: u6 };
+
+// Length 3..258 to its full bit pattern: the length symbol's fixed code
+// (symbols 257-279 are 7-bit, 280-285 8-bit) with the extra bits appended.
+const ff_len_codes = blk: {
+    @setEvalBranchQuota(100000);
+    const bases = [_]u16{ 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258 };
+    const extras = [_]u4{ 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0 };
+    var table: [FF_MAX_MATCH + 1]FfLenCode = undefined;
+    for (3..FF_MAX_MATCH + 1) |len| {
+        var symbol_index: usize = 0;
+        for (bases, 0..) |base, idx| {
+            if (len >= base and (idx == bases.len - 1 or len < bases[idx + 1])) symbol_index = idx;
+        }
+        const symbol = 257 + symbol_index;
+        var code: u16 = undefined;
+        var code_bits: u4 = undefined;
+        if (symbol <= 279) {
+            code = bitReverse(@intCast(symbol - 256), 7);
+            code_bits = 7;
+        } else {
+            code = bitReverse(@intCast(0xC0 + (symbol - 280)), 8);
+            code_bits = 8;
+        }
+        const extra_val: u32 = @intCast(len - bases[symbol_index]);
+        table[len] = .{
+            .pattern = @as(u32, code) | (extra_val << code_bits),
+            .bits = @as(u6, code_bits) + extras[symbol_index],
+        };
+    }
+    break :blk table;
+};
+
+const FfDistCode = struct { pattern: u32, bits: u6 };
+
+fn ffDistEntry(dist: u16) FfDistCode {
+    const bases = [_]u16{ 1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577 };
+    const extras = [_]u4{ 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13 };
+    var symbol: usize = 0;
+    for (bases, 0..) |base, idx| {
+        if (dist >= base and (idx == bases.len - 1 or dist < bases[idx + 1])) symbol = idx;
+    }
+    const code = bitReverse(@intCast(symbol), 5);
+    const extra_val: u32 = dist - bases[symbol];
+    return .{
+        .pattern = @as(u32, code) | (extra_val << 5),
+        .bits = 5 + @as(u6, extras[symbol]),
+    };
+}
+
+// Distances 1..256 fully precomputed.
+const ff_dist_lo = blk: {
+    @setEvalBranchQuota(200000);
+    var table: [257]FfDistCode = undefined;
+    for (1..257) |dist| table[dist] = ffDistEntry(@intCast(dist));
+    table[0] = .{ .pattern = 0, .bits = 0 };
+    break :blk table;
+};
+
+const FfDistSlot = struct { code: u16, base: u16, extra_bits: u6 };
+
+// Above distance 256 every fixed-code range is at least 128 wide, so each
+// 128-wide slot maps to exactly one symbol. The slot stores code, base, and
+// extra width, the runtime part is one subtract and one shift.
+const ff_dist_hi = blk: {
+    @setEvalBranchQuota(200000);
+    const bases = [_]u16{ 1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577 };
+    const extras = [_]u4{ 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13 };
+    var table: [256]FfDistSlot = undefined;
+    for (0..256) |slot| {
+        const dist: u16 = (@as(u16, @intCast(slot)) << 7) + 1;
+        var symbol: usize = 0;
+        for (bases, 0..) |base, idx| {
+            if (dist >= base and (idx == bases.len - 1 or dist < bases[idx + 1])) symbol = idx;
+        }
+        table[slot] = .{
+            .code = bitReverse(@intCast(symbol), 5),
+            .base = bases[symbol],
+            .extra_bits = extras[symbol],
+        };
+    }
+    break :blk table;
+};
+
+fn ffDistCode(dist: u16) FfDistCode {
+    if (dist < 257) return ff_dist_lo[dist];
+    const slot = ff_dist_hi[(dist - 1) >> 7];
+    return .{
+        .pattern = @as(u32, slot.code) | (@as(u32, dist - slot.base) << 5),
+        .bits = 5 + slot.extra_bits,
+    };
+}
+
+const FfBitWriter = struct {
+    bit_acc: u64 = 0,
+    bit_count: u6 = 0,
+    out: [*]u8,
+    start: [*]u8,
+
+    inline fn put(self: *FfBitWriter, pattern: u32, bits: u6) void {
+        self.bit_acc |= @as(u64, pattern) << self.bit_count;
+        self.bit_count += bits;
+        if (self.bit_count >= 32) {
+            std.mem.writeInt(u32, self.out[0..4], @truncate(self.bit_acc), .little);
+            self.out += 4;
+            self.bit_acc >>= 32;
+            self.bit_count -= 32;
+        }
+    }
+
+    fn finishByteAlign(self: *FfBitWriter) void {
+        while (self.bit_count > 0) {
+            self.out[0] = @truncate(self.bit_acc);
+            self.out += 1;
+            self.bit_acc >>= 8;
+            self.bit_count = if (self.bit_count >= 8) self.bit_count - 8 else 0;
+        }
+    }
+
+    fn written(self: *const FfBitWriter) usize {
+        return @intFromPtr(self.out) - @intFromPtr(self.start);
+    }
+};
+
+// Per-worker hash head table, epoch-tagged instead of cleared: entries are
+// u32 where the low 17 bits hold position+1 and the high 15 the call's
+// epoch. A stale slot can never decode to a live position in this call, so
+// the table is never memset — zlib's stream-reset does no equivalent work,
+// and at 1M+ req/s a 16 KiB clear per request is a measurable share of the
+// encode. Wraparound (every ~32K calls) is the one place the memset returns.
+threadlocal var ff_head: [FF_HASH_SIZE]u32 = std.mem.zeroes([FF_HASH_SIZE]u32);
+threadlocal var ff_epoch: u32 = 0;
+
+inline fn ffHash4(word: u32) u16 {
+    return @intCast((word *% 0x9E3779B1) >> (32 - FF_HASH_BITS));
+}
+
+// Compress src as one gzip member into dst; dst must hold gzipFastBound(src.len).
+fn gzipFastInto(src: []const u8, dst: []u8) usize {
+    const header = [_]u8{ 0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0, 0x03 };
+    @memcpy(dst[0..header.len], &header);
+    ff_epoch = (ff_epoch + 1) & 0x7FFF;
+    if (ff_epoch == 0) {
+        @memset(&ff_head, 0);
+        ff_epoch = 1;
+    }
+    const epoch_tag = ff_epoch << 17;
+
+    var bit_writer = FfBitWriter{ .out = dst.ptr + header.len, .start = dst.ptr + header.len };
+    bit_writer.put(0b011, 3);
+
+    var pos: usize = 0;
+    const limit = if (src.len >= FF_MIN_MATCH) src.len - FF_MIN_MATCH + 1 else 0;
+    while (pos < limit) {
+        const word = std.mem.readInt(u32, src[pos..][0..4], .little);
+        const slot = ffHash4(word);
+        const candidate = ff_head[slot];
+        ff_head[slot] = epoch_tag | @as(u32, @intCast(pos + 1));
+
+        if (candidate >= epoch_tag) {
+            const candidate_pos = candidate - epoch_tag - 1;
+            // DEFLATE's window is 32768: a farther candidate is not encodable.
+            if (pos - candidate_pos <= 32768 and
+                std.mem.readInt(u32, src[candidate_pos..][0..4], .little) == word)
+            {
+                var len: usize = FF_MIN_MATCH;
+                const max_len = @min(FF_MAX_MATCH, src.len - pos);
+                while (len + 8 <= max_len) {
+                    const ahead = std.mem.readInt(u64, src[pos + len ..][0..8], .little);
+                    const behind = std.mem.readInt(u64, src[candidate_pos + len ..][0..8], .little);
+                    const diff = ahead ^ behind;
+                    if (diff != 0) {
+                        len += @ctz(diff) / 8;
+                        break;
+                    }
+                    len += 8;
+                } else {
+                    while (len < max_len and src[pos + len] == src[candidate_pos + len]) len += 1;
+                }
+                if (len > max_len) len = max_len;
+
+                const len_entry = ff_len_codes[len];
+                bit_writer.put(len_entry.pattern, len_entry.bits);
+                const dist_entry = ffDistCode(@intCast(pos - candidate_pos));
+                bit_writer.put(dist_entry.pattern, dist_entry.bits);
+
+                var insert_pos = pos + 1;
+                const insert_end = @min(pos + len, limit);
+                while (insert_pos < insert_end) : (insert_pos += 2) {
+                    ff_head[ffHash4(std.mem.readInt(u32, src[insert_pos..][0..4], .little))] = epoch_tag | @as(u32, @intCast(insert_pos + 1));
+                }
+
+                pos += len;
+                continue;
+            }
+        }
+
+        const lit = ff_lit_codes[src[pos]];
+        bit_writer.put(lit.code, lit.bits);
+        pos += 1;
+    }
+
+    while (pos < src.len) : (pos += 1) {
+        const lit = ff_lit_codes[src[pos]];
+        bit_writer.put(lit.code, lit.bits);
+    }
+
+    bit_writer.put(0, 7);
+    bit_writer.finishByteAlign();
+
+    const deflate_len = bit_writer.written();
+    const tail = dst.ptr + header.len + deflate_len;
+    const crc = std.hash.Crc32.hash(src);
+    std.mem.writeInt(u32, tail[0..4], crc, .little);
+    std.mem.writeInt(u32, tail[4..8], @intCast(src.len), .little);
+
+    return header.len + deflate_len + 8;
+}
+
 fn gzipBody(allocator: std.mem.Allocator, content: []const u8) ?[]u8 {
-    if (ha_freestanding) return null;
+    // The fixed-Huffman encoder is the freestanding path — there is no zlib
+    // to cImport there. On hosted it measured slower than zlib end to end
+    // (its fixed codes emit ~17% more wire bytes on repeated-key JSON than
+    // zlib's dynamic blocks, and the extra bytes cost more than the encode
+    // saves), so hosted keeps zlib and this stays the unikernel's encoder.
+    if (ha_freestanding) {
+        if (content.len >= FF_INPUT_CAP) return null;
+        const need = gzipFastBound(content.len);
+        if (gz_buf.len < need) {
+            const nb = allocator.alloc(u8, need) catch return null;
+            if (gz_buf.len > 0) allocator.free(gz_buf);
+            gz_buf = nb;
+        }
+        return gz_buf[0..gzipFastInto(content, gz_buf)];
+    }
     if (!gz_strm_init) {
         if (ha_zlib.deflateInit2(&gz_strm, ha_zlib.Z_BEST_SPEED, ha_zlib.Z_DEFLATED, 15 + 16, 8, ha_zlib.Z_DEFAULT_STRATEGY) != ha_zlib.Z_OK) return null;
         gz_strm_init = true;
