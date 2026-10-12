@@ -37,6 +37,18 @@ saturated send paths pay the encode, saturated ones pay the bytes.
 The open question narrows to which regime the board's rate sits in —
 that is a droplet measurement, not a principle.
 
+2026-10-12 later — droplet answered. Same box (DO c-4, Debian 13,
+HttpArena upstream harness, best-of-3): orisha-uring at `gzipIntoFast`
+ran json-comp 64,728 req/s (4096c) and 72,520 (16384c); the identical
+image with the dial flipped to `gzipInto` ran 35,364 and 37,525. Fast
+wins by ~85% at board rate — the byte tax did not materialize where
+the original race said it should. The regimes are real on both ends:
+the send path has slack at ~70K req/s on 4 dedicated cores, and the
+earlier arm64 ~1M req/s measurement remains the saturated counterpoint.
+The regime threshold sits between them. For this benchmark class the
+dial stays at fast; the belief keeps its caution for the regime where
+send bytes actually saturate.
+
 ## Related
 
 - frag-serialize-the-invariant-render-the-variant — the sibling belief
