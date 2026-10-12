@@ -23,9 +23,21 @@ targets don't advertise `.crc`), and on native aarch64 the spelling
 doesn't compile at all: Zig's `r` constraint binds GPR64, `crc32x`
 needs w-registers, and 0.15.2's asm grammar has no width modifier.
 The win was slicing-by-8 alone, on every target, from the start.
-The arm was removed when the encoder lifted into `std/compress`;
-pmull folding — what zlib actually uses on aarch64 — remains the
-unbuilt hardware path.
+The arm was removed when the encoder lifted into `std/compress`.
+
+Second correction, same day (2026-10-12): pmull folding is no longer
+unbuilt — it landed and it was the last reason zlib won anywhere. A
+component race after multi-block showed the owned encoder slower on
+15-80KB compressible bodies (0.8-0.9x); the per-KB CRC table walk
+(0.44µs/KB, ~19% of the call at 81KB) was again the whole deficit.
+`pmull`/`pmull2` DO compile under Zig's `w` constraint (SIMD regs) —
+only the scalar crc32x accumulator was unspellable. The Gopal/Ozturk
+fold via Chromium's constants, bitwise-verified against the table
+path across ~2700 sizes: 0.44µs/KB -> 0.03µs/KB. Re-raced per call,
+the owned encoder now beats zlib on every shape measured (1.02x on
+81KB compressible, 1.9x at 1.8KB, 3.4x on repetitive 1MB) with
+tighter output on all of them. x86 PCLMUL remains unbuilt — on
+non-aes targets the trailer still walks the table.
 
 Two beliefs this hardens. The world model's cheapest instrument is the
 one that isolates the claim: end-to-end races can rank two systems but
