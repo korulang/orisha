@@ -271,7 +271,7 @@ for p in "${PROF_ARR[@]}"; do
 					# or is every byte still paying the mem-BIO toll?
 					ktlsfile="$OUT/tlsstat-$fw-r$r.txt"
 					( $SSH "root@$SERVER_PUB" 'sleep 3; cat /proc/net/tls_stat 2>/dev/null || echo NO_TLS_STAT' >"$ktlsfile" ) &
-					( $SSH "root@$SERVER_PUB" 'PERF=$(command -v perf || ls /usr/bin/perf_* 2>/dev/null | head -1); [ -n "$PERF" ] || { echo NO_PERF; exit 0; }; sleep 1; pid=$(docker inspect live -f "{{.State.Pid}}"); "$PERF" record -F 199 -g -p "$pid" -o /tmp/perf.$$ -- sleep 3 >/dev/null 2>&1 && "$PERF" report -i /tmp/perf.$$ --stdio 2>/dev/null | head -45; rm -f /tmp/perf.$$' >"$OUT/perf-$fw-r$r.txt" ) &
+					( $SSH "root@$SERVER_PUB" 'PERF=$(command -v perf || ls /usr/bin/perf_* 2>/dev/null | head -1); [ -n "$PERF" ] || { echo NO_PERF; exit 0; }; sleep 1; pid=$(docker inspect live -f "{{.State.Pid}}"); "$PERF" record -F 199 -g -p "$pid" -o /tmp/perf.$$ -- sleep 3 >/dev/null 2>&1 && "$PERF" report -i /tmp/perf.$$ --stdio 2>/dev/null | head -160; rm -f /tmp/perf.$$' >"$OUT/perf-$fw-r$r.txt" ) &
 					out="$($SSH "root@$LOAD_PUB" "timeout 90 docker run --rm --network host \
 					  --ulimit nofile=1048576:1048576 \
 					  --add-host bench.localhost:$SERVER_PRIV \
