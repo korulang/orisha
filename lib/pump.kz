@@ -3282,6 +3282,39 @@ fn workerCount() usize {
 // to sit between the wire and the parser attaches at that harvest below, not at
 // a call site.
 
+// Bounded batch wait: enter once, come back with up to wait_nr completions or
+// at the deadline, whichever lands first. `submit_and_wait(1)` parks on the
+// FIRST completion, so a hot worker pays one enter per CQE; a bounded wait
+// amortizes enters across the batch the same way the CQE drain amortizes
+// dispatch. The deadline must ride inside the wait (IORING_ENTER_EXT_ARG,
+// kernel 5.11+) — an IORING_OP_TIMEOUT SQE's clock starts at submission, not
+// at the wait, so a deadline that expires before the wait begins becomes part
+// of the sample the wakeup is judged against: a hang, not a late wakeup. TIME
+// is a normal short batch, not an error — the caller reaps whatever landed.
+fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !void {
+    const linux = std.os.linux;
+    const deadline: linux.kernel_timespec = .{ .sec = 0, .nsec = timeout_ns };
+    const wait_arg: linux.io_uring_getevents_arg = .{
+        .sigmask = 0,
+        .sigmask_sz = 0,
+        .pad = 0,
+        .ts = @intFromPtr(&deadline),
+    };
+    const res = linux.syscall6(
+        .io_uring_enter,
+        @as(usize, @intCast(ring.fd)),
+        ring.flush_sq(),
+        wait_nr,
+        linux.IORING_ENTER_GETEVENTS | linux.IORING_ENTER_EXT_ARG,
+        @intFromPtr(&wait_arg),
+        @sizeOf(linux.io_uring_getevents_arg),
+    );
+    switch (linux.E.init(res)) {
+        .SUCCESS, .TIME => {},
+        else => return error.RingWaitFailed,
+    }
+}
+
 ~proc drive|io-uring {
     if ($mod.maybeStartTls(tls_port, cert_path, key_path)) |err_msg| {
         return .{ .failed = err_msg };
@@ -3321,6 +3354,11 @@ fn workerCount() usize {
         const TAG_SEND: u64 = 1;
         const CQE_BATCH = 512;
         const SUBMIT_STRIDE = 16; // push staged SQEs every N completions in a deep batch
+        // Coalesced completion wait: a hot worker asks for up to this many
+        // CQEs per enter so wakeups amortize; the deadline bounds how long a
+        // short batch may be held — far below a request round trip.
+        const WAIT_COALESCE_MAX: u32 = 32;
+        const WAIT_COALESCE_NS: i64 = 20_000;
 
         ring: linux.IoUring,
         listen_fd: $mod.posix.fd_t,
@@ -4056,9 +4094,19 @@ fn workerCount() usize {
                 };
             }
 
+            // Bounded waits need IORING_FEAT_EXT_ARG (kernel 5.11+); without
+            // it the only safe bound is one completion, so coalescing stays
+            // off and every wait is the plain single-CQE park.
+            const coalesce_max: u32 = if (w.ring.features & linux.IORING_FEAT_EXT_ARG != 0) WAIT_COALESCE_MAX else 1;
+
+            var wait_nr: u32 = 1;
             var cqes: [CQE_BATCH]linux.io_uring_cqe = undefined;
             while (true) {
-                _ = w.ring.submit_and_wait(1) catch continue;
+                if (wait_nr > 1) {
+                    $mod.ringWaitTimeout(&w.ring, wait_nr, WAIT_COALESCE_NS) catch continue;
+                } else {
+                    _ = w.ring.submit_and_wait(1) catch continue;
+                }
                 const got = w.ring.copy_cqes(&cqes, 0) catch continue;
                 @import("root").koru_orisha.stampHttpDateLine();
                 var i: usize = 0;
@@ -4067,6 +4115,11 @@ fn workerCount() usize {
                     if (i % SUBMIT_STRIDE == 0) _ = w.ring.submit() catch {};
                     w.handleCqe(cqe);
                 }
+                // Ride the size of the last drain: a deep batch means more
+                // completions are already in flight, so the next enter can
+                // afford to wait for several; a shallow one decays back to
+                // single-completion waits within a pass.
+                wait_nr = @min(@max(@as(u32, @intCast(got / 2)), 1), coalesce_max);
             }
         }
     };
