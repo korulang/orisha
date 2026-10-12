@@ -7,6 +7,7 @@
 import orisha
 import std/io
 import std/build
+import std/compress
 
 std/build:requires {
     exe.linkSystemLibrary("z");
@@ -20,6 +21,12 @@ orisha:handler = orisha:router(req)
 ! [*] -> { status: 404, body: "not found", content_type: "text/plain" }
 
 // Cleartext for local wrk / baseline+pipeline+json-comp. Board Dockerfile sed-adds TLS for json-tls.
+// std/compress warmup: pulls the module into the program and bakes the
+// first dynamic tree before the first request pays for it.
+std/compress:gzip(data: "warmup")
+| compressed c |> std/io:print.ln("compress ready")
+| error e |> std/io:print.ln("compress failed")
+
 orisha:serve(port: 8080)
 | shutdown s |> std/io:print.ln(s)
 | failed f |> std/io:print.ln("failed: {{ f:s }}")

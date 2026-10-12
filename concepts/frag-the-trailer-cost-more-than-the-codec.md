@@ -12,10 +12,20 @@ of the encoder's 29µs on an 8KB body. The codec itself was 8µs. zlib's
 14.5µs includes its own hardware CRC; ours wrapped a world-class match
 in a reference-grade checksum.
 
-Swapping in ARM `crc32x` inline asm (comptime-gated on the target
-feature, slicing-by-8 tables elsewhere) took the call to 12.6µs —
-faster than zlib, with tighter output. The interleaved race flipped:
-the owned encoder won 4/6 rounds, +9% on totals.
+Swapping the byte-table walk for a slicing-by-8 table took the call
+to 12.6µs — faster than zlib, with tighter output. The interleaved
+race flipped: the owned encoder won 4/6 rounds, +9% on totals.
+
+Correction (2026-10-12): an earlier draft of this frag credited ARM
+`crc32x` inline asm. That arm never ran anywhere — every build that
+produced the 12.6µs number resolved `ff_hw_crc` false (baseline cpu
+targets don't advertise `.crc`), and on native aarch64 the spelling
+doesn't compile at all: Zig's `r` constraint binds GPR64, `crc32x`
+needs w-registers, and 0.15.2's asm grammar has no width modifier.
+The win was slicing-by-8 alone, on every target, from the start.
+The arm was removed when the encoder lifted into `std/compress`;
+pmull folding — what zlib actually uses on aarch64 — remains the
+unbuilt hardware path.
 
 Two beliefs this hardens. The world model's cheapest instrument is the
 one that isolates the claim: end-to-end races can rank two systems but
