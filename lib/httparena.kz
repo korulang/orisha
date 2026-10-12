@@ -15,17 +15,22 @@ threadlocal var gz_buf: []u8 = &.{};
 threadlocal var json_scratch: []u8 = &.{};
 
 fn gzipBody(allocator: std.mem.Allocator, content: []const u8) ?[]u8 {
-    // std/compress is the whole path on every target: dynamic Huffman with
-    // a per-worker cached tree, slicing-by-8 CRC trailer, tighter output
-    // than zlib at BEST_SPEED and a faster encode measured both per-call
-    // and end-to-end.
+    // std/compress is the whole path on every target. The dial here is
+    // honest, not decided: gzipIntoFast cuts the encode ~2.2x on this
+    // body shape (fixed Huffman, single pass) but emits ~26% more wire
+    // bytes — and output bytes are send bytes. An earlier interleaved
+    // race at ~1M req/s (frag-a-faster-encoder-can-lose-to-a-tighter-one)
+    // showed fixed codes LOSING to a tighter stream once the send path
+    // saturated; a same-box c256 A/B today leans the other way (+5-12%).
+    // The answer is regime-dependent; the droplet's rates decide it.
+    // If the board says bytes win, this call flips back to gzipInto.
     const need = ha_compress.gzipBound(content.len);
     if (gz_buf.len < need) {
         const nb = allocator.alloc(u8, need) catch return null;
         if (gz_buf.len > 0) allocator.free(gz_buf);
         gz_buf = nb;
     }
-    return gz_buf[0..ha_compress.gzipInto(content, gz_buf)];
+    return gz_buf[0..ha_compress.gzipIntoFast(content, gz_buf)];
 }
 
 const orisha = @import("root").koru_orisha;

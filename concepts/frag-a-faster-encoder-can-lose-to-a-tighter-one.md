@@ -24,6 +24,19 @@ The encoder still earned its keep exactly where the trade doesn't
 apply: freestanding has no zlib to cImport, so `flate_fast` is the
 unikernel's only compressor — identity responses became real gzip.
 
+2026-10-12 update — the trade moved inside our own codec and the
+constants changed. `std/compress` now owns both ends of the dial:
+`gzipInto` (dynamic, 1766B on the arena body, ~15µs) and
+`gzipIntoFast` (fixed, single-pass, 2223B, ~6.9µs). The original
+race priced *our* fixed against *zlib's* dynamic with a ~17% byte
+gap; the in-house matchup has a ~26% byte gap against an ~8µs encode
+saving. A same-box c256 A/B on the current send path leaned fast
+(+5-12%, noisy) — the opposite direction of the high-rate result.
+The belief survives as *regime-dependent*, not universal: under-
+saturated send paths pay the encode, saturated ones pay the bytes.
+The open question narrows to which regime the board's rate sits in —
+that is a droplet measurement, not a principle.
+
 ## Related
 
 - frag-serialize-the-invariant-render-the-variant — the sibling belief
