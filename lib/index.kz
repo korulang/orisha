@@ -844,6 +844,16 @@ const RESPONSE_500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\
     return formField(req.allocator, q, name);
 }
 
+// Raw spans: the entity bytes and the unparsed query string, borrowed from
+// the request. No codec, no content-type gate — parsing is the handler's.
+~proc body|zig {
+    return req.body;
+}
+
+~proc query|zig {
+    return req.query;
+}
+
 fn statusText(status: u16) []const u8 {
     return switch (status) {
         200 => "OK",

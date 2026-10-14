@@ -101,6 +101,28 @@ handler -> { status: 404, body: "Not Found", content_type: null }
 handler-lite -> null
 
 // ============================================================================
+// INIT — app-level setup, once, before any worker exists
+// ============================================================================
+// A server that loads a dataset, seeds a store, or warms a codec does it
+// here: `serve` fires init exactly once on the calling thread BEFORE the
+// pump stands up a listener or a worker, so whatever init writes is visible
+// to every worker by thread-spawn ordering — no lock needed on custody that
+// is never written again. `| failed` refuses startup: an app that cannot
+// stand up its custody does not get to answer requests over a half-load.
+// The default is a no-op — most apps own no process-lifetime state.
+//
+//   orisha:init = seed()
+//   | ok |> _ => ready
+//   | failed e => failed e
+//
+[abstract]pub tor init {}
+| ready
+| failed string
+
+// Default implementation - nothing to set up
+init => ready
+
+// ============================================================================
 // SERVE — a Koru flow over a platform pump
 // ============================================================================
 // `serve` used to be two ~200-line Zig bodies, one per readiness mechanism,
@@ -116,14 +138,16 @@ pub tor serve { port: u16, tls_port: ?u16, cert_path: ?string, key_path: ?string
 | failed string
 
 serve =
-    orisha/pump:run(port, tls_port, cert_path, key_path)
-    ! arrived x |> orisha:answer(x): a |> orisha/pump:reply(x, a.head, a.body, a.date_hole, a.head_static, a.body_static, hang: a.close)
-        | sent |> orisha:release-body(a.body, allocated: a.body_allocated)
-        | broken _ |> orisha:release-body(a.body, allocated: a.body_allocated)
-    ! frame f |> orisha/pump:ws-frame(f)
-    ! closed fd |> orisha/pump:ws-closed(fd)
-    | stopped s -> shutdown s
+    orisha:init()
     | failed e -> failed e
+    | ready |> orisha/pump:run(port, tls_port, cert_path, key_path)
+        ! arrived x |> orisha:answer(x): a |> orisha/pump:reply(x, a.head, a.body, a.date_hole, a.head_static, a.body_static, hang: a.close)
+            | sent |> orisha:release-body(a.body, allocated: a.body_allocated)
+            | broken _ |> orisha:release-body(a.body, allocated: a.body_allocated)
+        ! frame f |> orisha/pump:ws-frame(f)
+        ! closed fd |> orisha/pump:ws-closed(fd)
+        | stopped s -> shutdown s
+        | failed e -> failed e
 
 // ============================================================================
 // ANSWER — parse one request, run the handler, shape the response
@@ -172,6 +196,14 @@ pub tor cookie { req: *Request, name: string } -> ?string
 
 pub tor form { req: *Request, name: string } -> ?string
 pub tor query-param { req: *Request, name: string } -> ?string
+
+// The raw spans the parsed request carried — `body` is the entity bytes
+// exactly as received (no codec, no content-type gate) and `query` is the
+// unparsed query string. Handlers that need more than one field — or none
+// of the named-param codec — read the span and parse it themselves. Both
+// borrow the request and die with it.
+pub tor body { req: *Request } -> ?string
+pub tor query { req: *Request } -> ?string
 
 // The descriptor the request arrived on — `pump:fileno`'s handler-side
 // twin. A route that upgrades can register the connection for `ws-send-fd`
