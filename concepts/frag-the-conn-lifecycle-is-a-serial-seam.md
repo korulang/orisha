@@ -1,3 +1,10 @@
+---
+type: belief
+id: frag-the-conn-lifecycle-is-a-serial-seam
+provenance: epoll-pump instrumentation on the churn profile, 2026-10-12 — the fd-table mutex and serial accept; evolved 2026-10-15 when the interest list itself and ONESHOT re-arm bookkeeping proved to be the same seam (challenge 001, hunt-c)
+ts: 2026-10-15
+---
+
 # The conn lifecycle is a serial seam
 
 **Belief formed (2026-10-12):** on a churn profile — thousands of live
@@ -27,6 +34,21 @@ interleaved A/B between the table and pointer builds sits inside the
 box's noise. These are mechanism fixes (strictly less serialized work
 per event and per conn), not locally measured wins. Whether they move
 the board is a droplet measurement.
+
+**Evolved (2026-10-15):** the seam went deeper than the table and the
+accept queue — the epoll *instance itself* was shared. One kernel
+interest list meant every worker's `epoll_ctl` contended on the same
+lock, and EPOLLONESHOT demanded a re-arm `epoll_ctl` *per request* —
+bookkeeping the single-owner guarantee already made redundant. The next
+removal took the shape to its conclusion: an epoll instance and a
+SO_REUSEPORT listener *per worker*, accept folded into the worker loop
+(the dedicated acceptor threads retired), ONESHOT dropped so no `epoll_ctl`
+survives in the hot path at all. This time the box could answer: the
+merged baseline measured ~637k req/s against the 313.9k scored reference
+at the same concurrency — and the pump's log line now reads like the
+ring pump's ("epoll + listener each"), the two transports sharing a
+shape. The earlier caveat stands for board numbers; the local delta is
+no longer inside noise.
 
 ## Related
 

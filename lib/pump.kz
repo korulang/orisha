@@ -584,6 +584,33 @@ fn pendingLen(st: *ConnState) usize {
     return st.pending.items.len - st.pending_off;
 }
 
+// Claim a segment the renderer already wrote inside pending's own spare
+// capacity — ringRenderTarget hands TLS conns the pending tail, so the
+// pointer IS the queue: extending items (and, on an empty queue, skipping
+// the renderer's head gap via pending_off, which is already the drain
+// cursor) replaces the copy outright. Returns false for anything that
+// isn't already in place — the caller falls back to a real append.
+fn pendingClaim(st: *ConnState, seg: []const u8) bool {
+    if (st.pending.capacity == 0) return false;
+    const off = @intFromPtr(seg.ptr) -% @intFromPtr(st.pending.items.ptr);
+    const end = off + seg.len;
+    if (off >= st.pending.items.len and end <= st.pending.capacity) {
+        if (off == st.pending.items.len) {
+            // Contiguous with the queued tail — extend, no copy.
+            st.pending.items = st.pending.items.ptr[0..end];
+            return true;
+        }
+        if (st.pending.items.len == 0 and st.pending_off == 0) {
+            // Head-parked render on an empty queue: the gap in front is
+            // dead render space and pending_off skips it on drain.
+            st.pending_off = off;
+            st.pending.items = st.pending.items.ptr[0..end];
+            return true;
+        }
+    }
+    return false;
+}
+
 // Push what the socket will take right now, no waiting. `stalled` leaves the
 // tail in pending for a write-ready event; the rearm that follows every
 // dispatch is what asks the reactor for it.
@@ -646,8 +673,11 @@ fn appendPending(st: *ConnState, segments: []const []const u8) bool {
             return true;
         }
         if (pendingLen(st) + need > MAX_PENDING) return false;
+        var i: usize = 0;
+        while (i < segments.len and pendingClaim(st, segments[i])) i += 1;
+        if (i == segments.len) return true;
         st.pending.ensureUnusedCapacity(pumpAlloc(), need) catch return false;
-        for (segments) |seg| st.pending.appendSliceAssumeCapacity(seg);
+        for (segments[i..]) |seg| st.pending.appendSliceAssumeCapacity(seg);
         return true;
     }
     if (st.pending.items.len + need > MAX_PENDING) {
@@ -739,6 +769,17 @@ fn appendPair(st: *ConnState, a: []const u8, b: []const u8) bool {
             return true;
         }
         if (pendingLen(st) + need > MAX_PENDING) return false;
+        // A reply rendered into pending's own tail claims by pointer —
+        // only segments not already in place pay the copy. `a` claimed
+        // already moved its bytes into items, so `b` alone may still need
+        // the append; claiming first means a growth here cannot dangle a.
+        if (pendingClaim(st, a)) {
+            if (!pendingClaim(st, b)) {
+                st.pending.ensureUnusedCapacity(pumpAlloc(), b.len) catch return false;
+                st.pending.appendSliceAssumeCapacity(b);
+            }
+            return true;
+        }
         st.pending.ensureUnusedCapacity(pumpAlloc(), need) catch return false;
         st.pending.appendSliceAssumeCapacity(a);
         st.pending.appendSliceAssumeCapacity(b);
@@ -849,7 +890,19 @@ fn stageIovStatic(st: *ConnState, head: []const u8, body: []const u8, date_hole:
 pub fn ringRenderTarget(fd: posix.fd_t, min_len: usize) ?[]u8 {
     const st = connState(@intCast(fd)) orelse return null;
     if (st.owner_ring == null or st.mode == .ws or st.send_len != 0 or st.send_iov_n != 0) return null;
-    if (HAS_OPENSSL and st.ssl != null) return null;
+    if (HAS_OPENSSL and st.ssl != null) {
+        // Socket-BIO TLS: send_buf must never see plaintext (OpenSSL owns
+        // the wire), but pending IS this conn's pre-encryption queue — a
+        // render into its tail is claimed by the pointer match in
+        // pendingClaim instead of copied. The empty-queue requirement is
+        // what makes every rendered span claimable: a head gap in front of
+        // the message becomes a leading pending_off skip, which a nonempty
+        // queue could not express.
+        if (!st.tls_sockbio or st.pending.items.len != 0 or st.pending_off != 0) return null;
+        if (min_len > MAX_PENDING) return null;
+        st.pending.ensureUnusedCapacity(pumpAlloc(), min_len) catch return null;
+        return st.pending.items.ptr[0..st.pending.capacity];
+    }
     if (st.send_staged + min_len > MAX_PENDING) return null;
     if (st.send_buf.len < st.send_staged + min_len) {
         const nb = pumpAlloc().alloc(u8, @max(4096, st.send_buf.len * 2, st.send_staged + min_len)) catch return null;
@@ -1356,7 +1409,7 @@ fn armOwnerWrite(st: *ConnState) void {
     if (@import("builtin").os.tag == .linux) {
         const linux = std.os.linux;
         var wait = linux.epoll_event{
-            .events = linux.EPOLL.IN | linux.EPOLL.OUT | linux.EPOLL.ONESHOT,
+            .events = linux.EPOLL.IN | linux.EPOLL.OUT,
             .data = .{ .ptr = @intFromPtr(st) },
         };
         _ = linux.epoll_ctl(st.owner_q, linux.EPOLL.CTL_MOD, st.fd, &wait);
@@ -1726,7 +1779,7 @@ fn registerClientEpoll(client_fd: posix.fd_t, ssl: ?*ServerTls, epfd: i32) void 
     st.tls_hs = ssl != null;
     st.owner_q = epfd;
     var client_event = linux.epoll_event{
-        .events = linux.EPOLL.IN | linux.EPOLL.ONESHOT,
+        .events = linux.EPOLL.IN,
         .data = .{ .ptr = @intFromPtr(st) },
     };
     _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_ADD, client_fd, &client_event);
@@ -1734,11 +1787,13 @@ fn registerClientEpoll(client_fd: posix.fd_t, ssl: ?*ServerTls, epfd: i32) void 
 
 // The readiness a conn wants next, as epoll bits: a closing conn asks only
 // to drain, a queued-up conn asks for write-ready as well as reads, and a
-// live conn keeps reading. ONESHOT does the once-per-worker handoff.
+// live conn keeps reading. The mask is PERSISTENT — a conn lives on exactly
+// one worker's private epoll, so there is no ONESHOT hand-off to re-arm and
+// epoll_ctl fires only when this mask changes, never per event.
 fn epollMask(st: *ConnState) u32 {
     const linux = std.os.linux;
-    var mask: u32 = linux.EPOLL.ONESHOT;
-    if (!st.close_when_drained) mask |= linux.EPOLL.IN;
+    if (st.close_when_drained) return linux.EPOLL.OUT;
+    var mask: u32 = linux.EPOLL.IN;
     if (st.pending_off < st.pending.items.len) mask |= linux.EPOLL.OUT;
     return mask;
 }
@@ -2801,29 +2856,80 @@ fn workerCount() usize {
 
     const n_workers = $mod.workerCount();
 
-    // ONE readiness instance, shared by every worker.
+    // One epoll instance AND one SO_REUSEPORT listener per worker — the
+    // shared-nothing shape the ring pump uses. A connection is accepted,
+    // served and released on a single thread, so "exactly one worker holds
+    // a descriptor" is true by construction — which is the only thing
+    // EPOLLONESHOT was enforcing on the previous shared-epfd design.
     //
-    // This was one epoll per worker, with each connection assigned at accept
-    // time and owned by that worker for life. Round-robin hands out connections
-    // without any idea how much work each will turn out to be, and a request
-    // could then only ever be served by the worker it was given to, however
-    // idle the others were.
+    // That buys the per-request bookkeeping syscall back. ONESHOT disarms a
+    // descriptor on every delivery, so the shared-epfd loop paid one
+    // epoll_ctl(CTL_MOD) re-arm per readiness event — measured under wrk
+    // (strace -c, cost-hunt session) as read:write:epoll_ctl in exact 1:1:1,
+    // a full third of all syscalls — and every re-arm took the shared
+    // instance's lock against eleven other workers' epoll_waits.
     //
-    // ONESHOT keeps the property that made the old design lock-free — exactly
-    // one worker holds a descriptor at a time, so the connection table still
-    // needs no lock. What changes is only WHICH worker, and that it is decided
-    // when the work appears rather than when the connection arrived.
-    //
-    // Measured: 197,065 against 189,447 req/s, winning all three rounds.
-    // It did NOT change the tail (6.99ms against 6.68ms at p99), which was the
-    // reason it was written — see benchmarks/twobox/CONDITIONS.md.
-    var shared_epfd: i32 = -1;
+    // With a persistent level-triggered registration, epoll_ctl fires once
+    // at accept and then only on readiness-SHAPE changes: a stalled write
+    // adds EPOLLOUT, a drained queue drops it, a TLS handshake step picks a
+    // direction. Steady state per request is read + write plus an
+    // epoll_wait that returns ~a full 64-event batch under load.
 
-    // The per-connection half of the loop, which is the whole loop now that
-    // accepting has moved out. One of these runs per worker, each on its own
-    // epoll instance, each seeing only the descriptors handed to it.
+    // data.ptr tags that can never alias a *ConnState: the userspace
+    // pointers this process hands out keep the top bits clear. One tag per
+    // listener kind; the worker knows which fd each names because it owns
+    // both.
+    const LISTENER_TAG: usize = 0x8000_0000_0000_0000;
+    const TLS_LISTENER_TAG: usize = 0x8000_0000_0000_0001;
+    // Backlog beyond this stays queued and refires the level-triggered
+    // listener event next pass — a bounded accept keeps a connect storm
+    // from starving the readiness batch behind it.
+    const ACCEPT_BURST = 128;
+
     const Worker = struct {
-        fn loop(epfd: i32) void {
+        // The only epoll_ctl left in the pump: re-shape a LIVE
+        // registration — a stall gaining EPOLLOUT, a drain dropping it, a
+        // handshake step taking a direction. Never once per event.
+        fn arm(epfd: i32, st: *$mod.ConnState, mask: u32) void {
+            var ev = linux.epoll_event{
+                .events = mask,
+                .data = .{ .ptr = @intFromPtr(st) },
+            };
+            _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, st.fd, &ev);
+        }
+
+        fn takeConns(listen_fd: $mod.posix.fd_t, epfd: i32) void {
+            for (0..ACCEPT_BURST) |_| {
+                const client_fd = $mod.posix.accept(listen_fd, null, null, $mod.posix.SOCK.NONBLOCK | $mod.posix.SOCK.CLOEXEC) catch break;
+                $mod.registerClientEpoll(client_fd, null, epfd);
+            }
+        }
+
+        fn takeTlsConns(listen_fd: $mod.posix.fd_t, epfd: i32) void {
+            for (0..ACCEPT_BURST) |_| {
+                const client_fd = $mod.posix.accept(listen_fd, null, null, $mod.posix.SOCK.NONBLOCK | $mod.posix.SOCK.CLOEXEC) catch break;
+                // Only the SSL object is made here — the handshake runs
+                // below, one step per readiness event.
+                const ssl = $mod.beginTlsHandshake(@intCast(client_fd)) orelse continue;
+                $mod.registerClientEpoll(client_fd, ssl, epfd);
+            }
+        }
+
+        fn loop(listen_fd: $mod.posix.fd_t, tls_listen_fd: $mod.posix.fd_t, epfd: i32) void {
+            // The listener must not block the worker: a drained accept
+            // queue answers EAGAIN, not sleep.
+            $mod.markNonBlocking(listen_fd);
+            var lev = linux.epoll_event{
+                .events = linux.EPOLL.IN,
+                .data = .{ .ptr = LISTENER_TAG },
+            };
+            _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_ADD, listen_fd, &lev);
+            if (tls_listen_fd >= 0) {
+                $mod.markNonBlocking(tls_listen_fd);
+                lev.data = .{ .ptr = TLS_LISTENER_TAG };
+                _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_ADD, tls_listen_fd, &lev);
+            }
+
             var events: [$mod.MAX_EVENTS]linux.epoll_event = undefined;
             while (true) {
                 const n_rc = linux.epoll_wait(epfd, &events, $mod.MAX_EVENTS, -1);
@@ -2832,32 +2938,42 @@ fn workerCount() usize {
                 @import("root").koru_orisha.stampHttpDateLine();
 
                 for (events[0..@intCast(n)]) |event| {
-                    // The epoll set carries *ConnState in data.ptr — no fd→state
-                    // table lookup, no conn_states_mu on the dispatch path. ONESHOT
-                    // guarantees only one worker holds a conn at a time, so the
-                    // pointer cannot be freed under us: release happens here.
+                    if (event.data.ptr == LISTENER_TAG) {
+                        takeConns(listen_fd, epfd);
+                        continue;
+                    }
+                    if (event.data.ptr == TLS_LISTENER_TAG) {
+                        takeTlsConns(tls_listen_fd, epfd);
+                        continue;
+                    }
+
+                    // The epoll set carries *ConnState in data.ptr — no
+                    // fd→state table lookup, no conn_states_mu on the
+                    // dispatch path. Only this worker can ever dispatch or
+                    // release the conn, so the pointer cannot be freed
+                    // under us: release happens here.
                     const st: *$mod.ConnState = @ptrFromInt(event.data.ptr);
                     const fd: $mod.posix.fd_t = st.fd;
 
                     // The conn registers before its handshake finishes —
-                    // step it once per readiness event so a thousand
-                    // concurrent handshakes spread over every worker, and
-                    // trust no bytes as requests until the cipher is up.
+                    // step it once per readiness event and trust no bytes
+                    // as requests until the cipher is up.
                     if (st.tls_hs) {
                         switch ($mod.driveTlsHandshake(st)) {
-                            .ready => st.tls_hs = false,
-                            // Arm only the direction the cipher asked for: a
-                            // want_read conn re-armed IN|OUT refires instantly
-                            // (OUT is level-true on any writable socket), and a
-                            // thousand handshakes doing that drown the real
-                            // readiness events in futile SSL_accept calls.
+                            .ready => {
+                                st.tls_hs = false;
+                                // The handshake armed one direction; a live
+                                // conn reads and drains.
+                                arm(epfd, st, $mod.epollMask(st));
+                            },
+                            // Arm only the direction the cipher asked for:
+                            // a want_read conn armed IN|OUT refires
+                            // instantly (OUT is level-true on any writable
+                            // socket), drowning real readiness in futile
+                            // SSL_accept calls.
                             .want_read, .want_write => |w| {
                                 const dir: u32 = if (w == .want_read) linux.EPOLL.IN else linux.EPOLL.OUT;
-                                var wait = linux.epoll_event{
-                                    .events = dir | linux.EPOLL.ONESHOT,
-                                    .data = .{ .ptr = @intFromPtr(st) },
-                                };
-                                _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &wait);
+                                arm(epfd, st, dir);
                                 continue;
                             },
                             .failed => {
@@ -2876,42 +2992,30 @@ fn workerCount() usize {
                                 $mod.releaseConn(fd);
                                 continue;
                             },
-                            .stalled => {
-                                var wait = linux.epoll_event{
-                                    .events = $mod.epollMask(st),
-                                    .data = .{ .ptr = @intFromPtr(st) },
-                                };
-                                _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &wait);
-                                continue;
-                            },
+                            // Still stalled — EPOLLOUT stays armed, so the
+                            // next writable instant refires on its own.
+                            .stalled => continue,
                             .drained => {
                                 if (st.close_when_drained) {
                                     if (st.mode == .ws) closed(@intCast(fd));
                                     $mod.releaseConn(fd);
                                     continue;
                                 }
+                                // EPOLLOUT is level-true on a writable
+                                // socket: drop it or every wait returns a
+                                // write-ready event for a conn with nothing
+                                // left to write.
+                                arm(epfd, st, $mod.epollMask(st));
+                                if (event.events & linux.EPOLL.IN == 0) continue;
                             },
-                        }
-                        if (event.events & linux.EPOLL.IN == 0) {
-                            var wait = linux.epoll_event{
-                                .events = linux.EPOLL.IN | linux.EPOLL.ONESHOT,
-                                .data = .{ .ptr = @intFromPtr(st) },
-                            };
-                            _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &wait);
-                            continue;
                         }
                     }
 
                     switch ($mod.fill_event.handler(.{ .st = st })) {
                         .more => {},
-                        .idle => {
-                            var wait = linux.epoll_event{
-                                .events = $mod.epollMask(st),
-                                .data = .{ .ptr = @intFromPtr(st) },
-                            };
-                            _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &wait);
-                            continue;
-                        },
+                        // Nothing arrived after all — the IN registration
+                        // persists, so there is nothing to re-arm.
+                        .idle => continue,
                         .gone => {
                             if (st.mode == .ws) closed(@intCast(fd));
                             $mod.releaseConn(fd);
@@ -2919,8 +3023,8 @@ fn workerCount() usize {
                         },
                     }
 
-                    // Upgraded connection: frames, not requests — same seam as
-                    // the kqueue pump's `st.mode == .ws` block.
+                    // Upgraded connection: frames, not requests — same seam
+                    // as the kqueue pump's `st.mode == .ws` block.
                     if (st.mode == .ws) {
                         var ws_consumed: usize = 0;
                         var ws_alive = true;
@@ -2949,22 +3053,16 @@ fn workerCount() usize {
                         if (!ws_alive) {
                             if ($mod.pendingLen(st) > 0) {
                                 st.close_when_drained = true;
-                                var wait = linux.epoll_event{
-                                    .events = linux.EPOLL.OUT | linux.EPOLL.ONESHOT,
-                                    .data = .{ .ptr = @intFromPtr(st) },
-                                };
-                                _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &wait);
+                                arm(epfd, st, $mod.epollMask(st));
                                 continue;
                             }
                             if (st.mode == .ws) closed(@intCast(fd));
                             $mod.releaseConn(fd);
                             continue;
                         }
-                        var ws_rearm = linux.epoll_event{
-                            .events = $mod.epollMask(st),
-                            .data = .{ .ptr = @intFromPtr(st) },
-                        };
-                        _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &ws_rearm);
+                        // A stalled frame queue asks for write-readiness
+                        // beside reads; a clean conn's IN persists untouched.
+                        if ($mod.pendingLen(st) > 0) arm(epfd, st, $mod.epollMask(st));
                         continue;
                     }
 
@@ -2996,11 +3094,7 @@ fn workerCount() usize {
                         // releasing here would cut it mid-flight.
                         if ($mod.pendingLen(st) > 0) {
                             st.close_when_drained = true;
-                            var wait = linux.epoll_event{
-                                .events = linux.EPOLL.OUT | linux.EPOLL.ONESHOT,
-                                .data = .{ .ptr = @intFromPtr(st) },
-                            };
-                            _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &wait);
+                            arm(epfd, st, $mod.epollMask(st));
                             continue;
                         }
                         if (st.mode == .ws) closed(@intCast(fd));
@@ -3008,79 +3102,50 @@ fn workerCount() usize {
                         continue;
                     }
 
-                    var rearm = linux.epoll_event{
-                        .events = $mod.epollMask(st),
-                        .data = .{ .ptr = @intFromPtr(st) },
-                    };
-                    _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &rearm);
+                    // A flush that stalled asks for write-readiness beside
+                    // reads — the one shape change the hot path can cause.
+                    // A clean conn needs nothing: EPOLLIN persists.
+                    if ($mod.pendingLen(st) > 0) arm(epfd, st, $mod.epollMask(st));
                 }
             }
         }
     };
 
-    const rc = linux.epoll_create1(0);
-    shared_epfd = @bitCast(@as(u32, @truncate(rc)));
-    if (shared_epfd < 0) return .{ .failed = "Failed to create epoll" };
-    for (0..n_workers) |_| {
-        _ = std.Thread.spawn(.{}, Worker.loop, .{shared_epfd}) catch
-            return .{ .failed = "Failed to spawn worker" };
-    }
-
-    if ($mod.tls_server_ctx != null) {
-        const TlsAccept = struct {
-            fn loop(epfd: i32) void {
-                var tls_listener = $mod.openListener($mod.tls_listen_port) orelse return;
-                defer tls_listener.deinit();
-                while (true) {
-                    const conn = tls_listener.accept() catch continue;
-                    const client_fd = conn.stream.handle;
-                    $mod.markNonBlocking(client_fd);
-                    // Only the SSL object is made here — the handshake runs
-                    // in the worker loop, one step per readiness event.
-                    const ssl = $mod.beginTlsHandshake(@intCast(client_fd)) orelse continue;
-                    $mod.registerClientEpoll(client_fd, ssl, epfd);
-                }
-            }
-        };
-        _ = std.Thread.spawn(.{}, TlsAccept.loop, .{shared_epfd}) catch
-            return .{ .failed = "Failed to spawn TLS accept thread" };
-    }
-
-    // Accept was a single thread doing accept + setsockopt + 2×fcntl + a locked
-    // ConnState alloc + epoll_ctl per conn — one serial path capping churn near
-    // ~10-20K conns/s while -r25-style workloads demand ~T/25 new conns every
-    // second. REUSEPORT gives each acceptor its own listener, the kernel hashes
-    // flows across them, and the whole post-accept path runs in parallel.
-    // accept4 takes NONBLOCK|CLOEXEC here so the fd arrives already configured —
-    // the fcntl pair lives in the TLS accept loop instead, the only caller
-    // whose accept still returns a blocking descriptor.
-    const Acceptor = struct {
-        fn loop(lfd: $mod.posix.fd_t, epfd: i32) void {
-            while (true) {
-                const client_fd = $mod.posix.accept(lfd, null, null, $mod.posix.SOCK.NONBLOCK | $mod.posix.SOCK.CLOEXEC) catch continue;
-                $mod.registerClientEpoll(client_fd, null, epfd);
-            }
-        }
-    };
+    // REUSEPORT hands each worker its own listener, the kernel hashes flows
+    // across them, and accept + serve + release all stay on one thread —
+    // no acceptor threads, no cross-worker registration, no shared lock.
     var lfds: [$mod.MAX_WORKERS]$mod.posix.fd_t = undefined;
-    var n_listeners: usize = 0;
+    var tls_lfds: [$mod.MAX_WORKERS]$mod.posix.fd_t = undefined;
+    var epfds: [$mod.MAX_WORKERS]i32 = undefined;
+    var n_workers_up: usize = 0;
     for (0..n_workers) |i| {
-        lfds[i] = $mod.openReusePortListener(port) orelse break;
-        n_listeners += 1;
+        const lfd = $mod.openReusePortListener(port) orelse break;
+        const rc = linux.epoll_create1(0);
+        if (rc < 0) {
+            $mod.posix.close(lfd);
+            break;
+        }
+        lfds[i] = lfd;
+        epfds[i] = @bitCast(@as(u32, @truncate(rc)));
+        tls_lfds[i] = -1;
+        if ($mod.tls_server_ctx != null) {
+            tls_lfds[i] = $mod.openReusePortListener($mod.tls_listen_port) orelse -1;
+        }
+        n_workers_up += 1;
     }
-    if (n_listeners == 0) return .{ .failed = "Failed to listen" };
-    for (lfds[1..n_listeners]) |lfd| {
-        _ = std.Thread.spawn(.{}, Acceptor.loop, .{ lfd, shared_epfd }) catch
-            return .{ .failed = "Failed to spawn acceptor" };
+    if (n_workers_up == 0) return .{ .failed = "Failed to listen" };
+    for (1..n_workers_up) |i| {
+        _ = std.Thread.spawn(.{}, Worker.loop, .{ lfds[i], tls_lfds[i], epfds[i] }) catch
+            return .{ .failed = "Failed to spawn worker" };
     }
 
     std.debug.print("Orisha listening on http://0.0.0.0:{}\n", .{port});
     if ($mod.tls_server_ctx != null) {
         std.debug.print("Orisha listening on https://0.0.0.0:{}\n", .{$mod.tls_listen_port});
     }
-    std.debug.print("Pump: epoll, {} workers on one shared queue, {} accept listeners, keep-alive, TCP_NODELAY\n", .{ n_workers, n_listeners });
+    std.debug.print("Pump: epoll, {} workers (epoll + listener each), keep-alive, TCP_NODELAY\n", .{n_workers_up});
 
-    Acceptor.loop(lfds[0], shared_epfd);
+    Worker.loop(lfds[0], tls_lfds[0], epfds[0]);
 
     return .{ .stopped = "Server stopped" };
 }
@@ -3823,7 +3888,14 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
             };
             while (st.len < st.buf.len) {
                 switch (mod.sslMemRead(s, st.buf[st.len..])) {
-                    .read => |n| st.len += n,
+                    .read => |n| {
+                        st.len += n;
+                        // Retry only while OpenSSL still holds buffered
+                        // record data — a bare retry buys one read() that
+                        // can only EAGAIN. Ciphertext the kernel is still
+                        // holding re-fires POLLIN on the re-arm.
+                        if (!mod.sslHasUnprocessed(s)) break;
+                    },
                     .want_read => break,
                     .gone, .failed => {
                         st.ring_dead = true;
