@@ -50,8 +50,18 @@ pnpm-lock.yaml
 *.swo
 *~
 
-# Claude Code
-.claude/
+# .claude: private by default (settings, worktrees, prose) — but project-
+# authored skills are part of the toolchain and ship with the repo. The
+# seeded ADD runtime skills stay local (upstream: 6digit-skills; re-seed
+# with arbiters-init / arbiters-reconcile), same convention as koru.
+.claude/*
+!.claude/skills/
+.claude/skills/arbiters/
+.claude/skills/arbiters-challenge/
+.claude/skills/arbiters-worldmodel/
+.claude/skills/membrane/
+.claude/skills/bettermaker/
+.claude/skills/flash/
 
 # OS
 .DS_Store

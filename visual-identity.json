@@ -1,0 +1,13 @@
+{
+  "name": "orisha",
+  "palette": {
+    "base": "#11111b",
+    "text": "#cdd6f4",
+    "surface": "#313244",
+    "accent": "#74c7ec"
+  },
+  "background": null,
+  "sound": "E",
+  "glyph": "✦",
+  "avatar": null
+}

@@ -1,0 +1,175 @@
+diff --git a/lib/pump.kz b/lib/pump.kz
+index 1fa1767..4566ec3 100644
+--- a/lib/pump.kz
++++ b/lib/pump.kz
+@@ -115,6 +115,40 @@ const URING_ENTRIES: u16 = 4096;
+ const URING_ACCEPT: u64 = std.math.maxInt(u64);
+ const URING_ACCEPT_TLS: u64 = URING_ACCEPT - 1;
+ 
++// --- hunt-a instrumentation (temporary, PUMP_STATS gated) ---
++pub var st_drains: u64 = 0;
++pub var st_cqes: u64 = 0;
++pub var st_enters_wait: u64 = 0;
++pub var st_submits: u64 = 0;
++pub var st_send_sqes: u64 = 0;
++pub var st_send_bytes: u64 = 0;
++pub var st_reqs: u64 = 0;
++pub var st_pending_resps: u64 = 0; // responses that took the pending leg (send in flight)
++pub var st_direct_resps: u64 = 0; // responses staged straight into send_buf
++pub var st_recv_cqes: u64 = 0;
++pub var st_timeouts: u64 = 0;
++pub var st_submit1: u64 = 0;
++var st_last_print: i64 = 0;
++var st_enabled: bool = false;
++var st_checked: bool = false;
++fn stOn() bool {
++    if (!st_checked) {
++        st_checked = true;
++        st_enabled = std.posix.getenv("PUMP_STATS") != null;
++    }
++    return st_enabled;
++}
++fn stTick() void {
++    if (!stOn()) return;
++    const now = wallClockSeconds(null);
++    if (now - st_last_print < 5) return;
++    st_last_print = now;
++    std.debug.print(
++        "STATS drains={} cqes={} enters={} submits={} sends={} sendB={} reqs={} direct={} pend={} recv={} touts={} sub1={}\n",
++        .{ st_drains, st_cqes, st_enters_wait, st_submits, st_send_sqes, st_send_bytes, st_reqs, st_direct_resps, st_pending_resps, st_recv_cqes, st_timeouts, st_submit1 },
++    );
++}
++
+ // One read is not one request.
+ //
+ // A browser opening a page fires its asset requests back to back, and TCP is
+@@ -725,6 +759,7 @@ fn appendPair(st: *ConnState, a: []const u8, b: []const u8) bool {
+     const need = a.len + b.len;
+     if (st.owner_ring != null) {
+         if (st.send_len == 0 and st.send_iov_n == 0 and st.mode != .ws and !st.tls_sockbio) {
++            if (stOn()) st_direct_resps += 1;
+             const plan_mode = st.send_plan_n > 0;
+             if (a.len != 0) {
+                 if (plan_mode and st.send_plan_n == SEND_PLAN_MAX)
+@@ -738,6 +773,7 @@ fn appendPair(st: *ConnState, a: []const u8, b: []const u8) bool {
+             }
+             return true;
+         }
++        if (stOn()) st_pending_resps += 1;
+         if (pendingLen(st) + need > MAX_PENDING) return false;
+         st.pending.ensureUnusedCapacity(pumpAlloc(), need) catch return false;
+         st.pending.appendSliceAssumeCapacity(a);
+@@ -3119,7 +3155,7 @@ fn workerCount() usize {
+ // at the wait, so a deadline that expires before the wait begins becomes part
+ // of the sample the wakeup is judged against: a hang, not a late wakeup. TIME
+ // is a normal short batch, not an error — the caller reaps whatever landed.
+-fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !void {
++fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !bool {
+     const linux = std.os.linux;
+     const deadline: linux.kernel_timespec = .{ .sec = 0, .nsec = timeout_ns };
+     const wait_arg: linux.io_uring_getevents_arg = .{
+@@ -3138,7 +3174,8 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
+         @sizeOf(linux.io_uring_getevents_arg),
+     );
+     switch (linux.E.init(res)) {
+-        .SUCCESS, .TIME => {},
++        .SUCCESS => return false,
++        .TIME => return true,
+         else => return error.RingWaitFailed,
+     }
+ }
+@@ -3188,6 +3225,9 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
+         // short batch may be held — far below a request round trip.
+         const WAIT_COALESCE_MAX: u32 = 32;
+         const WAIT_COALESCE_NS: i64 = 20_000;
++        // A drain this deep proves backlog — the only evidence strong enough
++        // to raise wait_nr again after a timed-out (idle-padded) wait.
++        const RE_COALESCE_AT: u32 = 64;
+ 
+         ring: linux.IoUring,
+         listen_fd: $mod.posix.fd_t,
+@@ -3336,6 +3376,14 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
+         }
+ 
+         fn submitSend(w: *@This(), st: *$mod.ConnState) bool {
++            if ($mod.stOn()) {
++                $mod.st_send_sqes += 1;
++                if (st.send_iov_n > 0) {
++                    var b: usize = 0;
++                    for (st.send_iov[st.send_iov_pos..st.send_iov_n]) |v| b += v.len;
++                    $mod.st_send_bytes += b;
++                } else $mod.st_send_bytes += st.send_len - st.send_off;
++            }
+             if (st.send_iov_n > 0) {
+                 _ = w.ring.writev(udSend(st), st.fd, st.send_iov[st.send_iov_pos..st.send_iov_n], 0) catch {
+                     _ = w.ring.submit() catch {};
+@@ -3612,6 +3660,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
+                         // so the buffer must not rejoin the pool until the
+                         // dispatch below is done.
+                         const consumed = w.dispatchHttpSlice(st, buf);
++            if ($mod.stOn()) $mod.st_recv_cqes += 1;
+                         dispatched = true;
+                         if (consumed < buf.len and !st.ring_dead) {
+                             const tail = buf[consumed..];
+@@ -3874,6 +3923,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
+                 const take = $mod.scanRequest(bytes[consumed..], &head) orelse break;
+                 var exchange = $mod.Exchange{ .fd = st.fd, .st = st, .raw = bytes[consumed .. consumed + take], .head = &head };
+                 if (head.wants_close) exchange.keep_alive = false;
++                if ($mod.stOn()) $mod.st_reqs += 1;
+                 arrived(&exchange);
+                 consumed += take;
+                 if (!exchange.keep_alive) {
+@@ -3944,24 +3994,46 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
+             var wait_nr: u32 = 1;
+             var cqes: [CQE_BATCH]linux.io_uring_cqe = undefined;
+             while (true) {
++                var wait_timed_out = false;
+                 if (wait_nr > 1) {
+-                    $mod.ringWaitTimeout(&w.ring, wait_nr, WAIT_COALESCE_NS) catch continue;
++                    if ($mod.stOn()) $mod.st_enters_wait += 1;
++                    wait_timed_out = $mod.ringWaitTimeout(&w.ring, wait_nr, WAIT_COALESCE_NS) catch continue;
++                    if ($mod.stOn() and wait_timed_out) $mod.st_timeouts += 1;
+                 } else {
++                    if ($mod.stOn()) {
++                        $mod.st_enters_wait += 1;
++                        $mod.st_submit1 += 1;
++                    }
+                     _ = w.ring.submit_and_wait(1) catch continue;
+                 }
+                 const got = w.ring.copy_cqes(&cqes, 0) catch continue;
+                 @import("root").koru_orisha.stampHttpDateLine();
++                if ($mod.stOn()) {
++                    $mod.st_drains += 1;
++                    $mod.st_cqes += got;
++                    $mod.stTick();
++                }
+                 var i: usize = 0;
+                 for (cqes[0..got]) |cqe| {
+                     i += 1;
+-                    if (i % SUBMIT_STRIDE == 0) _ = w.ring.submit() catch {};
++                    if (i % SUBMIT_STRIDE == 0) {
++                        if ($mod.stOn()) $mod.st_submits += 1;
++                        _ = w.ring.submit() catch {};
++                    }
+                     w.handleCqe(cqe);
+                 }
+-                // Ride the size of the last drain: a deep batch means more
+-                // completions are already in flight, so the next enter can
+-                // afford to wait for several; a shallow one decays back to
+-                // single-completion waits within a pass.
+-                wait_nr = @min(@max(@as(u32, @intCast(got / 2)), 1), coalesce_max);
++                // Ride the size of the last drain while arrivals keep pace:
++                // a deep batch means completions are in flight, so the next
++                // enter can afford to wait for several. A wait that TIMED
++                // OUT is the ring's own evidence that coalescing parked
++                // dead time — a pipelined burst pays that park as latency —
++                // so decay to a single-completion wake and stay there until
++                // a drain big enough to prove backlog returns.
++                if (wait_timed_out) {
++                    wait_nr = 1;
++                } else if (wait_nr > 1 or got >= RE_COALESCE_AT) {
++                    wait_nr = @min(@max(@as(u32, @intCast(got / 2)), 1), coalesce_max);
++                }
+             }
+         }
+     };
