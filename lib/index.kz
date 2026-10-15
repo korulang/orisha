@@ -1889,7 +1889,7 @@ fn stripQuotes(s: []const u8) []const u8 {
     return s;
 }
 
-fn processDirectory(allocator: std.mem.Allocator, routes: *std.ArrayList(ProcessedRoute), method: []const u8, base_path: []const u8, dir_path: []const u8) void {
+fn processDirectory(allocator: std.mem.Allocator, routes: *std.ArrayList(ProcessedRoute), method: []const u8, base_path: []const u8, dir_path: []const u8, gzip_only: bool) void {
     var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
     defer dir.close();
     var walker = dir.walk(allocator) catch return;
@@ -1904,7 +1904,7 @@ fn processDirectory(allocator: std.mem.Allocator, routes: *std.ArrayList(Process
         const content = std.fs.cwd().readFileAlloc(allocator, file_path, 10 * 1024 * 1024) catch continue;
         // SvelteKit's hashed assets all live under /_app/ — their URLs change
         // when the content does, so they are safe to cache as immutable.
-        const http_resp = buildHttpResponse(allocator, content, mimeTypeFromPath(file_path), std.mem.startsWith(u8, route_path, "/_app/")) catch continue;
+        const http_resp = buildHttpResponse(allocator, content, mimeTypeFromPath(file_path), std.mem.startsWith(u8, route_path, "/_app/"), gzip_only) catch continue;
         routes.append(allocator, .{ .method = method, .path = route_path, .response = http_resp.response, .response_gzip = http_resp.response_gzip, .etag = http_resp.etag, .etag_gzip = http_resp.etag_gzip }) catch continue;
         if (std.mem.eql(u8, entry.path, "index.html") and std.mem.eql(u8, base_path, "/")) {
             routes.append(allocator, .{ .method = method, .path = "/", .response = http_resp.response, .response_gzip = http_resp.response_gzip, .etag = http_resp.etag, .etag_gzip = http_resp.etag_gzip }) catch continue;
@@ -1934,10 +1934,10 @@ fn processDirectory(allocator: std.mem.Allocator, routes: *std.ArrayList(Process
     }
 }
 
-fn processFile(allocator: std.mem.Allocator, routes: *std.ArrayList(ProcessedRoute), method: []const u8, path: []const u8, file_path: []const u8, content_type_override: ?[]const u8) void {
+fn processFile(allocator: std.mem.Allocator, routes: *std.ArrayList(ProcessedRoute), method: []const u8, path: []const u8, file_path: []const u8, content_type_override: ?[]const u8, gzip_only: bool) void {
     const content = std.fs.cwd().readFileAlloc(allocator, file_path, 10 * 1024 * 1024) catch return;
     const content_type = content_type_override orelse mimeTypeFromPath(file_path);
-    const http_resp = buildHttpResponse(allocator, content, content_type, std.mem.startsWith(u8, path, "/_app/")) catch return;
+    const http_resp = buildHttpResponse(allocator, content, content_type, std.mem.startsWith(u8, path, "/_app/"), gzip_only) catch return;
     routes.append(allocator, .{ .method = method, .path = path, .response = http_resp.response, .response_gzip = http_resp.response_gzip, .etag = http_resp.etag, .etag_gzip = http_resp.etag_gzip }) catch return;
 }
 
@@ -1984,18 +1984,34 @@ fn gzipCompress(allocator: std.mem.Allocator, content: []const u8) ?[]const u8 {
     return allocator.realloc(output, compressed_size) catch output[0..compressed_size];
 }
 
-// Both representations are baked per route — identity always, gzip when the
-// MIME type is compressible and deflate actually wins — because the client is
-// only known at request time. Serving the gzip bytes to a client that never
-// advertised `Accept-Encoding: gzip` is a protocol violation; a body it cannot
-// decode is a 200 that renders as garbage. `Vary: Accept-Encoding` goes on
-// BOTH variants so a shared cache keys them apart instead of replaying
-// whichever one it saw first.
-fn buildHttpResponse(allocator: std.mem.Allocator, content: []const u8, content_type: []const u8, is_immutable: bool) !HttpResponse {
+// Two bake contracts, chosen per-site by ~orisha:static's `gzip_only` arg.
+//
+// Default (gzip_only = false): both representations bake per route — identity
+// always, gzip when the MIME type is compressible and deflate wins — because
+// the client is only known at request time and serving gzip bytes to a client
+// that never advertised is a protocol violation. `Vary: Accept-Encoding` goes
+// on BOTH variants so a shared cache keys them apart.
+//
+// gzip_only = true: compressible content bakes ONE representation — the gzip
+// one — served to every client whatever Accept-Encoding says. Ruled
+// 2026-10-15: identity + gzip per route is what pushed the korulang.org
+// reactor past Vercel's 100MB upload cap; the identity half bought nothing
+// real clients use. Serving gzip bytes to a non-advertising client is the
+// violation the site accepts — the alternative is a site too big to deploy.
+// Non-compressible content bakes its single identity response either way.
+fn buildHttpResponse(allocator: std.mem.Allocator, content: []const u8, content_type: []const u8, is_immutable: bool, gzip_only: bool) !HttpResponse {
+    const compressed = if (isCompressible(content_type)) gzipCompress(allocator, content) else null;
+    if (gzip_only and compressed != null) {
+        const gz = compressed.?;
+        var gz_buf: [64]u8 = undefined;
+        computeEtag(gz, &gz_buf);
+        const etag_gz = try allocator.dupe(u8, gz_buf[0..16]);
+        const response = try renderResponse(allocator, gz, content_type, etag_gz, true, false, is_immutable);
+        return .{ .response = response, .response_gzip = null, .etag = etag_gz, .etag_gzip = null };
+    }
     var etag_buf: [64]u8 = undefined;
     computeEtag(content, &etag_buf);
     const etag = try allocator.dupe(u8, etag_buf[0..16]);
-    const compressed = if (isCompressible(content_type)) gzipCompress(allocator, content) else null;
     const negotiated = compressed != null;
     // Strong etags are per-REPRESENTATION (RFC 9110 §8.8.3): the identity and
     // gzip bodies are different bytes, so they carry different validators.
@@ -2279,8 +2295,9 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes_const: []const P
         \\    const i = by_path.get(path) orelse return null;
         \\    const r = routes[i];
         \\    if (!std.mem.eql(u8, r.method, if (head) "GET" else method)) return null;
-        \\    // If-None-Match validates the SELECTED representation: identity and
-        \\    // gzip are different bytes and carry different strong etags.
+        \\    // If-None-Match validates the SELECTED representation: a
+        \\    // negotiated route's identity and gzip bodies carry different
+        \\    // strong etags; a gzip_only route carries exactly one.
         \\    const use_gz = r.response_gzip != null and wantsGzip(accept_encoding);
         \\    const picked = if (use_gz) r.response_gzip.? else r.response;
         \\    const picked_etag = if (use_gz) r.etag_gzip.? else r.etag;
@@ -2311,6 +2328,19 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes_const: []const P
         \\    try std.testing.expect(wantsGzip("*;q=0, gzip"));
         \\}
         \\
+        \\test "single-representation routes serve their one variant whatever is advertised" {
+        \\    for (routes) |r| {
+        \\        if (r.response_gzip != null) continue;
+        \\        for ([_]?[]const u8{ null, "gzip", "br", "gzip;q=0", "*" }) |ae| {
+        \\            try std.testing.expectEqualStrings(r.response, lookupWithEtag(r.method, r.path, null, ae).?);
+        \\        }
+        \\        const head = r.response[0..std.mem.indexOf(u8, r.response, "\r\n\r\n").?];
+        \\        if (std.mem.indexOf(u8, head, "Content-Encoding") != null) {
+        \\            try std.testing.expect(std.mem.indexOf(u8, head, "Content-Encoding: gzip") != null);
+        \\        }
+        \\    }
+        \\}
+        \\
         \\test "negotiated routes serve identity unless gzip is advertised" {
         \\    for (routes) |r| {
         \\        const gz = r.response_gzip orelse continue;
@@ -2329,20 +2359,11 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes_const: []const P
         \\    }
         \\}
         \\
-        \\test "non-negotiated routes serve identity even when gzip is advertised" {
-        \\    for (routes) |r| {
-        \\        if (r.response_gzip != null) continue;
-        \\        try std.testing.expectEqualStrings(r.response, lookupWithEtag(r.method, r.path, null, "gzip").?);
-        \\        const head = r.response[0..std.mem.indexOf(u8, r.response, "\r\n\r\n").?];
-        \\        try std.testing.expect(std.mem.indexOf(u8, head, "Content-Encoding") == null);
-        \\    }
-        \\}
-        \\
-        \\test "HEAD answers with the selected variant's head and no body" {
+        \\test "HEAD answers with the served variant's head and no body" {
         \\    for (routes) |r| {
         \\        const head = lookupWithEtag("HEAD", r.path, null, null).?;
         \\        const head_end = std.mem.indexOf(u8, r.response, "\r\n\r\n").? + 4;
-        \\        // The head is the identity variant's head — and it is ALL of it.
+        \\        // The head is the single baked variant's head — and it is ALL of it.
         \\        try std.testing.expectEqualStrings(r.response[0..head_end], head);
         \\        try std.testing.expectEqual(head_end, head.len);
         \\        if (r.response_gzip) |gz| {
@@ -2354,15 +2375,15 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes_const: []const P
         \\    }
         \\}
         \\
-        \\test "identity and gzip carry distinct strong etags" {
+        \\test "the served etag validates a 304; negotiated etags stay distinct" {
         \\    for (routes) |r| {
-        \\        const gz_etag = r.etag_gzip orelse continue;
-        \\        try std.testing.expect(!std.mem.eql(u8, r.etag, gz_etag));
-        \\        // 304 only when the client holds the SELECTED variant's etag.
-        \\        try std.testing.expectEqualStrings(response_304, lookupWithEtag(r.method, r.path, gz_etag, "gzip").?);
         \\        try std.testing.expectEqualStrings(response_304, lookupWithEtag(r.method, r.path, r.etag, null).?);
-        \\        // The other variant's etag does not validate this selection.
-        \\        try std.testing.expectEqualStrings(r.response_gzip.?, lookupWithEtag(r.method, r.path, r.etag, "gzip").?);
+        \\        if (r.etag_gzip) |gz_etag| {
+        \\            try std.testing.expect(!std.mem.eql(u8, r.etag, gz_etag));
+        \\            try std.testing.expectEqualStrings(response_304, lookupWithEtag(r.method, r.path, gz_etag, "gzip").?);
+        \\            // The other variant's etag does not validate this selection.
+        \\            try std.testing.expectEqualStrings(r.response_gzip.?, lookupWithEtag(r.method, r.path, r.etag, "gzip").?);
+        \\        }
         \\    }
         \\}
         \\
@@ -2404,6 +2425,7 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes_const: []const P
     // Find the matching ~orisha:static(name: "...") declaration in the program
     var static_root: ?[]const u8 = null;
     var static_fallback: ?[]const u8 = null;
+    var static_gzip_only: bool = false;
 
     for (program.items) |prog_item| {
         if (prog_item != .flow) continue;
@@ -2417,6 +2439,7 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes_const: []const P
             if (std.mem.eql(u8, arg.name, "name")) found_name = stripQuotes(arg.value);
             if (std.mem.eql(u8, arg.name, "root")) static_root = stripQuotes(arg.value);
             if (std.mem.eql(u8, arg.name, "fallback")) static_fallback = stripQuotes(arg.value);
+            if (std.mem.eql(u8, arg.name, "gzip_only")) static_gzip_only = std.mem.eql(u8, std.mem.trim(u8, arg.value, " \t\r\n"), "true");
         }
         if (found_name) |n| {
             if (std.mem.eql(u8, n, static_name)) break;
@@ -2424,6 +2447,7 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes_const: []const P
         // Reset if this wasn't the matching declaration
         static_root = null;
         static_fallback = null;
+        static_gzip_only = false;
     }
 
     if (static_root == null) {
@@ -2431,14 +2455,15 @@ fn generateNamedRoutesFile(allocator: std.mem.Allocator, routes_const: []const P
         return .{};
     }
 
-    std.debug.print("[STATIC_ROUTER] root={s}, fallback={s}\n", .{
+    std.debug.print("[STATIC_ROUTER] root={s}, fallback={s}, gzip_only={s}\n", .{
         static_root.?,
         if (static_fallback) |f| f else "(none)",
+        if (static_gzip_only) "true" else "false",
     });
 
     // Process the directory and generate routes file
     var routes: std.ArrayList(ProcessedRoute) = .empty;
-    processDirectory(allocator, &routes, "GET", "/", static_root.?);
+    processDirectory(allocator, &routes, "GET", "/", static_root.?, static_gzip_only);
 
     const routes_filename = std.fmt.allocPrint(allocator, "generated/{s}_routes.zig", .{static_name}) catch unreachable;
     std.debug.print("[STATIC_ROUTER] Generating {s} ({} routes)\n", .{ routes_filename, routes.items.len });

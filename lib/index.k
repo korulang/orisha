@@ -289,8 +289,11 @@ pub tor ws-accept { req: *Request } -> ?string
 // - name: identifier for referencing via static-router
 // - root: directory to embed (relative to the consuming file)
 // - fallback: optional file for SPA fallback (relative to root, e.g. "200.html")
+// - gzip_only: bake one representation per compressible route (the gzip one,
+//   served to every client) instead of the negotiated identity+gzip pair —
+//   halves the embed for hosts with an artifact size cap (Vercel, 2026-10-15)
 
-[comptime]pub tor static { name: string, root: string, fallback: ?string }
+[comptime]pub tor static { name: string, root: string, fallback: ?string, gzip_only: ?bool }
 
 // ============================================================================
 // STATIC ROUTER - Compile-time transform for static file dispatch
