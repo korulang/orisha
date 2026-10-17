@@ -4,6 +4,7 @@
     "paths": {
         "std": "../../../koru/koru_std",
         "orisha": "../../lib",
-        "koru": "../../../koru-libs"
+        "koru": "../../../koru-libs",
+        "httparena": "../../httparena"
     }
 }

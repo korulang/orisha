@@ -5,11 +5,14 @@
 **Orisha** is the framework (`import orisha`). **This directory** is the HttpArena entry — the genhttp-kestrel shape: a small `main.k` that wires routes and listens.
 
 ```
-orisha/lib/httparena.*   ← route implementations (orisha/httparena:dispatch)
-orisha/httparena/        ← benchmark entry (this tree)
+orisha/httparena/         ← benchmark entry (this tree)
+orisha/httparena/handlers.k ← route implementations (import httparena/handlers)
 ```
 
-Route code lives in `lib/httparena.k` + `lib/httparena.kz` because Koru only nests `orisha/httparena:*` under the framework module from that companion pair. It is **not** part of the public Orisha API — it exists so the entry can call `orisha/httparena:dispatch(req)` with correct `Request`/`Response` types.
+Route code lives in `handlers.k` beside `main.k` — an app module, not part of the
+public Orisha API. It used to sit in `orisha/lib/` for the `orisha/httparena`
+name, which made its `orisha:init` impl (dataset seed) load into every
+`import orisha` consumer; moved out so the library package stays the library.
 
 ## Run locally
 

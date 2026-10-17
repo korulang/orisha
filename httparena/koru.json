@@ -1,10 +1,11 @@
 {
     "name": "httparena-orisha",
     "version": "0.1.0",
-    "description": "HttpArena benchmark entry — Orisha + validate.sh oracle routes",
+    "description": "HttpArena benchmark entry \u2014 Orisha + validate.sh oracle routes",
     "paths": {
         "std": "../../koru/koru_std",
         "orisha": "../lib",
-        "koru": "../../koru-libs"
+        "koru": "../../koru-libs",
+        "httparena": "."
     }
 }

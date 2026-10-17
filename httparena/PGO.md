@@ -8,7 +8,6 @@ Orisha has **compile-time PGO** — not LLVM `-fprofile-instr-generate`, but the
 |---------|--------|
 | **`orisha:static-router`** | Reorders embedded response bodies in the binary (hot pages adjacent) |
 | **`orisha:router`** | Reorders the generated if-chain — hot patterns compared first |
-| **`orisha/httparena:dispatch`** | Legacy monolithic proc — kept for direct calls; board uses router |
 
 Static layout PGO is measured in `benchmarks/twobox/profile-experiment.sh`. Router branch PGO is demonstrated in `examples/pgo-router-case/` — constructed
 31-route table, `/baseline11` declared last, baseline profile at compile time.
@@ -66,16 +65,16 @@ Until `orisha:router` owns HttpArena routes, the showcase is:
 
 ## Migrating HttpArena handler to router (enables full PGO)
 
-Today `main.k` uses `orisha/httparena:dispatch(req)` for typed access to `Request`/`Response`.
+Today `main.k` routes each arm to `httparena/handlers:baseline`/`json` for typed access to `Request`/`Response`.
 
 To get profile-guided **branch** order on baseline/json/pipeline:
 
 ```
 ~orisha:handler = orisha:router(req)
 | [GET /pipeline] !> ...
-| [GET /baseline11] !> orisha/httparena:baseline(req)
-| [POST /baseline11] !> orisha/httparena:baseline(req)
-| [GET /json/:count] p !> orisha/httparena:json(req, count: p.count)
+| [GET /baseline11] !> httparena/handlers:baseline(req)
+| [POST /baseline11] !> httparena/handlers:baseline(req)
+| [GET /json/:count] p !> httparena/handlers:json(req, count: p.count)
 | [*] !> ...
 ```
 
