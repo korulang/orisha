@@ -205,6 +205,24 @@ pub tor query-param { req: *Request, name: string } -> ?string
 pub tor body { req: *Request } -> ?string
 pub tor query { req: *Request } -> ?string
 
+// Every value `name` carries in the form body, decimal-parsed and joined
+// "," — Rails' `params[:user_ids]` shape for multi-select fields. Non-
+// numeric values drop out; no match at all answers "0" so the string can
+// sit inside a SQL IN () list and still exclude everything.
+// Spelling ruled (campfire port, 2026-10-17): `form-ids` sits on the
+// request-reading surface beside `form`/`query-param` — same req+name
+// shape, contract answered as a string for the SQL use-site.
+pub tor form-ids { req: *Request, name: string } -> string
+
+// The undecoded request body, or "". The bot-messages endpoint reads its
+// payload this way (Messages::ByBotsController's raw_request_body) — no
+// content-type gate, matching request.body.read. `raw-body` differs from
+// `body` only in the nullable contract: it collapses absence to "" where
+// `body` answers null.
+// Spelling ruled (same ruling): `raw-body` is the un-decoded-body reader;
+// absent body answers "" as a designed answer, not an error path.
+pub tor raw-body { req: *Request } -> string
+
 // The descriptor the request arrived on — `pump:fileno`'s handler-side
 // twin. A route that upgrades can register the connection for `ws-send-fd`
 // pushes, and `! closed` reports the same integer when it goes away.
@@ -220,6 +238,17 @@ pub tor fd { req: *Request } -> usize
 // 101 head and the pump flips the connection to frames on the way out.
 
 pub tor ws-accept { req: *Request } -> ?string
+
+// ============================================================================
+// GENERATION-BUMP — the page cache's invalidation signal
+// ============================================================================
+// A GET 200 whose Response sets `cacheable` is stored post-render (keyed on
+// method + target + cookie + host + negotiated encoding) and hits skip
+// dispatch. One bump retires every stored page — call it from the write
+// paths the pages must reflect. Pages never decide this themselves: the
+// app knows which writes matter, the cache only keeps the ledger.
+
+pub tor generation-bump {}
 
 // ============================================================================
 // PLATFORM SELECTION

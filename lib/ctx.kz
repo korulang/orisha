@@ -1,0 +1,197 @@
+// Orisha's request context — the implementation.
+//
+// Everything in this file is threadlocal, and that is the whole mechanism:
+// an orisha worker owns its thread and a handler runs to completion on it,
+// so one request's cells and buffers are live at a time and nothing locks.
+// The `.k` companion is where the scoping argument lives; this file only
+// has to be small, fixed, and honest about its bounds.
+//
+// `~pub tor` decls may not live here — KORU111: while the companion exists,
+// the public surface is the contract's job. These are bodies only.
+
+const std = @import("std");
+const builtin = @import("builtin");
+
+// Cells and buffers heap-allocate (the body accumulator) or sit inline
+// (cells). Neither exists on a freestanding target — a compile error here
+// rather than a server that panics on its first request.
+const alloc = switch (builtin.os.tag) {
+    .freestanding, .wasi => @compileError("orisha/ctx needs a heap and OS threads; a freestanding target has neither. Bake responses with ~orisha:static, or port the accumulator behind a fixed buffer."),
+    else => std.heap.page_allocator,
+};
+
+// ============================================================================
+// CELLS
+// ============================================================================
+// Fixed tables, name-keyed by linear scan — a request stashes a handful of
+// values, so a hash map would be machinery for its own sake. A full table is
+// a programming error (the app named more cells than exist), so it panics
+// loudly rather than evicting a live cell and lying about what was stashed.
+
+const INT_SLOTS = 24;
+const TEXT_SLOTS = 16;
+const TEXT_CAP = 2048;
+
+const IntCell = struct { name: []const u8, v: i64, live: bool };
+const TextCell = struct { name: []const u8, buf: [TEXT_CAP]u8, len: usize, live: bool };
+
+threadlocal var int_cells: [INT_SLOTS]IntCell = undefined;
+threadlocal var int_live: [INT_SLOTS]bool = .{false} ** INT_SLOTS;
+threadlocal var text_cells: [TEXT_SLOTS]TextCell = undefined;
+threadlocal var text_live: [TEXT_SLOTS]bool = .{false} ** TEXT_SLOTS;
+
+// Slot lookup by name. A set finds the live cell with this name or claims
+// the first dead one; a read only sees live cells.
+fn intSlotIx(name: []const u8) usize {
+    var dead: ?usize = null;
+    for (0..INT_SLOTS) |i| {
+        if (int_live[i]) {
+            if (std.mem.eql(u8, int_cells[i].name, name)) return i;
+        } else if (dead == null) dead = i;
+    }
+    const i = dead orelse @panic("orisha/ctx: int cell table full (24 slots)");
+    int_live[i] = true;
+    int_cells[i].name = name;
+    return i;
+}
+
+fn intFindIx(name: []const u8) ?usize {
+    for (0..INT_SLOTS) |i| {
+        if (int_live[i] and std.mem.eql(u8, int_cells[i].name, name)) return i;
+    }
+    return null;
+}
+
+fn textSlotIx(name: []const u8) usize {
+    var dead: ?usize = null;
+    for (0..TEXT_SLOTS) |i| {
+        if (text_live[i]) {
+            if (std.mem.eql(u8, text_cells[i].name, name)) return i;
+        } else if (dead == null) dead = i;
+    }
+    const i = dead orelse @panic("orisha/ctx: text cell table full (16 slots)");
+    text_live[i] = true;
+    text_cells[i].name = name;
+    return i;
+}
+
+fn textFindIx(name: []const u8) ?usize {
+    for (0..TEXT_SLOTS) |i| {
+        if (text_live[i] and std.mem.eql(u8, text_cells[i].name, name)) return i;
+    }
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+
+~proc set-int|zig {
+    const i = intSlotIx(name);
+    int_cells[i].v = v;
+}
+
+~proc int|zig {
+    if (intFindIx(name)) |i| return int_cells[i].v;
+    return null;
+}
+
+~proc int-or|zig {
+    if (intFindIx(name)) |i| return int_cells[i].v;
+    return default;
+}
+
+~proc take-int|zig {
+    const i = intFindIx(name) orelse return null;
+    int_live[i] = false;
+    return int_cells[i].v;
+}
+
+~proc take-int-or|zig {
+    const i = intFindIx(name) orelse return default;
+    int_live[i] = false;
+    return int_cells[i].v;
+}
+
+~proc set-text|zig {
+    const i = textSlotIx(name);
+    const c = &text_cells[i];
+    if (v.len > TEXT_CAP) {
+        @memcpy(c.buf[0..TEXT_CAP], v[0..TEXT_CAP]);
+        c.len = TEXT_CAP;
+        return .truncated;
+    }
+    @memcpy(c.buf[0..v.len], v);
+    c.len = v.len;
+    return .ok;
+}
+
+// An empty stash and an unstashed cell are the same fact — callers use the
+// cell for "the row gave me a column", and col.text hands "" for NULL, so
+// length zero IS absence.
+~proc text|zig {
+    const i = textFindIx(name) orelse return null;
+    const c = &text_cells[i];
+    if (c.len == 0) return null;
+    return c.buf[0..c.len];
+}
+
+~proc take-text|zig {
+    const i = textFindIx(name) orelse return null;
+    const c = &text_cells[i];
+    text_live[i] = false;
+    if (c.len == 0) return null;
+    return c.buf[0..c.len];
+}
+
+~proc clear|zig {
+    int_live = .{false} ** INT_SLOTS;
+    text_live = .{false} ** TEXT_SLOTS;
+}
+
+// ============================================================================
+// BODY — the outgoing-body accumulator
+// ============================================================================
+// Two buffers, one per nesting level: `body` is the page, `frag` is the
+// row-fragment rendered to be embedded INSIDE the page. body-take returns a
+// live slice of body_buf — folding rows into body_buf and then embedding it
+// in a component would dangle the fragment (and double its bytes). begin
+// clears both.
+//
+// page_allocator: the accumulator's growth is mmap'd pages retained for the
+// process, so a busy server's per-request alloc churn stays near zero —
+// matching the measured shape this mechanism replaced.
+
+threadlocal var body_buf: std.ArrayList(u8) = .empty;
+threadlocal var frag_buf: std.ArrayList(u8) = .empty;
+
+~proc begin|zig {
+    body_buf.clearRetainingCapacity();
+    frag_buf.clearRetainingCapacity();
+}
+
+~proc body-write|zig {
+    body_buf.appendSlice(alloc, text) catch unreachable;
+}
+
+~proc body-take|zig {
+    return body_buf.items;
+}
+
+~proc frag-write|zig {
+    frag_buf.appendSlice(alloc, text) catch unreachable;
+}
+
+~proc frag-take|zig {
+    return frag_buf.items;
+}
+
+~proc has-content|zig {
+    return body_buf.items.len > 0;
+}
+
+~proc body-status|zig {
+    return if (body_buf.items.len > 0) 200 else 204;
+}
+
+~proc body-status-or|zig {
+    return if (body_buf.items.len > 0) 200 else status;
+}

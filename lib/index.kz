@@ -15,6 +15,13 @@
     exe.linkLibC();
 }
 
+// Runtime gzip on handler-built bodies calls the same zlib the compile-time
+// static-route bake uses — the app binary needs the link too.
+~std/build:requires {
+    exe.linkSystemLibrary("z");
+    exe.linkLibC();
+}
+
 const std = @import("std");
 const ast = @import("ast");
 const Program = ast.Program;
@@ -278,6 +285,13 @@ pub const Response = struct {
     // that rendered its own Date at the splice point.
     wire: bool = false,
     wire_date_hole: usize = 0,
+    // Opt-in to the generation-keyed page cache: a GET 200 marked cacheable
+    // is stored once rendered (post-gzip, keyed on method + target + cookie +
+    // host + negotiated encoding) and later hits skip dispatch entirely. The
+    // handler's voucher is "this response depends only on those inputs and
+    // the current data generation" — writes the page must reflect are the
+    // app's signal to `generation-bump`, never the cache's guess.
+    cacheable: bool = false,
 };
 
 // The header is built into a buffer that outlives the frame, because `answer`
@@ -563,6 +577,125 @@ fn formField(allocator: std.mem.Allocator, encoded: []const u8, name: []const u8
 // after it — on keep-alive the next read would parse them as a response.
 const RESPONSE_500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
+// ============================================================================
+// PAGE CACHE — generation-keyed finished responses
+// ============================================================================
+// A GET 200 whose handler set `Response.cacheable` is stored post-gzip and
+// later hits return the stored bytes without dispatch. The key hashes
+// everything the render may observe: method, decoded path, query, Cookie
+// header, Host header, and the negotiated encoding (gzip and identity
+// variants coexist as different keys). Writes invalidate through
+// `generation-bump`: a stale entry is skipped on lookup and freed on the
+// next store, so nothing ever serves across a bump. Every slice the map
+// holds is cache-owned; a hit serves a private dupe, so no send in flight
+// can ever point at memory an eviction frees.
+
+const PageEntry = struct {
+    gen: u64,
+    status: u16,
+    content_type: ?[]const u8,
+    content_encoding: ?[]const u8,
+    extra_headers: ?[]const u8,
+    body: []const u8,
+};
+
+var page_cache_mu: std.Thread.Mutex = .{};
+var page_cache_map: ?std.AutoHashMap(u128, PageEntry) = null;
+var page_cache_gen: std.atomic.Value(u64) = .init(1);
+const PAGE_CACHE_MAX: usize = 1024;
+
+pub fn generationBump() void {
+    _ = page_cache_gen.fetchAdd(1, .acq_rel);
+}
+
+fn pageCacheKey(method: []const u8, path: []const u8, query: ?[]const u8, cookie: ?[]const u8, host: ?[]const u8, ae_gzip: bool) u128 {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update(method);
+    h.update("\x00");
+    h.update(path);
+    h.update("\x00");
+    if (query) |q| h.update(q);
+    h.update("\x00");
+    if (cookie) |c| h.update(c);
+    h.update("\x00");
+    if (host) |hh| h.update(hh);
+    var out: [32]u8 = undefined;
+    h.final(&out);
+    out[0] ^= @intFromBool(ae_gzip);
+    return std.mem.readInt(u128, out[0..16], .little);
+}
+
+fn pageCacheFree(e: PageEntry) void {
+    const a = koru_allocator();
+    a.free(e.body);
+    if (e.content_type) |s| a.free(s);
+    if (e.content_encoding) |s| a.free(s);
+    if (e.extra_headers) |s| a.free(s);
+}
+
+// A hit's small header fields are duped alongside the body so nothing served
+// references the map after the lock drops. The caller frees these three
+// after the head is rendered (they are spliced into head_out, never sent
+// directly); `body` goes out with body_allocated and is released by the
+// normal post-send path.
+const PageHit = struct {
+    res: Response,
+    small: [3]?[]const u8,
+};
+
+fn pageCacheGet(key: u128) ?PageHit {
+    page_cache_mu.lock();
+    defer page_cache_mu.unlock();
+    const map = if (page_cache_map) |*m| m else return null;
+    const e = map.get(key) orelse return null;
+    if (e.gen != page_cache_gen.load(.acquire)) return null;
+    const a = koru_allocator();
+    const body = a.dupe(u8, e.body) catch return null;
+    var small: [3]?[]const u8 = .{ null, null, null };
+    if (e.content_type) |s| small[0] = a.dupe(u8, s) catch null;
+    if (e.content_encoding) |s| small[1] = a.dupe(u8, s) catch null;
+    if (e.extra_headers) |s| small[2] = a.dupe(u8, s) catch null;
+    return .{ .res = .{ .status = e.status, .body = body, .content_type = small[0], .content_encoding = small[1], .extra_headers = small[2], .body_allocated = true }, .small = small };
+}
+
+fn pageCachePut(key: u128, status: u16, content_type: ?[]const u8, content_encoding: ?[]const u8, extra_headers: ?[]const u8, body: []const u8) void {
+    const a = koru_allocator();
+    page_cache_mu.lock();
+    defer page_cache_mu.unlock();
+    if (page_cache_map == null) page_cache_map = std.AutoHashMap(u128, PageEntry).init(a);
+    const map = &page_cache_map.?;
+    const gen = page_cache_gen.load(.acquire);
+    // Retire entries a bump made unservable, then bound the map.
+    var keys: [64]u128 = undefined;
+    var n: usize = 0;
+    var it = map.iterator();
+    while (it.next()) |kv| {
+        if (kv.value_ptr.gen != gen and n < keys.len) {
+            keys[n] = kv.key_ptr.*;
+            n += 1;
+        }
+    }
+    for (keys[0..n]) |k| {
+        const e = map.fetchRemove(k) orelse continue;
+        pageCacheFree(e.value);
+    }
+    if (map.count() >= PAGE_CACHE_MAX) {
+        var it2 = map.iterator();
+        while (it2.next()) |kv| pageCacheFree(kv.value_ptr.*);
+        map.clearRetainingCapacity();
+    }
+    const owned: PageEntry = .{
+        .gen = gen,
+        .status = status,
+        .content_type = if (content_type) |s| (a.dupe(u8, s) catch return) else null,
+        .content_encoding = if (content_encoding) |s| (a.dupe(u8, s) catch return) else null,
+        .extra_headers = if (extra_headers) |s| (a.dupe(u8, s) catch return) else null,
+        .body = a.dupe(u8, body) catch return,
+    };
+    if (map.fetchRemove(key)) |old| pageCacheFree(old.value);
+    map.put(key, owned) catch pageCacheFree(owned);
+}
+
 ~proc answer|zig {
     const req_allocator = $mod.requestAllocator();
     const raw = x.raw;
@@ -610,7 +743,40 @@ const RESPONSE_500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\
     // request materialization below. A hit shares the same response tail as
     // the full path; a miss pays one call and a few compares and everything
     // proceeds exactly as it always did.
-    const res = $mod.handler_lite_event.handler(.{ .method = method, .path = path }) orelse blk: {
+    // Read once at function scope: the lite path skips the request-
+    // materialization block below, but the runtime-gzip tail negotiates on
+    // this header no matter which dispatch produced the response.
+    const accept_encoding: ?[]const u8 = if (parsed) |h|
+        (if (h.accept_encoding_off != 0) raw[h.accept_encoding_off..][0..h.accept_encoding_len] else null)
+    else
+        $mod.headValueParsed(parsed, raw, "accept-encoding");
+
+    // Page-cache lookup precedes even handler-lite — a hit is a finished
+    // response rejoining the shared tail. Only GETs are ever stored, so
+    // everything else skips the key hash entirely. `served_small` carries a
+    // hit's three duped header fields; they are dead the moment the head is
+    // rendered, and the defer settles them on every return path.
+    var served_small: [3]?[]const u8 = .{ null, null, null };
+    defer for (served_small) |s| {
+        if (s) |v| koru_allocator().free(v);
+    };
+    const page_key: u128 = if (std.mem.eql(u8, method, "GET")) pageCacheKey(
+        method,
+        path,
+        query,
+        $mod.headValueParsed(parsed, raw, "cookie"),
+        $mod.headValueParsed(parsed, raw, "host"),
+        aeWantsGzip(accept_encoding),
+    ) else 0;
+
+    const res = res_blk: {
+        if (page_key != 0) {
+            if (pageCacheGet(page_key)) |hit| {
+                served_small = hit.small;
+                break :res_blk hit.res;
+            }
+        }
+        break :res_blk $mod.handler_lite_event.handler(.{ .method = method, .path = path }) orelse blk: {
         var client_etag: ?[]const u8 = null;
         // Header names are case-insensitive. The Vercel adapter used to omit this
         // header entirely; once it forwards it, browsers send `If-None-Match` in
@@ -626,11 +792,6 @@ const RESPONSE_500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\
                 client_etag = tag;
             }
         }
-
-        const accept_encoding: ?[]const u8 = if (parsed) |h|
-            (if (h.accept_encoding_off != 0) raw[h.accept_encoding_off..][0..h.accept_encoding_len] else null)
-        else
-            $mod.headValueParsed(parsed, raw, "accept-encoding");
 
         var body: ?[]const u8 = null;
         var headers_block: ?[]const u8 = null;
@@ -675,6 +836,7 @@ const RESPONSE_500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\
         };
 
         break :blk $mod.handler_event.handler(.{ .req = &req });
+        };
     };
 
     // A handler that already rendered a whole response (a static route) hands
@@ -750,44 +912,81 @@ const RESPONSE_500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\
         return .{ .head = head101, .body = res.body, .body_allocated = res.body_allocated, .date_hole = 0, .close = res.close, .head_static = false, .body_static = res.body_static and !res.body_allocated };
     }
 
+    // Runtime gzip for dynamic bodies. Static routes bake both
+    // representations at build time; a handler-built body gets the fast dial
+    // here when the client advertised gzip and the type compresses. The
+    // scratch slice leaves through the copy path — body_static forced false —
+    // so the next exchange on this worker may overwrite the buffer. A body
+    // the handler already encoded is left alone: double-encoding is a
+    // protocol violation, not an optimization.
+    var body_out = res.body;
+    var body_allocated = res.body_allocated;
+    var content_encoding = res.content_encoding;
+    var body_static = res.body_static;
+    if (content_encoding == null and body_out.len >= 100 and
+        res.content_type != null and isCompressible(res.content_type.?) and
+        aeWantsGzip(accept_encoding))
+    {
+        if (gzipCompressLevel(koru_allocator(), body_out, zlib.Z_BEST_SPEED)) |gz| {
+            if (gz.len < body_out.len) {
+                if (body_allocated) koru_allocator().free(body_out);
+                body_out = gz;
+                body_allocated = true;
+                body_static = false;
+                content_encoding = "gzip";
+            } else koru_allocator().free(gz);
+        }
+    }
+
+    // Store the finished response — post-gzip, so each negotiated encoding
+    // lands under its own key and hits never pay deflate twice. Opted-in GET
+    // 200s only; the lookup key was built before dispatch and stays valid.
+    if (res.cacheable and page_key != 0 and res.status == 200) {
+        pageCachePut(page_key, res.status, res.content_type, content_encoding, res.extra_headers, body_out);
+    }
+
     // A bufPrint failure answers null now, not the canned 500, so the leg
     // below can send an EMPTY body. The old shape wrote the 500's
     // "Content-Length: 0" head and then still shipped res.body after it —
     // on keep-alive those bytes became the NEXT response's head.
-    const head = if (res.content_encoding) |enc| blk: {
+    const head = if (content_encoding) |enc| blk: {
         if (headerPrefixKeepAlive(res.status)) |prefix| {
             break :blk std.fmt.bufPrint(
                 head_out,
                 "{s}{d}\r\n{s}Content-Encoding: {s}\r\nDate: {s}\r\nX-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\n{s}\r\n",
-                .{ prefix, res.body.len, res_ct, enc, &date_buf, extras },
+                .{ prefix, body_out.len, res_ct, enc, &date_buf, extras },
             ) catch null;
         }
         break :blk std.fmt.bufPrint(
             head_out,
             "HTTP/1.1 {d} {s}\r\n{s}Content-Encoding: {s}\r\nContent-Length: {d}\r\nDate: {s}\r\nX-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\n{s}\r\n",
-            .{ res.status, statusText(res.status), res_ct, enc, res.body.len, &date_buf, extras },
+            .{ res.status, statusText(res.status), res_ct, enc, body_out.len, &date_buf, extras },
         ) catch null;
     } else if (headerPrefixKeepAlive(res.status)) |prefix|
-        std.fmt.bufPrint(head_out, "{s}{d}\r\n{s}Date: {s}\r\nX-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\n{s}\r\n", .{ prefix, res.body.len, res_ct, &date_buf, extras }) catch
+        std.fmt.bufPrint(head_out, "{s}{d}\r\n{s}Date: {s}\r\nX-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\n{s}\r\n", .{ prefix, body_out.len, res_ct, &date_buf, extras }) catch
             null
     else
         std.fmt.bufPrint(
             head_out,
             "HTTP/1.1 {d} {s}\r\n{s}Content-Length: {d}\r\nDate: {s}\r\nX-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\n{s}\r\n",
-            .{ res.status, statusText(res.status), res_ct, res.body.len, &date_buf, extras },
+            .{ res.status, statusText(res.status), res_ct, body_out.len, &date_buf, extras },
         ) catch null;
 
     const head_slice = head orelse {
-        if (res.body_allocated) koru_allocator().free(res.body);
+        if (body_allocated) koru_allocator().free(body_out);
         return .{ .head = RESPONSE_500, .body = "", .body_allocated = false, .date_hole = 0, .close = res.close, .head_static = true, .body_static = false };
     };
-    return .{ .head = head_slice, .body = res.body, .body_allocated = res.body_allocated, .date_hole = 0, .close = res.close, .head_static = false, .body_static = res.body_static and !res.body_allocated };
+    return .{ .head = head_slice, .body = body_out, .body_allocated = body_allocated, .date_hole = 0, .close = res.close, .head_static = false, .body_static = body_static and !body_allocated };
 }
 
 ~proc release-body|zig {
     if (allocated) {
         koru_allocator().free(body);
     }
+}
+
+~proc generation-bump|zig {
+    generationBump();
 }
 
 // The descriptor the request arrived on — the handler's half of
@@ -852,6 +1051,45 @@ const RESPONSE_500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\
 
 ~proc query|zig {
     return req.query;
+}
+
+threadlocal var ids_buf: [1024]u8 = undefined;
+
+// form-ids' worker: walk the pair list, keep every pair whose decoded key
+// matches `name`, decimal-parse each value (leading digits only — Rails'
+// to_i semantics), and join the survivors ",". Every early "0" below is
+// the designed no-match answer — an IN list that selects no rows — not
+// an error or a substitute result; absent/mistyped input is valid input.
+~proc form-ids|zig {
+    const block = req.headers orelse return "0";
+    const ct = headValueParsed(req.head, block, "content-type") orelse return "0";
+    const urlencoded = "application/x-www-form-urlencoded";
+    if (ct.len < urlencoded.len or !std.ascii.eqlIgnoreCase(ct[0..urlencoded.len], urlencoded)) return "0";
+    const body = req.body orelse return "0";
+    var w: usize = 0;
+    var pairs = std.mem.splitScalar(u8, body, '&');
+    while (pairs.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        const key = urlDecode(req.allocator, pair[0..eq]) orelse continue;
+        if (!std.mem.eql(u8, key, name)) continue;
+        const val = urlDecode(req.allocator, pair[eq + 1 ..]) orelse continue;
+        var n: i64 = 0;
+        var digits: usize = 0;
+        for (val) |c| {
+            if (c < '0' or c > '9') break;
+            n = n * 10 + (c - '0');
+            digits += 1;
+        }
+        if (digits == 0) continue;
+        const written = std.fmt.bufPrint(ids_buf[w..], "{s}{d}", .{ if (w == 0) "" else ",", n }) catch break;
+        w += written.len;
+    }
+    if (w == 0) return "0";
+    return ids_buf[0..w];
+}
+
+~proc raw-body|zig {
+    return req.body orelse "";
 }
 
 fn statusText(status: u16) []const u8 {
@@ -1961,7 +2199,46 @@ fn isCompressible(content_type: []const u8) bool {
     return false;
 }
 
+/// Did this coding's own parameters refuse it? `q=0` is an explicit
+/// refusal — presence in the list is not consent. A malformed qvalue
+/// refuses too: identity is always legal, so doubt serves identity.
+/// (Same logic as the emitted `codingRefused` in the static-route
+/// template — kept in step deliberately.)
+fn aeCodingRefused(params: []const u8) bool {
+    var it = std.mem.splitScalar(u8, params, ';');
+    while (it.next()) |param| {
+        const p = std.mem.trim(u8, param, " \t");
+        if (p.len >= 2 and (p[0] == 'q' or p[0] == 'Q') and p[1] == '=') {
+            const v = std.fmt.parseFloat(f64, std.mem.trim(u8, p[2..], " \t")) catch return true;
+            return v == 0;
+        }
+    }
+    return false;
+}
+
+fn aeWantsGzip(accept_encoding: ?[]const u8) bool {
+    const ae = accept_encoding orelse return false;
+    var star: ?[]const u8 = null;
+    var it = std.mem.splitScalar(u8, ae, ',');
+    while (it.next()) |raw_entry| {
+        const entry = std.mem.trim(u8, raw_entry, " \t");
+        const semi = std.mem.indexOfScalar(u8, entry, ';') orelse entry.len;
+        const name = std.mem.trim(u8, entry[0..semi], " \t");
+        if (std.ascii.eqlIgnoreCase(name, "gzip")) {
+            // An explicit entry beats the wildcard (RFC 9110 §12.5.3).
+            return !aeCodingRefused(entry[semi..]);
+        }
+        if (std.mem.eql(u8, name, "*")) star = entry[semi..];
+    }
+    const sp = star orelse return false;
+    return !aeCodingRefused(sp);
+}
+
 fn gzipCompress(allocator: std.mem.Allocator, content: []const u8) ?[]const u8 {
+    return gzipCompressLevel(allocator, content, zlib.Z_DEFAULT_COMPRESSION);
+}
+
+fn gzipCompressLevel(allocator: std.mem.Allocator, content: []const u8, level: c_int) ?[]const u8 {
     if (content.len < 100) return null;
     const max_output = zlib.compressBound(@intCast(content.len));
     const output = allocator.alloc(u8, max_output) catch return null;
@@ -1970,7 +2247,7 @@ fn gzipCompress(allocator: std.mem.Allocator, content: []const u8) ?[]const u8 {
     strm.avail_in = @intCast(content.len);
     strm.next_out = output.ptr;
     strm.avail_out = @intCast(output.len);
-    if (zlib.deflateInit2(&strm, zlib.Z_DEFAULT_COMPRESSION, zlib.Z_DEFLATED, 15 + 16, 8, zlib.Z_DEFAULT_STRATEGY) != zlib.Z_OK) {
+    if (zlib.deflateInit2(&strm, level, zlib.Z_DEFLATED, 15 + 16, 8, zlib.Z_DEFAULT_STRATEGY) != zlib.Z_OK) {
         allocator.free(output);
         return null;
     }
