@@ -173,6 +173,22 @@ pub tor cookie { req: *Request, name: string } -> ?string
 pub tor form { req: *Request, name: string } -> ?string
 pub tor query-param { req: *Request, name: string } -> ?string
 
+// Every value `name` carries in the form body, decimal-parsed and joined
+// "," — Rails' `params[:user_ids]` shape for multi-select fields. Non-
+// numeric values drop out; no match at all answers "0" so the string can
+// sit inside a SQL IN () list and still exclude everything.
+// Spelling ruled (campfire port, 2026-10-17): `form-ids` sits on the
+// request-reading surface beside `form`/`query-param` — same req+name
+// shape, contract answered as a string for the SQL use-site.
+pub tor form-ids { req: *Request, name: string } -> string
+
+// The undecoded request body, or "". The bot-messages endpoint reads its
+// payload this way (Messages::ByBotsController's raw_request_body) — no
+// content-type gate, matching request.body.read.
+// Spelling ruled (same ruling): `raw-body` is the un-decoded-body reader;
+// absent body answers "" as a designed answer, not an error path.
+pub tor raw-body { req: *Request } -> string
+
 // The descriptor the request arrived on — `pump:fileno`'s handler-side
 // twin. A route that upgrades can register the connection for `ws-send-fd`
 // pushes, and `! closed` reports the same integer when it goes away.

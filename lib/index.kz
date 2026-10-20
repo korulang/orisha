@@ -1043,6 +1043,45 @@ fn pageCachePut(key: u128, status: u16, content_type: ?[]const u8, content_encod
     return formField(req.allocator, q, name);
 }
 
+threadlocal var ids_buf: [1024]u8 = undefined;
+
+// form-ids' worker: walk the pair list, keep every pair whose decoded key
+// matches `name`, decimal-parse each value (leading digits only — Rails'
+// to_i semantics), and join the survivors ",". Every early "0" below is
+// the designed no-match answer — an IN list that selects no rows — not
+// an error or a substitute result; absent/mistyped input is valid input.
+~proc form-ids|zig {
+    const block = req.headers orelse return "0";
+    const ct = headValueParsed(req.head, block, "content-type") orelse return "0";
+    const urlencoded = "application/x-www-form-urlencoded";
+    if (ct.len < urlencoded.len or !std.ascii.eqlIgnoreCase(ct[0..urlencoded.len], urlencoded)) return "0";
+    const body = req.body orelse return "0";
+    var w: usize = 0;
+    var pairs = std.mem.splitScalar(u8, body, '&');
+    while (pairs.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        const key = urlDecode(req.allocator, pair[0..eq]) orelse continue;
+        if (!std.mem.eql(u8, key, name)) continue;
+        const val = urlDecode(req.allocator, pair[eq + 1 ..]) orelse continue;
+        var n: i64 = 0;
+        var digits: usize = 0;
+        for (val) |c| {
+            if (c < '0' or c > '9') break;
+            n = n * 10 + (c - '0');
+            digits += 1;
+        }
+        if (digits == 0) continue;
+        const written = std.fmt.bufPrint(ids_buf[w..], "{s}{d}", .{ if (w == 0) "" else ",", n }) catch break;
+        w += written.len;
+    }
+    if (w == 0) return "0";
+    return ids_buf[0..w];
+}
+
+~proc raw-body|zig {
+    return req.body orelse "";
+}
+
 fn statusText(status: u16) []const u8 {
     return switch (status) {
         200 => "OK",
