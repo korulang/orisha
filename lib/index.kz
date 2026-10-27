@@ -471,7 +471,10 @@ fn decodeChunkedPayload(body: []const u8, out: []u8) ?[]const u8 {
         pos = line_end + 2;
         if (chunk_size == 0) return out[0..w];
         if (w + chunk_size > out.len) return null;
-        @memcpy(out[w .. w + chunk_size], body[pos .. pos + chunk_size]);
+        // copyForwards, not memcpy: callers decode in place over the wire
+        // bytes — w trails pos by at least the chunk-line bytes, so the
+        // ranges overlap and only a forward copy has a defined order.
+        std.mem.copyForwards(u8, out[w .. w + chunk_size], body[pos .. pos + chunk_size]);
         w += chunk_size;
         pos += chunk_size;
         if (pos + 2 > body.len or body[pos] != '\r' or body[pos + 1] != '\n') return null;
@@ -800,8 +803,11 @@ fn pageCachePut(key: u128, status: u16, content_type: ?[]const u8, content_encod
             headers_block = raw[0..h.head_len];
             const body_raw = if (h.head_len < raw.len) raw[h.head_len..] else "";
             if (h.chunked) {
-                var decoded_buf: [4096]u8 = undefined;
-                if (decodeChunkedPayload(body_raw, &decoded_buf)) |decoded| {
+                // Decode in place: the payload is always shorter than the
+                // framing it rode in on, so writing back over body_raw can
+                // never overtake the read cursor. No arena, no size cap —
+                // the request arena is 64KiB and the 8gbit bodies go past it.
+                if (decodeChunkedPayload(body_raw, @constCast(body_raw))) |decoded| {
                     body = decoded;
                 }
             } else if (body_raw.len > 0) {
@@ -813,8 +819,8 @@ fn pageCachePut(key: u128, status: u16, content_type: ?[]const u8, content_encod
             headers_block = block;
             const body_raw = if (headers_end < raw.len) raw[headers_end..] else "";
             if (transferEncodingChunkedHead(block)) {
-                var decoded_buf: [4096]u8 = undefined;
-                if (decodeChunkedPayload(body_raw, &decoded_buf)) |decoded| {
+                // In place — see the parsed branch above.
+                if (decodeChunkedPayload(body_raw, @constCast(body_raw))) |decoded| {
                     body = decoded;
                 }
             } else if (body_raw.len > 0) {

@@ -17,6 +17,7 @@ import std/store
 pub tor baseline { req: *orisha:Request } -> orisha:Response
 pub tor json { req: *orisha:Request, count: string } -> orisha:Response
 pub tor ws-upgrade { req: *orisha:Request } -> orisha:Response
+pub tor echo { req: *orisha:Request } -> orisha:Response
 
 // The dataset's process-lifetime home. Each row is one item's wire view —
 // every byte the response carries except the request-scoped `total` — held
@@ -278,3 +279,8 @@ ws-upgrade = orisha:ws-accept(req): acc
 |> if(astr.len == 0)
     | then -> { status: 400, body: "websocket upgrade requires Sec-WebSocket-Key", content_type: "text/plain" }
     | else |> ws-headers(key: astr): hdr -> { status: 101, body: "", content_type: "text/plain", extra_headers: hdr }
+
+// 8gbit: byte-exact echo of the entity — decoded chunked or Content-Length
+// body alike, borrowed from the request arena (sent inside the arm, freed
+// with it). An absent body answers 200 with nothing, as the contract asks.
+echo = orisha:body(req): b -> { status: 200, body: b orelse "", content_type: "application/octet-stream" }

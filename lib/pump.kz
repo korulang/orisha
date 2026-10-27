@@ -366,7 +366,7 @@ pub const ConnState = struct {
     ssl: ?*ServerTls = null,
     mode: ConnMode = .http,
     ws_mu: SendMutex = .{},
-    buf: [REQUEST_BUFFER]u8 = undefined,
+    buf: []u8 = &.{},
     len: usize = 0,
     // Websocket reassembly — only meaningful while mode == .ws. `buf` holds
     // undispatched wire bytes like always; frames too big or fragmented for
@@ -520,6 +520,11 @@ fn connState(fd: posix.fd_t) ?*ConnState {
     if (conn_states[idx]) |s| return s;
     const s = pumpAlloc().create(ConnState) catch return null;
     s.* = .{ .fd = fd };
+    s.buf = pumpAlloc().alloc(u8, REQUEST_BUFFER) catch {
+        conn_states[idx] = null;
+        pumpAlloc().destroy(s);
+        return null;
+    };
     s.wsq_head = &s.wsq_stub;
     s.wsq_tail.store(&s.wsq_stub, .monotonic);
     conn_states[idx] = s;
@@ -600,7 +605,28 @@ fn closeConnWire(st: *ConnState) void {
     }
 }
 
+// Grow the per-conn request buffer past REQUEST_BUFFER only when a request
+// actually needs it — a large declared body (the 8gbit echo) must fit whole
+// before dispatch, but the baseline conn should never pay for it. Returns
+// false past REQ_BUF_MAX: a conn claiming more than that is abuse, not a
+// workload.
+const REQ_BUF_MAX = 256 * 1024 * 1024;
+
+fn growReqBuf(st: *ConnState) bool {
+    const want = @min(st.buf.len * 4, REQ_BUF_MAX);
+    if (want <= st.buf.len) return false;
+    const nb = pumpAlloc().alloc(u8, want) catch return false;
+    @memcpy(nb[0..st.len], st.buf[0..st.len]);
+    pumpAlloc().free(st.buf);
+    st.buf = nb;
+    return true;
+}
+
 fn closeConnMem(st: *ConnState) void {
+    if (st.buf.len > 0) {
+        pumpAlloc().free(st.buf);
+        st.buf = &.{};
+    }
     st.ws_msg.deinit(pumpAlloc());
     st.pending.deinit(pumpAlloc());
     wsqClear(st);
@@ -2460,8 +2486,8 @@ fn workerCount() usize {
                         }
                         if (!ws_alive) break;
                     }
-                    st.len = $mod.retainTail(&st.buf, st.len, ws_consumed);
-                    if (ws_alive and st.len == st.buf.len) ws_alive = false;
+                    st.len = $mod.retainTail(st.buf, st.len, ws_consumed);
+                    if (ws_alive and st.len == st.buf.len) ws_alive = $mod.growReqBuf(st);
                     if (!ws_alive) {
                         if ($mod.hasWork(st)) {
                             st.close_when_drained = true;
@@ -2498,10 +2524,10 @@ fn workerCount() usize {
                 }
                 st.batching = false;
                 _ = $mod.flushPending(st);
-                st.len = $mod.retainTail(&st.buf, st.len, consumed);
+                st.len = $mod.retainTail(st.buf, st.len, consumed);
 
                 // Headers that never end are not a request this server can answer.
-                if (alive and st.len == st.buf.len) alive = false;
+                if (alive and st.len == st.buf.len) alive = $mod.growReqBuf(st);
 
                 if (!alive) {
                     if ($mod.hasWork(st)) {
@@ -3105,8 +3131,8 @@ fn workerCount() usize {
                             }
                             if (!ws_alive) break;
                         }
-                        st.len = $mod.retainTail(&st.buf, st.len, ws_consumed);
-                        if (ws_alive and st.len == st.buf.len) ws_alive = false;
+                        st.len = $mod.retainTail(st.buf, st.len, ws_consumed);
+                        if (ws_alive and st.len == st.buf.len) ws_alive = $mod.growReqBuf(st);
                         if (!ws_alive) {
                             if ($mod.hasWork(st)) {
                                 st.close_when_drained = true;
@@ -3143,10 +3169,10 @@ fn workerCount() usize {
                     }
                     st.batching = false;
                     _ = $mod.flushPending(st);
-                    st.len = $mod.retainTail(&st.buf, st.len, consumed);
+                    st.len = $mod.retainTail(st.buf, st.len, consumed);
 
                     // Headers that never end are not a request this server can answer.
-                    if (alive and st.len == st.buf.len) alive = false;
+                    if (alive and st.len == st.buf.len) alive = $mod.growReqBuf(st);
 
                     if (!alive) {
                         // A closing answer still in the queue drains first —
@@ -3431,8 +3457,8 @@ fn workerCount() usize {
                             }
                             if (!ws_alive) break;
                         }
-                        st.len = $mod.retainTail(&st.buf, st.len, ws_consumed);
-                        if (ws_alive and st.len == st.buf.len) ws_alive = false;
+                        st.len = $mod.retainTail(st.buf, st.len, ws_consumed);
+                        if (ws_alive and st.len == st.buf.len) ws_alive = $mod.growReqBuf(st);
                         if (!ws_alive) {
                             if ($mod.hasWork(st)) {
                                 st.close_when_drained = true;
@@ -3469,8 +3495,8 @@ fn workerCount() usize {
                     }
                     st.batching = false;
                     _ = $mod.flushPending(st);
-                    st.len = $mod.retainTail(&st.buf, st.len, consumed);
-                    if (alive and st.len == st.buf.len) alive = false;
+                    st.len = $mod.retainTail(st.buf, st.len, consumed);
+                    if (alive and st.len == st.buf.len) alive = $mod.growReqBuf(st);
 
                     if (!alive) {
                         // A closing answer still in the queue drains first —
@@ -3883,7 +3909,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                 }
                 return;
             }
-            if (st.ring_dead or st.len == st.buf.len) {
+            if (st.ring_dead or (st.len == st.buf.len and !$mod.growReqBuf(st))) {
                 w.teardown(st);
                 return;
             }
@@ -4064,8 +4090,10 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                         if (consumed < buf.len and !st.ring_dead) {
                             const tail = buf[consumed..];
                             if (tail.len > st.buf.len) {
-                                st.ring_dead = true;
-                            } else {
+                                while (st.buf.len < tail.len and $mod.growReqBuf(st)) {}
+                                if (tail.len > st.buf.len) st.ring_dead = true;
+                            }
+                            if (tail.len <= st.buf.len and !st.ring_dead) {
                                 @memcpy(st.buf[0..tail.len], tail);
                                 st.len = tail.len;
                             }
@@ -4122,7 +4150,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
         // wire. Each dispatch may free room; drain what fits and re-dispatch
         // until the hold empties or the buffer genuinely fills.
         fn drainRecvHold(w: *@This(), st: *$mod.ConnState) void {
-            while (!st.ring_dead and st.len < st.buf.len and st.recv_hold_off < st.recv_hold.items.len) {
+            while (!st.ring_dead and (st.len < st.buf.len or $mod.growReqBuf(st)) and st.recv_hold_off < st.recv_hold.items.len) {
                 const room = st.buf.len - st.len;
                 const avail = st.recv_hold.items.len - st.recv_hold_off;
                 const n = @min(room, avail);
@@ -4168,15 +4196,15 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                     }
                     if (!ws_alive) break;
                 }
-                st.len = $mod.retainTail(&st.buf, st.len, ws_consumed);
-                if (ws_alive and st.len == st.buf.len) ws_alive = false;
+                st.len = $mod.retainTail(st.buf, st.len, ws_consumed);
+                if (ws_alive and st.len == st.buf.len) ws_alive = $mod.growReqBuf(st);
                 if (!ws_alive) st.ring_dead = true;
                 return;
             }
 
             const consumed = w.dispatchHttpSlice(st, st.buf[0..st.len]);
-            st.len = $mod.retainTail(&st.buf, st.len, consumed);
-            if (!st.ring_dead and st.len == st.buf.len) st.ring_dead = true;
+            st.len = $mod.retainTail(st.buf, st.len, consumed);
+            if (!st.ring_dead and st.len == st.buf.len and !$mod.growReqBuf(st)) st.ring_dead = true;
         }
 
         // A poll CQE on a socket-BIO TLS conn. Handshake-era CQEs step
@@ -4205,7 +4233,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                             // want_read means OpenSSL is holding nothing.
                             const tls = st.ssl.?;
                             if (tls.ssl) |s| {
-                                while (st.len < st.buf.len) {
+                                while (st.len < st.buf.len or $mod.growReqBuf(st)) {
                                     switch (mod.sslMemRead(s, st.buf[st.len..])) {
                                         .read => |n| st.len += n,
                                         else => break,
@@ -4269,7 +4297,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                 st.ring_dead = true;
                 return;
             };
-            while (st.len < st.buf.len) {
+            while (st.len < st.buf.len or $mod.growReqBuf(st)) {
                 switch (mod.sslMemRead(s, st.buf[st.len..])) {
                     .read => |n| {
                         st.len += n;
@@ -4306,7 +4334,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                     .drained => {},
                 }
             }
-            if (st.ring_dead or st.len == st.buf.len) {
+            if (st.ring_dead or (st.len == st.buf.len and !$mod.growReqBuf(st))) {
                 w.teardown(st);
                 return;
             }
