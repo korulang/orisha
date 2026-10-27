@@ -16,6 +16,7 @@ import std/store
 
 pub tor baseline { req: *orisha:Request } -> orisha:Response
 pub tor json { req: *orisha:Request, count: string } -> orisha:Response
+pub tor ws-upgrade { req: *orisha:Request } -> orisha:Response
 
 // The dataset's process-lifetime home. Each row is one item's wire view —
 // every byte the response carries except the request-scoped `total` — held
@@ -41,7 +42,7 @@ tor int-of { text: string } -> i64
 int-of = if(text.len == 0)
 | then -> 0
 | else |> std/string:from-page(text)
-    | ok s |> std/string:parse-int(s)
+    | ok s |> std/string:parse-int(s: s.data)
         | ok n |> std/string:free(s) |> finish(n): r -> r
         | err _ |> std/string:free(s) |> finish(n: 0): r -> r
     | err _ -> 0
@@ -56,8 +57,13 @@ clamp-count = if(want <= 0)
     | then -> len
     | else -> @as(usize, @intCast(want))
 
+// fmt.blk — the body outlives the arm as the Response's owned bytes; the
+// pump frees it via release-body. fmt:ln's scoped borrow can't leave the
+// frame (KORU030 since scratch@scoped).
 tor respond-int { n: i64 } -> orisha:Response
-respond-int = std/fmt:ln("{{ n:d }}"): l -> { status: 200, body: l.text, content_type: "text/plain" }
+respond-int = std/string:from-int(n)
+| ok s |> std/string:detach(s): b -> { status: 200, body: b, content_type: "text/plain", body_allocated: true }
+| err _ -> { status: 500, body: "internal error", content_type: "text/plain" }
 
 tor respond-plain { body: string } -> orisha:Response
 respond-plain -> { status: 200, body, content_type: "application/json", body_allocated: true }
@@ -245,3 +251,30 @@ json = orisha:query-param(req, name: "m"): qm
 |> orisha:header(req, name: "accept-encoding"): ah
 |> or-empty(s: ah): ae
 |> serve-items(m, want, ae): r -> r
+
+// A missing key is not an upgrade — refuse it as a plain request.
+tor accept-str { a: ?string } -> string
+accept-str -> a orelse ""
+
+// The 101's extra_headers block: the accept value is per-request, so the
+// block is appended at runtime and detached to a borrow — the head is
+// built and sent inside the arm, before the arena dies.
+tor ws-headers { key: string } -> string
+ws-headers = std/string:from-page(text: "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ")
+| ok h |> std/string:take(s: h): acc
+    |> std/string:append(s: acc, text: key)
+    | ok |> std/string:append(s: acc, text: "\r\n")
+        | ok |> std/string:detach(s: acc): hdr -> hdr
+        | err _ |> std/string:free(s: acc) -> ""
+    | err _ |> std/string:free(s: acc) -> ""
+| err _ -> ""
+
+// RFC 6455 §4.2: the 101 carries Upgrade/Connection/Sec-WebSocket-Accept as
+// the extra_headers block (each line CRLF-terminated, no blank line — the
+// emitter validates that shape). The pump flips the connection to frames
+// on the way out and routes every complete message to ws-frame.
+ws-upgrade = orisha:ws-accept(req): acc
+|> accept-str(a: acc): astr
+|> if(astr.len == 0)
+    | then -> { status: 400, body: "websocket upgrade requires Sec-WebSocket-Key", content_type: "text/plain" }
+    | else |> ws-headers(key: astr): hdr -> { status: 101, body: "", content_type: "text/plain", extra_headers: hdr }

@@ -1,3 +1,13 @@
+---
+type: belief
+id: frag-a-target-nobody-builds-rots
+provenance: unikraft target rot discovered 2026-10-12 (three independent
+  breaks between 2026-08-09 and first rebuild); evolved 2026-10-27 when
+  the same rot reached the httparena entry against deliberate contract
+  walls — uncompiled consumer, not unbuilt target
+ts: 2026-10-27
+---
+
 # A target nobody builds rots
 
 **Belief.** A supported build target that no check compiles is not
@@ -26,6 +36,18 @@ builds:
 None of these was a bug on Linux. The unikernel's failure mode is the
 same class as a test suite that isn't run: the artifact claims support
 and the claim is stale.
+
+The same rot reached the *application* layer on 2026-10-27: the
+HttpArena entry (`httparena/main.k` + `handlers.k`) refused to
+compile, 14 days after its last board build — against two deliberate
+contract walls, not accidents. `fmt:ln`'s `.text` became
+`scratch@scoped` (koru c3750391, 2026-10-17 — `respond-int` could no
+longer produce it into the Response record) and
+`std/string:parse-int` tightened to the slice, not the wrapper. The
+toolchain did nothing wrong anywhere; the consumer broke anyway. So
+the rot class is wider than "unbuilt target": it is "uncompiled
+consumer" — and the clock is contract-velocity, which includes
+deliberate improvement, not just bit-rot.
 
 ## The seam that holds
 

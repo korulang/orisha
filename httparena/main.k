@@ -15,7 +15,12 @@ orisha:handler = orisha:router(req)
 ! [GET /baseline11] |> httparena/handlers:baseline(req)
 ! [POST /baseline11] |> httparena/handlers:baseline(req)
 ! [GET /json/:count] p |> httparena/handlers:json(req, p.count)
+! [GET /ws] |> httparena/handlers:ws-upgrade(req)
 ! [*] -> { status: 404, body: "not found", content_type: "text/plain" }
+
+// echo-ws: every complete message the pump reassembles goes straight back,
+// opcode preserved. Control frames never reach this arm.
+orisha/pump:ws-frame = orisha/pump:ws-send(x: f, payload: f.raw, f.opcode)
 
 // Cleartext for local wrk / baseline+pipeline+json-comp. Board Dockerfile sed-adds TLS for json-tls.
 // std/compress warmup: pulls the module into the program and bakes the
