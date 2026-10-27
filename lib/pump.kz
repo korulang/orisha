@@ -874,12 +874,12 @@ fn flushPendingOwned(st: *ConnState) Flush {
 
 // Batch append: queue without flushing. Over the cap the socket drains
 // inline first — a full queue is the socket's problem, not the app's.
-// ws-mode conns append under ws_mu: ws-send-fd writes can race the owner's
-// post-upgrade replies on the shared ArrayList.
+// Caller-locked: ws-mode conns reach this only from wsSendFrameRaw, whose
+// two callers (ws-send in a frame arm, ws-send-fd) already hold ws_mu —
+// taking it again here self-deadlocks the worker. ws-send-fd writes can
+// race the owner's post-upgrade replies on the shared ArrayList, which is
+// exactly what ws_mu serializes at the call sites.
 fn appendPending(st: *ConnState, segments: []const []const u8) bool {
-    const lock_it = st.mode == .ws;
-    if (lock_it) st.ws_mu.lock();
-    defer if (lock_it) st.ws_mu.unlock();
     var need: usize = 0;
     for (segments) |seg| need += seg.len;
     if (st.owner_ring != null) {
@@ -981,9 +981,6 @@ fn stageIntoSendBuf(st: *ConnState, seg: []const u8, plan_mode: bool) bool {
 // one way: with no index into a remainder slice, a full plan on `b`
 // spills just `b`.
 fn appendPair(st: *ConnState, a: []const u8, b: []const u8) bool {
-    const lock_it = st.mode == .ws;
-    if (lock_it) st.ws_mu.lock();
-    defer if (lock_it) st.ws_mu.unlock();
     const need = a.len + b.len;
     if (st.owner_ring != null) {
         if (st.send_len == 0 and st.send_iov_n == 0 and st.mode != .ws and !st.tls_sockbio) {
