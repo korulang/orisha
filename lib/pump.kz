@@ -118,6 +118,7 @@ const URING_ENTRIES: u16 = 4096;
 const URING_ACCEPT: u64 = std.math.maxInt(u64);
 const URING_ACCEPT_TLS: u64 = URING_ACCEPT - 1;
 const URING_ACCEPT_H2C: u64 = URING_ACCEPT - 2;
+const URING_ACCEPT_H2TLS: u64 = URING_ACCEPT - 3;
 
 // One read is not one request.
 //
@@ -1532,6 +1533,11 @@ const ServerTls = if (HAS_OPENSSL) @import("root").koru_koru.koru_openssl.Tls el
 const ServerTlsCtx = if (HAS_OPENSSL) @import("root").koru_koru.koru_openssl.ServerCtx else anyopaque;
 
 var tls_server_ctx: ?*ServerTlsCtx = null;
+// h2-over-TLS is a dedicated ctx, not the shared one — the ALPN select
+// callback is h2-or-nothing, and installing it on the h1-TLS ctx would
+// fail every client that honestly offers "h1".
+var h2_tls_server_ctx: ?*ServerTlsCtx = null;
+var h2_tls_listen_port: u16 = 0;
 var tls_listen_port: u16 = 0;
 // Prior-knowledge HTTP/2 cleartext listener — the harness's h2c port is
 // fixed at 8082 and the entry opts in via H2C_PORT, the same env-driven
@@ -1541,6 +1547,39 @@ var h2c_listen_port: u16 = 0;
 fn h2cPortEnv() u16 {
     const s = std.posix.getenv("H2C_PORT") orelse return 0;
     return std.fmt.parseInt(u16, s, 10) catch 0;
+}
+
+// h2-over-TLS listener — the arena publishes :8443 for baseline-h2 /
+// static-h2 / unary-grpc-tls. Same certs as the h1-TLS port, its own ctx
+// because the ALPN policy differs.
+fn h2TlsPortEnv() u16 {
+    const s = std.posix.getenv("H2_TLS_PORT") orelse return 0;
+    return std.fmt.parseInt(u16, s, 10) catch 0;
+}
+
+// Load the h2-TLS ctx once when the port is declared: same cert pair, the
+// h2-only ALPN select callback. Failure is a startup refusal, same rule
+// as maybeStartTls.
+fn maybeStartH2Tls(port_env: u16, cert_path: ?[]const u8, key_path: ?[]const u8) ?[]const u8 {
+    if (HAS_OPENSSL) {
+        if (port_env == 0) return null;
+        const cert = cert_path orelse "/certs/server.crt";
+        const key = key_path orelse "/certs/server.key";
+        const loaded = @import("root").koru_koru.koru_openssl.loadServerCtx(std.heap.page_allocator, cert, key);
+        switch (loaded) {
+            .ok => |ctx| {
+                @import("root").koru_koru.koru_openssl.setAlpnH2Only(ctx);
+                h2_tls_server_ctx = ctx;
+                h2_tls_listen_port = port_env;
+                return null;
+            },
+            .err => |e| return e.msg,
+        }
+    }
+    return if (port_env != 0)
+        "H2_TLS_PORT set, but this target cannot link openssl"
+    else
+        null;
 }
 
 // ── HTTP/2 cleartext (h2c) — prior-knowledge per the arena profile ──────────
@@ -3239,9 +3278,18 @@ fn kqueueRearm(kq: i32, fd: posix.fd_t, st: *ConnState) void {
 // the crypto of a thousand simultaneous handshakes spreads across every
 // worker instead of queueing behind one accept thread.
 fn beginTlsHandshake(client_fd: c_int) ?*ServerTls {
+    const ctx = tls_server_ctx orelse {
+        posix.close(@intCast(client_fd));
+        return null;
+    };
+    return beginTlsHandshakeCtx(client_fd, ctx);
+}
+
+// Same creation path against a caller-chosen ctx — the h2-TLS listener's
+// ctx carries the h2-only ALPN policy, the h1 ctx must stay ALPN-free.
+fn beginTlsHandshakeCtx(client_fd: c_int, ctx: *ServerTlsCtx) ?*ServerTls {
     if (HAS_OPENSSL) {
         const openssl = @import("root").koru_koru.koru_openssl;
-        const ctx = tls_server_ctx orelse return null;
         const begun = openssl.acceptBegin(ctx, client_fd, std.heap.page_allocator);
         return switch (begun) {
             .ok => |ssl| blk: {
@@ -3308,9 +3356,18 @@ fn driveTlsHandshake(st: *ConnState) TlsStep {
 // kernel at handshake end. The ring never sees ciphertext — it supplies
 // readiness via poll_add and, once offloaded, plaintext recv/send SQEs.
 fn beginTlsHandshakeSock(client_fd: c_int) ?*ServerTls {
+    const ctx = tls_server_ctx orelse {
+        posix.close(@intCast(client_fd));
+        return null;
+    };
+    return beginTlsHandshakeSockCtx(client_fd, ctx);
+}
+
+// Caller-chosen ctx — the h2-TLS leg binds to the ctx with the h2-only
+// ALPN policy; the h1 leg stays on the shared one.
+fn beginTlsHandshakeSockCtx(client_fd: c_int, ctx: *ServerTlsCtx) ?*ServerTls {
     if (HAS_OPENSSL) {
         const openssl = @import("root").koru_koru.koru_openssl;
-        const ctx = tls_server_ctx orelse return null;
         const begun = openssl.acceptBegin(ctx, @intCast(client_fd), std.heap.page_allocator);
         return switch (begun) {
             .ok => |ssl| blk: {
@@ -3363,6 +3420,30 @@ fn registerClientH2c(client_fd: posix.fd_t, kq: i32) void {
         posix.close(client_fd);
         return;
     };
+    st.mode = .h2c;
+    st.owner_q = kq;
+    armKqueueRead(kq, client_fd);
+}
+
+// h2-over-TLS: the conn is h2c once the handshake completes — the ctx's
+// ALPN callback already refused anything that didn't offer "h2". tls_hs
+// marks the handshake as outstanding exactly like an h1-TLS accept.
+fn registerClientH2cTls(client_fd: posix.fd_t, ssl: ?*ServerTls, kq: i32) void {
+    disableNagle(client_fd);
+    markNonBlocking(client_fd);
+    const st = connState(client_fd) orelse {
+        if (HAS_OPENSSL) {
+            if (ssl) |tls| {
+                const mod = @import("root").koru_koru.koru_openssl;
+                if (tls.ssl) |s| mod.releaseServerSsl(s);
+                tls.allocator.destroy(tls);
+            }
+        }
+        posix.close(client_fd);
+        return;
+    };
+    st.ssl = ssl;
+    st.tls_hs = ssl != null;
     st.mode = .h2c;
     st.owner_q = kq;
     armKqueueRead(kq, client_fd);
@@ -3578,6 +3659,9 @@ fn workerCount() usize {
 
     $mod.h2c_listen_port = $mod.h2cPortEnv();
     if ($mod.maybeStartTls(tls_port, cert_path, key_path)) |err_msg| {
+        return .{ .failed = err_msg };
+    }
+    if ($mod.maybeStartH2Tls($mod.h2TlsPortEnv(), cert_path, key_path)) |err_msg| {
         return .{ .failed = err_msg };
     }
 
@@ -4276,6 +4360,9 @@ fn workerCount() usize {
     if ($mod.maybeStartTls(tls_port, cert_path, key_path)) |err_msg| {
         return .{ .failed = err_msg };
     }
+    if ($mod.maybeStartH2Tls($mod.h2TlsPortEnv(), cert_path, key_path)) |err_msg| {
+        return .{ .failed = err_msg };
+    }
 
     var server = $mod.openListener(port) orelse return .{ .failed = "Failed to listen" };
 
@@ -4540,9 +4627,32 @@ fn workerCount() usize {
             return .{ .failed = "Failed to spawn h2c accept thread" };
     }
 
+    if ($mod.h2_tls_server_ctx != null) {
+        const H2TlsAccept = struct {
+            fn loop(kqs_ptr: *[$mod.MAX_WORKERS]i32, n: usize, next_ptr: *usize) void {
+                var h2_listener = $mod.openListener($mod.h2_tls_listen_port) orelse return;
+                defer h2_listener.deinit();
+                while (true) {
+                    const conn = h2_listener.accept() catch continue;
+                    const client_fd = conn.stream.handle;
+                    const ctx = $mod.h2_tls_server_ctx orelse break;
+                    const ssl = $mod.beginTlsHandshakeCtx(@intCast(client_fd), ctx) orelse continue;
+                    const worker = next_ptr.*;
+                    next_ptr.* = (next_ptr.* + 1) % n;
+                    $mod.registerClientH2cTls(client_fd, ssl, kqs_ptr[worker]);
+                }
+            }
+        };
+        _ = std.Thread.spawn(.{}, H2TlsAccept.loop, .{ &kqs, n_workers, &next }) catch
+            return .{ .failed = "Failed to spawn h2-TLS accept thread" };
+    }
+
     std.debug.print("Orisha listening on http://0.0.0.0:{}\n", .{port});
     if ($mod.tls_server_ctx != null) {
         std.debug.print("Orisha listening on https://0.0.0.0:{}\n", .{$mod.tls_listen_port});
+    }
+    if ($mod.h2_tls_server_ctx != null) {
+        std.debug.print("Orisha listening on h2s://0.0.0.0:{}\n", .{$mod.h2_tls_listen_port});
     }
     std.debug.print("Pump: kqueue, {} workers, keep-alive, TCP_NODELAY\n", .{n_workers});
 
@@ -4571,6 +4681,9 @@ fn workerCount() usize {
 
     $mod.h2c_listen_port = $mod.h2cPortEnv();
     if ($mod.maybeStartTls(tls_port, cert_path, key_path)) |err_msg| {
+        return .{ .failed = err_msg };
+    }
+    if ($mod.maybeStartH2Tls($mod.h2TlsPortEnv(), cert_path, key_path)) |err_msg| {
         return .{ .failed = err_msg };
     }
 
@@ -4975,6 +5088,9 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
     if ($mod.maybeStartTls(tls_port, cert_path, key_path)) |err_msg| {
         return .{ .failed = err_msg };
     }
+    if ($mod.maybeStartH2Tls($mod.h2TlsPortEnv(), cert_path, key_path)) |err_msg| {
+        return .{ .failed = err_msg };
+    }
     // `std.os.linux.IoUring` cannot be NAMED on a non-Linux target — it reaches
     // for `linux.E` and a macOS build has `darwin.E` instead, so this is a type
     // error, not a missing feature. The guard is comptime-known, so the body
@@ -5021,6 +5137,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
         listen_fd: $mod.posix.fd_t,
         tls_listen_fd: $mod.posix.fd_t,
         h2c_listen_fd: $mod.posix.fd_t = -1,
+        h2_tls_listen_fd: $mod.posix.fd_t = -1,
         // Provided-buffer pool for cleartext multishot recv: the kernel picks
         // the destination per packet and the op stays armed for the conn's
         // life — no per-recv SQE prep, and reads proceed while a send is in
@@ -5280,10 +5397,11 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
 
         fn handleCqe(w: *@This(), cqe: linux.io_uring_cqe) void {
             const ud = cqe.user_data;
-            if (ud == $mod.URING_ACCEPT or ud == $mod.URING_ACCEPT_TLS or ud == $mod.URING_ACCEPT_H2C) {
+            if (ud == $mod.URING_ACCEPT or ud == $mod.URING_ACCEPT_TLS or ud == $mod.URING_ACCEPT_H2C or ud == $mod.URING_ACCEPT_H2TLS) {
                 const is_tls = ud == $mod.URING_ACCEPT_TLS;
                 const is_h2c = ud == $mod.URING_ACCEPT_H2C;
-                const accept_fd = if (is_tls) w.tls_listen_fd else if (is_h2c) w.h2c_listen_fd else w.listen_fd;
+                const is_h2tls = ud == $mod.URING_ACCEPT_H2TLS;
+                const accept_fd = if (is_tls) w.tls_listen_fd else if (is_h2c) w.h2c_listen_fd else if (is_h2tls) w.h2_tls_listen_fd else w.listen_fd;
                 // Multishot: this one SQE reaps the whole connect storm.
                 // F_MORE cleared means the op retired — re-arm it once.
                 if (cqe.res >= 0) {
@@ -5298,13 +5416,16 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                         st.len = 0;
                         st.owner_ring = @ptrCast(w);
                         var ready = true;
-                        if (is_h2c) st.mode = .h2c;
-                        if (is_tls) {
+                        if (is_h2c or is_h2tls) st.mode = .h2c;
+                        if (is_tls or is_h2tls) {
                             // Socket-BIO SSL — OpenSSL keeps the wire, the
                             // ring supplies readiness. ENABLE_KTLS on the ctx
                             // hands the record layer to the kernel at
-                            // handshake end where the host supports it.
-                            st.ssl = $mod.beginTlsHandshakeSock(@intCast(cfd));
+                            // handshake end where the host supports it. The
+                            // h2-TLS leg handshakes on its own ctx — the one
+                            // with the h2-only ALPN policy.
+                            const ctx = if (is_h2tls) $mod.h2_tls_server_ctx else $mod.tls_server_ctx;
+                            st.ssl = if (ctx) |hctx| $mod.beginTlsHandshakeSockCtx(@intCast(cfd), hctx) else null;
                             if (st.ssl == null) {
                                 // A failed begin already closed cfd — keep
                                 // teardown from closing it twice.
@@ -5778,12 +5899,17 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                 -1;
             const h2c_listen_fd: $mod.posix.fd_t = if ($mod.h2c_listen_port != 0)
                 $mod.openReusePortListener($mod.h2c_listen_port) orelse {
-                    std.debug.print("Pump: io_uring worker failed to listen on :{}\n", .{$mod.h2c_listen_port});
+                    return .{ .failed = "Failed to listen on h2c port" };
+                }
+            else -1;
+            const h2_tls_listen_fd: $mod.posix.fd_t = if ($mod.h2_tls_listen_port != 0)
+                $mod.openReusePortListener($mod.h2_tls_listen_port) orelse {
+                    std.debug.print("Pump: io_uring worker failed to listen on :{}\n", .{$mod.h2_tls_listen_port});
                     return;
                 }
             else
                 -1;
-            var w = @This(){ .ring = ring, .listen_fd = listen_fd, .tls_listen_fd = tls_listen_fd, .h2c_listen_fd = h2c_listen_fd };
+            var w = @This(){ .ring = ring, .listen_fd = listen_fd, .tls_listen_fd = tls_listen_fd, .h2c_listen_fd = h2c_listen_fd, .h2_tls_listen_fd = h2_tls_listen_fd };
             // 1024 pool buffers of 8K per worker — far more than the deepest
             // CQE batch (512) can hold hostage, since each buffer is recycled
             // the moment its CQE is processed. Requests bigger than a buffer
@@ -5803,6 +5929,12 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
             if (h2c_listen_fd >= 0) {
                 _ = w.ring.accept_multishot($mod.URING_ACCEPT_H2C, h2c_listen_fd, null, null, 0) catch {
                     std.debug.print("Pump: io_uring h2c accept arm failed\n", .{});
+                    return;
+                };
+            }
+            if (h2_tls_listen_fd >= 0) {
+                _ = w.ring.accept_multishot($mod.URING_ACCEPT_H2TLS, h2_tls_listen_fd, null, null, 0) catch {
+                    std.debug.print("Pump: io_uring h2-TLS accept arm failed\n", .{});
                     return;
                 };
             }
