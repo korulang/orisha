@@ -989,6 +989,87 @@ fn pageCachePut(key: u128, status: u16, content_type: ?[]const u8, content_encod
     return .{ .head = head_slice, .body = body_out, .body_allocated = body_allocated, .date_hole = 0, .close = res.close, .head_static = false, .body_static = body_static and !body_allocated, .delay_ms = res.delay_ms };
 }
 
+// Per-request disk read for the runtime-static seam — the sibling of
+// `orisha:static`, which embeds at compile time and therefore can never
+// answer the benchmark's mid-run file rewrites. STATIC_DIR mirrors
+// DATASET_PATH: the harness mounts data/static at /data/static and local
+// dev points the env wherever the tree actually is. Traversal refuses
+// with the same 404 a missing file gets — a refused path and an absent
+// one carry the same information, and 403 would only teach the probe
+// which guesses were syntactically interesting.
+fn staticRoot() []const u8 {
+    return std.posix.getenv("STATIC_DIR") orelse "/data/static";
+}
+
+fn servePathAlloc(a: std.mem.Allocator, parts: []const []const u8) ?[]u8 {
+    var len: usize = 0;
+    for (parts) |p| len += p.len;
+    len += parts.len - 1; // '/' separators
+    const out = a.alloc(u8, len) catch return null;
+    var w: usize = 0;
+    for (parts, 0..) |p, i| {
+        if (i > 0) {
+            out[w] = '/';
+            w += 1;
+        }
+        @memcpy(out[w .. w + p.len], p);
+        w += p.len;
+    }
+    return out;
+}
+
+~proc serve-file|zig {
+    // `path` is a route parameter — it can contain no '/', and ".." is the
+    // only traversal a single segment can still carry.
+    if (path.len == 0 or std.mem.indexOf(u8, path, "..") != null) {
+        return .{ .status = 404, .body = "not found", .content_type = "text/plain" };
+    }
+    const a = koru_allocator();
+    const root = $mod.staticRoot();
+    // Strongest-first: a .br sibling exists for every corpus file, gzip as
+    // the fallback, identity last. `Vary: Accept-Encoding` rides every
+    // answer — the response depends on it, cached or not.
+    const variants = [_]struct { ext: []const u8, enc: []const u8 }{
+        .{ .ext = ".br", .enc = "br" },
+        .{ .ext = ".gz", .enc = "gzip" },
+    };
+    var encoding: ?[]const u8 = null;
+    var file_path: ?[]u8 = null;
+    if (aeWantsCoding(req.accept_encoding, "br") or aeWantsCoding(req.accept_encoding, "gzip")) {
+        for (variants) |v| {
+            if (!aeWantsCoding(req.accept_encoding, v.enc)) continue;
+            const full = $mod.servePathAlloc(a, &.{ root, path }) orelse break;
+            const with_ext = std.fmt.allocPrint(a, "{s}{s}", .{ full, v.ext }) catch {
+                a.free(full);
+                break;
+            };
+            a.free(full);
+            if (std.fs.cwd().access(with_ext, .{})) |_| {
+                encoding = v.enc;
+                file_path = with_ext;
+                break;
+            } else |_| {
+                a.free(with_ext);
+            }
+        }
+    }
+    const target = file_path orelse ($mod.servePathAlloc(a, &.{ root, path }) orelse {
+        return .{ .status = 500, .body = "alloc failed", .content_type = "text/plain" };
+    });
+    defer a.free(target);
+    const body = std.fs.cwd().readFileAlloc(a, target, 64 * 1024 * 1024) catch {
+        return .{ .status = 404, .body = "not found", .content_type = "text/plain" };
+    };
+    return .{
+        .status = 200,
+        .body = body,
+        .content_type = mimeTypeFromPath(path),
+        .content_encoding = encoding,
+        .extra_headers = if (encoding != null) "Vary: Accept-Encoding\r\n" else null,
+        .body_allocated = true,
+    };
+}
+
 ~proc release-body|zig {
     if (allocated) {
         koru_allocator().free(body);
@@ -2226,7 +2307,7 @@ fn aeCodingRefused(params: []const u8) bool {
     return false;
 }
 
-fn aeWantsGzip(accept_encoding: ?[]const u8) bool {
+fn aeWantsCoding(accept_encoding: ?[]const u8, coding: []const u8) bool {
     const ae = accept_encoding orelse return false;
     var star: ?[]const u8 = null;
     var it = std.mem.splitScalar(u8, ae, ',');
@@ -2234,7 +2315,7 @@ fn aeWantsGzip(accept_encoding: ?[]const u8) bool {
         const entry = std.mem.trim(u8, raw_entry, " \t");
         const semi = std.mem.indexOfScalar(u8, entry, ';') orelse entry.len;
         const name = std.mem.trim(u8, entry[0..semi], " \t");
-        if (std.ascii.eqlIgnoreCase(name, "gzip")) {
+        if (std.ascii.eqlIgnoreCase(name, coding)) {
             // An explicit entry beats the wildcard (RFC 9110 §12.5.3).
             return !aeCodingRefused(entry[semi..]);
         }
@@ -2242,6 +2323,10 @@ fn aeWantsGzip(accept_encoding: ?[]const u8) bool {
     }
     const sp = star orelse return false;
     return !aeCodingRefused(sp);
+}
+
+fn aeWantsGzip(accept_encoding: ?[]const u8) bool {
+    return aeWantsCoding(accept_encoding, "gzip");
 }
 
 fn gzipCompress(allocator: std.mem.Allocator, content: []const u8) ?[]const u8 {

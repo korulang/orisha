@@ -165,6 +165,16 @@ pub tor answer { x: *orisha/pump:Exchange } -> { head: string, body: string, bod
 // buffers arrive with allocated=false; those must not be freed.
 pub tor release-body { body: string, allocated: bool }
 
+// Read one file off disk and answer it — the runtime half of what
+// `orisha:static` does at compile time. The file is read on EVERY request:
+// the HttpArena static profiles rewrite their tree mid-benchmark and a
+// cached body fails the staleness probe by construction. Pre-compressed
+// `<file>.br` / `<file>.gz` siblings on disk are served when the client's
+// Accept-Encoding allows, strongest first; `root` comes from STATIC_DIR
+// (default /data/static, the harness's mount). Traversal past the root is
+// refused with 404 — `path` is attacker-shaped input, not a filename hint.
+pub tor serve-file { req: *Request, path: string } -> orisha:Response
+
 // ============================================================================
 // REQUEST HEADERS — lazy reads over the raw block
 // ============================================================================

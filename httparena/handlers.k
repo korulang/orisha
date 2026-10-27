@@ -19,6 +19,7 @@ pub tor json { req: *orisha:Request, count: string } -> orisha:Response
 pub tor ws-upgrade { req: *orisha:Request } -> orisha:Response
 pub tor echo { req: *orisha:Request } -> orisha:Response
 pub tor delay { req: *orisha:Request, ms: string } -> orisha:Response
+pub tor static-file { req: *orisha:Request, file: string } -> orisha:Response
 
 // The dataset's process-lifetime home. Each row is one item's wire view —
 // every byte the response carries except the request-scoped `total` — held
@@ -292,3 +293,9 @@ echo = orisha:body(req): b -> { status: 200, body: b orelse "", content_type: "a
 delay = std/string:parse-int(s: ms)
 | ok n -> { status: 200, body: ms, content_type: "text/plain", delay_ms: n }
 | err _ -> { status: 400, body: "invalid delay", content_type: "text/plain" }
+
+// static-tls: /static/<file> serves the harness tree from disk every
+// request — the corpus is rewritten mid-run and the validator measures
+// that the bytes follow it. serve-file owns encoding negotiation and the
+// traversal refuse; the handler is the route's name, nothing more.
+static-file = orisha:serve-file(req, path: file)

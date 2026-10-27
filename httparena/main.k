@@ -18,6 +18,7 @@ orisha:handler = orisha:router(req)
 ! [GET /ws] |> httparena/handlers:ws-upgrade(req)
 ! [POST /echo] |> httparena/handlers:echo(req)
 ! [GET /delay/:ms] p |> httparena/handlers:delay(req, p.ms)
+! [GET /static/:file] p |> httparena/handlers:static-file(req, p.file)
 ! [*] -> { status: 404, body: "not found", content_type: "text/plain" }
 
 // echo-ws: every complete message the pump reassembles goes straight back,
