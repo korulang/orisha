@@ -1463,18 +1463,156 @@ fn literalWireDateHole(allocator: std.mem.Allocator, plain: []const u8) ?usize {
     return at;
 }
 
+// Field parse for a koru record literal — the transform sees
+// `{ status: 200, body: "ok", content_type: "text/plain" }` as source text.
+// Returns the field's value span, or null when absent.
+fn recordField(plain: []const u8, name: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, plain, i, name)) |at| {
+        const before = at == 0 or !(std.ascii.isAlphanumeric(plain[at - 1]) or plain[at - 1] == '_');
+        var q = at + name.len;
+        while (q < plain.len and (plain[q] == ' ' or plain[q] == '\t')) q += 1;
+        if (!before or q >= plain.len or plain[q] != ':') {
+            i = at + name.len;
+            continue;
+        }
+        q += 1;
+        while (q < plain.len and (plain[q] == ' ' or plain[q] == '\t')) q += 1;
+        var e = q;
+        while (e < plain.len and plain[e] != ',' and plain[e] != '}') e += 1;
+        while (e > q and (plain[e - 1] == ' ' or plain[e - 1] == '\t')) e -= 1;
+        return plain[q..e];
+    }
+    return null;
+}
+
+fn decodeKoruString(allocator: std.mem.Allocator, lit: []const u8) ?[]u8 {
+    if (lit.len < 2 or lit[0] != '"') return null;
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 1;
+    while (i < lit.len) {
+        const c = lit[i];
+        if (c == '"') return out.toOwnedSlice(allocator) catch null;
+        if (c == '\\' and i + 1 < lit.len) {
+            const d: u8 = switch (lit[i + 1]) {
+                'r' => '\r', 'n' => '\n', 't' => '\t', '\\' => '\\', '"' => '"',
+                else => return null,
+            };
+            out.append(allocator, d) catch return null;
+            i += 2;
+            continue;
+        }
+        out.append(allocator, c) catch return null;
+        i += 1;
+    }
+    return null;
+}
+
+// Bake a fully-static `{status, body, content_type}` literal into its wire
+// bytes at compile time — the same string the render path formats per
+// request (`headerPrefixKeepAlive` head + Content-Type + the X- lines +
+// body), with the Date line left as a splice hole so `answer` emits the
+// voucher and the send path stamps the live date per response.
+// Gated to shapes whose runtime path is provably identical: prefix-table
+// statuses only, no extra_headers / content_encoding / cacheable / delay,
+// and body.len < 100 so the gzip negotiation leg could never have fired.
+const StaticWire = struct { plain: []u8, hole: usize };
+
+fn synthStaticWire(allocator: std.mem.Allocator, plain: []const u8) ?StaticWire {
+    if (recordField(plain, "extra_headers") != null) return null;
+    if (recordField(plain, "content_encoding") != null) return null;
+    if (recordField(plain, "cacheable") != null) return null;
+    if (recordField(plain, "delay_ms") != null) return null;
+    if (recordField(plain, "body_allocated") != null) return null;
+    const status_lit = recordField(plain, "status") orelse return null;
+    const status = std.fmt.parseInt(u16, status_lit, 10) catch return null;
+    const prefix = switch (status) {
+        200 => "HTTP/1.1 200 OK\r\nContent-Length: ",
+        201 => "HTTP/1.1 201 Created\r\nContent-Length: ",
+        204 => "HTTP/1.1 204 No Content\r\nContent-Length: ",
+        400 => "HTTP/1.1 400 Bad Request\r\nContent-Length: ",
+        401 => "HTTP/1.1 401 Unauthorized\r\nContent-Length: ",
+        403 => "HTTP/1.1 403 Forbidden\r\nContent-Length: ",
+        404 => "HTTP/1.1 404 Not Found\r\nContent-Length: ",
+        500 => "HTTP/1.1 500 Internal Server Error\r\nContent-Length: ",
+        else => return null,
+    };
+    const body = decodeKoruString(allocator, recordField(plain, "body") orelse return null) orelse return null;
+    defer allocator.free(body);
+    if (body.len >= 100) return null;
+    const ct: ?[]u8 = if (recordField(plain, "content_type")) |ct_lit|
+        if (std.mem.eql(u8, ct_lit, "null")) null else decodeKoruString(allocator, ct_lit)
+    else null;
+    defer if (ct) |c| allocator.free(c);
+    var w: std.ArrayList(u8) = .empty;
+    w.appendSlice(allocator, prefix) catch return null;
+    var len_buf: [20]u8 = undefined;
+    w.appendSlice(allocator, std.fmt.bufPrint(&len_buf, "{}", .{body.len}) catch return null) catch return null;
+    w.appendSlice(allocator, "\r\n") catch return null;
+    if (ct) |c| {
+        w.appendSlice(allocator, "Content-Type: ") catch return null;
+        w.appendSlice(allocator, c) catch return null;
+        w.appendSlice(allocator, "\r\n") catch return null;
+    }
+    // The hole: offset where the whole "Date: ..." line inserts at send —
+    // after the ct line, before the X- block, exactly where the render
+    // path's `Date: {s}` lands in its format.
+    const hole = w.items.len;
+    w.appendSlice(allocator, "X-Powered-By: koru/orisha\r\nX-Orisha: reactor\r\n\r\n") catch return null;
+    w.appendSlice(allocator, body) catch return null;
+    const wire = w.toOwnedSlice(allocator) catch return null;
+    // Re-encode as a koru string literal for the emitted record.
+    var lit: std.ArrayList(u8) = .empty;
+    lit.append(allocator, '"') catch return null;
+    for (wire) |c| {
+        const esc: []const u8 = switch (c) {
+            '\r' => "\\r", '\n' => "\\n", '\t' => "\\t", '\\' => "\\\\", '"' => "\\\"",
+            else => &[1]u8{c},
+        };
+        lit.appendSlice(allocator, esc) catch return null;
+    }
+    lit.append(allocator, '"') catch return null;
+    const pv = lit.toOwnedSlice(allocator) catch return null;
+    allocator.free(wire);
+    return .{ .plain = pv, .hole = hole };
+}
+
 // Wire voucher: a produce literal whose `body:` already spells a complete
 // HTTP/1.x message carries `.wire` plus the compile-time splice offset — the
 // `answer` tail then takes `res.wire` and skips the startsWith/CR-scan/
-// `Date: ` probe entirely. Inserted inside the record braces the same way
-// mark_body_allocated rides in.
+// `Date: ` probe entirely. Static `{status, body, content_type}` records
+// get the same voucher with a compiler-BAKED body — the pipelined hot path
+// pays one slice append instead of three bufPrints and a date format.
 fn wireTagArmCode(allocator: std.mem.Allocator, cont: *const ast.Continuation, code: []const u8) []const u8 {
     const n = cont.node orelse return code;
     if (n != .branch_constructor) return code;
     const pv = n.branch_constructor.plain_value orelse return code;
-    const hole = literalWireDateHole(allocator, pv) orelse return code;
+    if (literalWireDateHole(allocator, pv)) |hole| {
+        const close = std.mem.lastIndexOfScalar(u8, code, '}') orelse return code;
+        return std.fmt.allocPrint(allocator, "{s}, .wire = true, .wire_date_hole = {} {s}", .{ code[0..close], hole, code[close..] }) catch code;
+    }
+    const sw = synthStaticWire(allocator, pv) orelse return code;
+    defer allocator.free(sw.plain);
+    // Replace the emitted `.body = "..."` literal with the baked wire —
+    // find `.body = ` in the emitted code, keep everything around it.
+    const bkey = ".body = ";
+    const bat = std.mem.indexOf(u8, code, bkey) orelse return code;
+    const vat = bat + bkey.len;
+    if (vat >= code.len or code[vat] != '"') return code;
+    var vend = vat + 1;
+    while (vend < code.len) {
+        if (code[vend] == '\\') {
+            vend += 2;
+            continue;
+        }
+        if (code[vend] == '"') break;
+        vend += 1;
+    }
+    if (vend >= code.len) return code;
     const close = std.mem.lastIndexOfScalar(u8, code, '}') orelse return code;
-    return std.fmt.allocPrint(allocator, "{s}, .wire = true, .wire_date_hole = {} {s}", .{ code[0..close], hole, code[close..] }) catch code;
+    // body_static only needs adding when the record didn't already say it.
+    const static_tag: []const u8 = if (recordField(pv, "body_static") != null) "" else ", .body_static = true";
+    return std.fmt.allocPrint(allocator, "{s}{s}{s}, .wire = true, .wire_date_hole = {}{s} {s}", .{ code[0..vat], sw.plain, code[vend + 1 .. close], sw.hole, static_tag, code[close..] }) catch code;
 }
 
 // Rename orisha's `handler-lite` default impl to `handler-lite.default` —
