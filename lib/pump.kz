@@ -3354,6 +3354,20 @@ fn registerClient(client_fd: posix.fd_t, ssl: ?*ServerTls, kq: i32) void {
     armKqueueRead(kq, client_fd);
 }
 
+// h2c conns take no TLS object and start in .h2c — the preface and every
+// frame after it route through h2cProcess, not scanRequest.
+fn registerClientH2c(client_fd: posix.fd_t, kq: i32) void {
+    disableNagle(client_fd);
+    markNonBlocking(client_fd);
+    const st = connState(client_fd) orelse {
+        posix.close(client_fd);
+        return;
+    };
+    st.mode = .h2c;
+    st.owner_q = kq;
+    armKqueueRead(kq, client_fd);
+}
+
 fn registerClientEpoll(client_fd: posix.fd_t, ssl: ?*ServerTls, epfd: i32) void {
     const linux = std.os.linux;
     disableNagle(client_fd);
@@ -3729,7 +3743,22 @@ fn workerCount() usize {
                 var consumed: usize = 0;
                 var alive = true;
                 var head_pairs: [$mod.HEAD_PAIRS_MAX]$mod.HeadPair = undefined;
-                while (consumed < st.len) {
+                if (st.mode == .h2c) {
+                    // Frames, not request bytes — h2cProcess consumes what it
+                    // can and queues completed requests; arrived fires here
+                    // because the effect only binds in ~proc scope.
+                    consumed = $mod.h2cProcess(st, st.buf[0..st.len]);
+                    while ($mod.h2cPopReady(st)) |r| {
+                        var head: $mod.Head = .{ .pairs = &head_pairs };
+                        _ = $mod.scanRequest(r.raw, &head) orelse {
+                            $mod.pumpAlloc().free(r.raw);
+                            continue;
+                        };
+                        var exchange = $mod.Exchange{ .fd = fd, .st = st, .raw = r.raw, .head = &head, .h2_stream = r.stream_id };
+                        arrived(&exchange);
+                        $mod.pumpAlloc().free(r.raw);
+                    }
+                } else while (consumed < st.len) {
                     var head: $mod.Head = .{ .pairs = &head_pairs };
                     const take = $mod.scanRequest(st.buf[consumed..st.len], &head) orelse break;
                     var exchange = $mod.Exchange{ .fd = fd, .st = st, .raw = st.buf[consumed .. consumed + take], .head = &head };
@@ -3797,6 +3826,24 @@ fn workerCount() usize {
 
         _ = std.Thread.spawn(.{}, TlsAccept.loop, .{ &$mod.worker_kqs, $mod.worker_total, &$mod.worker_next }) catch
             return .{ .failed = "Failed to spawn TLS accept thread" };
+    }
+
+    if ($mod.h2c_listen_port != 0) {
+        const H2cAccept = struct {
+            fn loop(kqs_ptr: *[$mod.MAX_WORKERS]i32, n: usize, next_ptr: *usize) void {
+                var h2c_listener = $mod.openListener($mod.h2c_listen_port) orelse return;
+                defer h2c_listener.deinit();
+                while (true) {
+                    const conn = h2c_listener.accept() catch continue;
+                    const client_fd = conn.stream.handle;
+                    const worker = next_ptr.*;
+                    next_ptr.* = (next_ptr.* + 1) % n;
+                    $mod.registerClientH2c(client_fd, kqs_ptr[worker]);
+                }
+            }
+        };
+        _ = std.Thread.spawn(.{}, H2cAccept.loop, .{ &$mod.worker_kqs, $mod.worker_total, &$mod.worker_next }) catch
+            return .{ .failed = "Failed to spawn h2c accept thread" };
     }
 
     std.debug.print("Orisha listening on http://0.0.0.0:{}\n", .{port});
@@ -4396,7 +4443,19 @@ fn workerCount() usize {
                     var consumed: usize = 0;
                     var alive = true;
                     var head_pairs: [$mod.HEAD_PAIRS_MAX]$mod.HeadPair = undefined;
-                    while (consumed < st.len) {
+                    if (st.mode == .h2c) {
+                        consumed = $mod.h2cProcess(st, st.buf[0..st.len]);
+                        while ($mod.h2cPopReady(st)) |r| {
+                            var head: $mod.Head = .{ .pairs = &head_pairs };
+                            _ = $mod.scanRequest(r.raw, &head) orelse {
+                                $mod.pumpAlloc().free(r.raw);
+                                continue;
+                            };
+                            var exchange = $mod.Exchange{ .fd = fd, .st = st, .raw = r.raw, .head = &head, .h2_stream = r.stream_id };
+                            arrived(&exchange);
+                            $mod.pumpAlloc().free(r.raw);
+                        }
+                    } else while (consumed < st.len) {
                         var head: $mod.Head = .{ .pairs = &head_pairs };
                         const take = $mod.scanRequest(st.buf[consumed..st.len], &head) orelse break;
                         var exchange = $mod.Exchange{ .fd = fd, .st = st, .raw = st.buf[consumed .. consumed + take], .head = &head };
@@ -4461,6 +4520,24 @@ fn workerCount() usize {
         };
         _ = std.Thread.spawn(.{}, TlsAccept.loop, .{ &kqs, n_workers, &next }) catch
             return .{ .failed = "Failed to spawn TLS accept thread" };
+    }
+
+    if ($mod.h2c_listen_port != 0) {
+        const H2cAccept = struct {
+            fn loop(kqs_ptr: *[$mod.MAX_WORKERS]i32, n: usize, next_ptr: *usize) void {
+                var h2c_listener = $mod.openListener($mod.h2c_listen_port) orelse return;
+                defer h2c_listener.deinit();
+                while (true) {
+                    const conn = h2c_listener.accept() catch continue;
+                    const client_fd = conn.stream.handle;
+                    const worker = next_ptr.*;
+                    next_ptr.* = (next_ptr.* + 1) % n;
+                    $mod.registerClientH2c(client_fd, kqs_ptr[worker]);
+                }
+            }
+        };
+        _ = std.Thread.spawn(.{}, H2cAccept.loop, .{ &kqs, n_workers, &next }) catch
+            return .{ .failed = "Failed to spawn h2c accept thread" };
     }
 
     std.debug.print("Orisha listening on http://0.0.0.0:{}\n", .{port});
@@ -4745,7 +4822,19 @@ fn workerCount() usize {
                     var consumed: usize = 0;
                     var alive = true;
                     var head_pairs: [$mod.HEAD_PAIRS_MAX]$mod.HeadPair = undefined;
-                    while (consumed < st.len) {
+                    if (st.mode == .h2c) {
+                        consumed = $mod.h2cProcess(st, st.buf[0..st.len]);
+                        while ($mod.h2cPopReady(st)) |r| {
+                            var head: $mod.Head = .{ .pairs = &head_pairs };
+                            _ = $mod.scanRequest(r.raw, &head) orelse {
+                                $mod.pumpAlloc().free(r.raw);
+                                continue;
+                            };
+                            var exchange = $mod.Exchange{ .fd = fd, .st = st, .raw = r.raw, .head = &head, .h2_stream = r.stream_id };
+                            arrived(&exchange);
+                            $mod.pumpAlloc().free(r.raw);
+                        }
+                    } else while (consumed < st.len) {
                         var head: $mod.Head = .{ .pairs = &head_pairs };
                         const take = $mod.scanRequest(st.buf[consumed..st.len], &head) orelse break;
                         var exchange = $mod.Exchange{ .fd = fd, .st = st, .raw = st.buf[consumed .. consumed + take], .head = &head };
