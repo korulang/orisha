@@ -292,6 +292,10 @@ pub const Response = struct {
     // the current data generation" — writes the page must reflect are the
     // app's signal to `generation-bump`, never the cache's guess.
     cacheable: bool = false,
+    // Milliseconds the pump holds the rendered response before it reaches
+    // the wire — the async profile's /delay: the whole reply stages and the
+    // conn parks; the wire order behind it stays exactly what it was.
+    delay_ms: i64 = 0,
 };
 
 // The header is built into a buffer that outlives the frame, because `answer`
@@ -850,7 +854,7 @@ fn pageCachePut(key: u128, status: u16, content_type: ?[]const u8, content_encod
     // `wire` voucher says so up front and carries the splice offset, so a
     // compiler-rendered response skips the probe and the hole search alike.
     if (res.wire) {
-        return .{ .head = res.body, .body = "", .body_allocated = false, .date_hole = res.wire_date_hole, .close = res.close, .head_static = res.body_static, .body_static = false };
+        return .{ .head = res.body, .body = "", .body_allocated = false, .date_hole = res.wire_date_hole, .close = res.close, .head_static = res.body_static, .body_static = false, .delay_ms = res.delay_ms };
     }
     if (std.mem.startsWith(u8, res.body, "HTTP/1.")) {
         // Pre-rendered static routes: the whole message is `head`. `body`
@@ -867,7 +871,7 @@ fn pageCachePut(key: u128, status: u16, content_type: ?[]const u8, content_encod
             const at = cr + 2;
             if (at + 6 > res.body.len or !std.mem.eql(u8, res.body[at..][0..6], "Date: ")) hole = at;
         }
-        return .{ .head = res.body, .body = "", .body_allocated = false, .date_hole = hole, .close = res.close, .head_static = res.body_static, .body_static = false };
+        return .{ .head = res.body, .body = "", .body_allocated = false, .date_hole = hole, .close = res.close, .head_static = res.body_static, .body_static = false, .delay_ms = res.delay_ms };
     }
 
     // `content_type: null` means NO Content-Type header — a bare redirect or
@@ -890,7 +894,7 @@ fn pageCachePut(key: u128, status: u16, content_type: ?[]const u8, content_encod
     const extras: []const u8 = if (res.extra_headers) |raw_extras| blk: {
         if (!extraHeadersWellFormed(raw_extras)) {
             if (res.body_allocated) koru_allocator().free(res.body);
-            return .{ .head = RESPONSE_500, .body = "", .body_allocated = false, .date_hole = 0, .close = res.close, .head_static = true, .body_static = false };
+            return .{ .head = RESPONSE_500, .body = "", .body_allocated = false, .date_hole = 0, .close = res.close, .head_static = true, .body_static = false, .delay_ms = res.delay_ms };
         }
         break :blk raw_extras;
     } else "";
@@ -913,9 +917,9 @@ fn pageCachePut(key: u128, status: u16, content_type: ?[]const u8, content_encod
             .{ extras, &date_buf },
         ) catch {
             if (res.body_allocated) koru_allocator().free(res.body);
-            return .{ .head = RESPONSE_500, .body = "", .body_allocated = false, .date_hole = 0, .close = res.close, .head_static = true, .body_static = false };
+            return .{ .head = RESPONSE_500, .body = "", .body_allocated = false, .date_hole = 0, .close = res.close, .head_static = true, .body_static = false, .delay_ms = res.delay_ms };
         };
-        return .{ .head = head101, .body = res.body, .body_allocated = res.body_allocated, .date_hole = 0, .close = res.close, .head_static = false, .body_static = res.body_static and !res.body_allocated };
+        return .{ .head = head101, .body = res.body, .body_allocated = res.body_allocated, .date_hole = 0, .close = res.close, .head_static = false, .body_static = res.body_static and !res.body_allocated, .delay_ms = res.delay_ms };
     }
 
     // Runtime gzip for dynamic bodies. Static routes bake both
@@ -980,9 +984,9 @@ fn pageCachePut(key: u128, status: u16, content_type: ?[]const u8, content_encod
 
     const head_slice = head orelse {
         if (body_allocated) koru_allocator().free(body_out);
-        return .{ .head = RESPONSE_500, .body = "", .body_allocated = false, .date_hole = 0, .close = res.close, .head_static = true, .body_static = false };
+        return .{ .head = RESPONSE_500, .body = "", .body_allocated = false, .date_hole = 0, .close = res.close, .head_static = true, .body_static = false, .delay_ms = res.delay_ms };
     };
-    return .{ .head = head_slice, .body = body_out, .body_allocated = body_allocated, .date_hole = 0, .close = res.close, .head_static = false, .body_static = body_static and !body_allocated };
+    return .{ .head = head_slice, .body = body_out, .body_allocated = body_allocated, .date_hole = 0, .close = res.close, .head_static = false, .body_static = body_static and !body_allocated, .delay_ms = res.delay_ms };
 }
 
 ~proc release-body|zig {

@@ -366,6 +366,16 @@ pub const ConnState = struct {
     ssl: ?*ServerTls = null,
     mode: ConnMode = .http,
     ws_mu: SendMutex = .{},
+    // Async delay: a handler's `delay_ms` stages its whole response and
+    // parks the conn — no read or write arm — until this timestamp. The
+    // parked list is per-worker (one thread, one loop), parked gates every
+    // re-arm so a suspended conn emits nothing until fireParked runs it
+    // through the ordinary next-op choice again. `parked` makes the gate
+    // idempotent: a second arm attempt against a parked conn is a no-op,
+    // not a double-insert.
+    park_until: i64 = 0,
+    park_next: ?*ConnState = null,
+    parked: bool = false,
     buf: []u8 = &.{},
     len: usize = 0,
     // Websocket reassembly — only meaningful while mode == .ws. `buf` holds
@@ -612,6 +622,43 @@ fn closeConnWire(st: *ConnState) void {
 // workload.
 const REQ_BUF_MAX = 256 * 1024 * 1024;
 
+// Per-worker sorted parked list — conns whose reply is staged but whose
+// send waits on a handler-requested delay. Sorted by deadline so the head
+// is the next wake; fireParked pops everything due. One worker thread per
+// loop means threadlocal is the right scope — a parked conn never migrates.
+threadlocal var parked_head: ?*ConnState = null;
+
+fn parkInsert(st: *ConnState) void {
+    var slot: *?*ConnState = &parked_head;
+    while (slot.*) |next| {
+        if (next.park_until > st.park_until) break;
+        slot = &next.park_next;
+    }
+    st.park_next = slot.*;
+    st.parked = true;
+    slot.* = st;
+}
+
+// Milliseconds until the earliest parked conn is due — the ceiling a wait
+// timeout must not exceed. maxInt when nothing is parked.
+fn parkMsUntilDue() i64 {
+    const head = parked_head orelse return std.math.maxInt(i64);
+    const d = head.park_until - std.time.milliTimestamp();
+    return if (d < 0) 0 else d;
+}
+
+// Detach the head if it is due; the caller clears park_until and re-arms —
+// what "re-arm" means is the pump variant's own business.
+fn parkDue() ?*ConnState {
+    const head = parked_head orelse return null;
+    if (head.park_until > std.time.milliTimestamp()) return null;
+    parked_head = head.park_next;
+    head.park_next = null;
+    head.parked = false;
+    head.park_until = 0;
+    return head;
+}
+
 fn growReqBuf(st: *ConnState) bool {
     const want = @min(st.buf.len * 4, REQ_BUF_MAX);
     if (want <= st.buf.len) return false;
@@ -622,7 +669,27 @@ fn growReqBuf(st: *ConnState) bool {
     return true;
 }
 
+// A conn dying while parked must leave the list — the head is live ConnState
+// memory and a stale entry is a use-after-free the next fireParked walks into.
+// O(n) unlink is fine: the list only ever holds delay-parked conns and removal
+// happens once per such conn's death.
+fn parkRemove(st: *ConnState) void {
+    if (!st.parked) return;
+    var slot: *?*ConnState = &parked_head;
+    while (slot.*) |next| {
+        if (next == st) {
+            slot.* = st.park_next;
+            break;
+        }
+        slot = &next.park_next;
+    }
+    st.park_next = null;
+    st.parked = false;
+    st.park_until = 0;
+}
+
 fn closeConnMem(st: *ConnState) void {
+    parkRemove(st);
     if (st.buf.len > 0) {
         pumpAlloc().free(st.buf);
         st.buf = &.{};
@@ -705,6 +772,11 @@ fn pendingClaim(st: *ConnState, seg: []const u8) bool {
 // tail in pending for a write-ready event; the rearm that follows every
 // dispatch is what asks the reactor for it.
 fn flushPending(st: *ConnState) Flush {
+    // A parked conn must not write — the arm gates suspend scheduling but
+    // this is the socket egress every path (batch tails, WRITE events,
+    // queueAndFlush, the SSL drain) funnels through. Stalled is the honest
+    // answer: bytes are queued, the caller arms, and the park gate parks.
+    if (st.park_until != 0) return .stalled;
     while (st.pending_off < st.pending.items.len) {
         if (HAS_OPENSSL) {
             if (st.ssl) |tls| {
@@ -1989,6 +2061,17 @@ fn ukAdmit(incoming: c_int) ?c_int {
 }
 
 fn armKqueueFilter(kq: i32, fd: posix.fd_t, filter: i16) void {
+    // Callers hold the fd, not the ConnState — peek the table (no create)
+    // for the same park gate the st-holding arms have.
+    conn_states_mu.lock();
+    const st = if (@as(usize, @intCast(fd)) < MAX_TRACKED_FD) conn_states[@intCast(fd)] else null;
+    conn_states_mu.unlock();
+    if (st) |s| {
+        if (s.park_until != 0) {
+            if (!s.parked) parkInsert(s);
+            return;
+        }
+    }
     var changes: [1]libc.Kevent = undefined;
     var none: [0]libc.Kevent = undefined;
     changes[0] = .{
@@ -2010,6 +2093,10 @@ fn armKqueueRead(kq: i32, fd: posix.fd_t) void {
 // only to drain, a queued-up conn adds EVFILT_WRITE, a live conn keeps
 // reading. Two filters are two change entries — there is no combined event.
 fn kqueueRearm(kq: i32, fd: posix.fd_t, st: *ConnState) void {
+    if (st.park_until != 0) {
+        if (!st.parked) parkInsert(st);
+        return;
+    }
     var changes: [2]libc.Kevent = undefined;
     var count: usize = 0;
     if (!st.close_when_drained) {
@@ -2384,7 +2471,31 @@ fn workerCount() usize {
         var events: [$mod.MAX_EVENTS]$mod.libc.Kevent = undefined;
 
         while (true) {
-            const n = $mod.libc.kevent(kq, &no_changes, 0, &events, $mod.MAX_EVENTS, null);
+            // Parked conns emit nothing — the wait must wake for their
+            // deadline or a /delay reply would sleep until unrelated traffic
+            // happened to arrive.
+            var wait_ts: std.c.timespec = undefined;
+            const park_ms = $mod.parkMsUntilDue();
+            const ts: ?*std.c.timespec = if (park_ms == std.math.maxInt(i64)) null else blk: {
+                wait_ts = .{ .sec = @intCast(@divTrunc(park_ms, 1000)), .nsec = @intCast(@mod(park_ms, 1000) * 1000000) };
+                break :blk &wait_ts;
+            };
+            const n = $mod.libc.kevent(kq, &no_changes, 0, &events, $mod.MAX_EVENTS, ts);
+            while ($mod.parkDue()) |pst| {
+                const pfd: $mod.posix.fd_t = @intCast(pst.fd);
+                switch ($mod.flushPendingOwned(pst)) {
+                    .dead => {
+                        $mod.releaseConn(pfd);
+                        continue;
+                    },
+                    .stalled, .drained => {},
+                }
+                if (pst.close_when_drained and !$mod.hasWork(pst)) {
+                    $mod.releaseConn(pfd);
+                    continue;
+                }
+                $mod.kqueueRearm(kq, pfd, pst);
+            }
             if (n <= 0) continue;
             @import("root").koru_orisha.stampHttpDateLine();
 
@@ -3030,7 +3141,28 @@ fn workerCount() usize {
             var events: [$mod.MAX_EVENTS]$mod.libc.Kevent = undefined;
 
             while (true) {
-                const n = $mod.libc.kevent(kq, &no_changes, 0, &events, $mod.MAX_EVENTS, null);
+                var wait_ts: std.c.timespec = undefined;
+                const park_ms = $mod.parkMsUntilDue();
+                const ts: ?*std.c.timespec = if (park_ms == std.math.maxInt(i64)) null else blk: {
+                    wait_ts = .{ .sec = @intCast(@divTrunc(park_ms, 1000)), .nsec = @intCast(@mod(park_ms, 1000) * 1000000) };
+                    break :blk &wait_ts;
+                };
+                const n = $mod.libc.kevent(kq, &no_changes, 0, &events, $mod.MAX_EVENTS, ts);
+                while ($mod.parkDue()) |pst| {
+                    const pfd: $mod.posix.fd_t = @intCast(pst.fd);
+                    switch ($mod.flushPendingOwned(pst)) {
+                        .dead => {
+                            $mod.releaseConn(pfd);
+                            continue;
+                        },
+                        .stalled, .drained => {},
+                    }
+                    if (pst.close_when_drained and !$mod.hasWork(pst)) {
+                        $mod.releaseConn(pfd);
+                        continue;
+                    }
+                    $mod.kqueueRearm(kq, pfd, pst);
+                }
                 if (n <= 0) continue;
                 @import("root").koru_orisha.stampHttpDateLine();
 
@@ -3292,6 +3424,10 @@ fn workerCount() usize {
         // registration — a stall gaining EPOLLOUT, a drain dropping it, a
         // handshake step taking a direction. Never once per event.
         fn arm(epfd: i32, st: *$mod.ConnState, mask: u32) void {
+            if (st.park_until != 0) {
+                if (!st.parked) $mod.parkInsert(st);
+                return;
+            }
             // `armed` tracks the OUT bit of every installed mask — the flag
             // a wsPublishFrame producer reads before deciding to arm.
             st.armed.store((mask & linux.EPOLL.OUT) != 0, .release);
@@ -3336,7 +3472,25 @@ fn workerCount() usize {
 
             var events: [$mod.MAX_EVENTS]linux.epoll_event = undefined;
             while (true) {
-                const n_rc = linux.epoll_wait(epfd, &events, $mod.MAX_EVENTS, -1);
+                // Same rule as the kqueue wait: a parked conn's deadline
+                // is the latest this wait may sleep.
+                const park_ms = $mod.parkMsUntilDue();
+                const wait_ms: i32 = if (park_ms == std.math.maxInt(i64)) -1 else @intCast(@min(park_ms, std.math.maxInt(i32) - 1));
+                const n_rc = linux.epoll_wait(epfd, &events, $mod.MAX_EVENTS, wait_ms);
+                while ($mod.parkDue()) |pst| {
+                    switch ($mod.flushPendingOwned(pst)) {
+                        .dead => {
+                            $mod.releaseConn(@intCast(pst.fd));
+                            continue;
+                        },
+                        .stalled, .drained => {},
+                    }
+                    if (pst.close_when_drained and !$mod.hasWork(pst)) {
+                        $mod.releaseConn(@intCast(pst.fd));
+                        continue;
+                    }
+                    arm(epfd, pst, $mod.epollMask(pst));
+                }
                 const n: i32 = @bitCast(@as(u32, @truncate(n_rc)));
                 if (n <= 0) continue;
                 @import("root").koru_orisha.stampHttpDateLine();
@@ -3829,6 +3983,13 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
         // send, and a conn answered `keep_alive = false` still flushes its
         // last response before the fd drops.
         fn advance(w: *@This(), st: *$mod.ConnState) void {
+            // A parked conn's deadline outranks every next op — nothing is
+            // submitted until fireParked drops it back here with
+            // park_until cleared.
+            if (st.park_until != 0) {
+                if (!st.parked) $mod.parkInsert(st);
+                return;
+            }
             // Socket-BIO TLS conns own none of the ring's send machinery —
             // output leaves through SSL_write and readiness is poll_add.
             if (st.tls_sockbio) {
@@ -4427,12 +4588,27 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
             var wait_nr: u32 = 1;
             var cqes: [CQE_BATCH]linux.io_uring_cqe = undefined;
             while (true) {
-                if (wait_nr > 1) {
-                    $mod.ringWaitTimeout(&w.ring, wait_nr, WAIT_COALESCE_NS) catch continue;
+                // A parked conn emits no CQE — when the list is non-empty the
+                // wait must be bounded by its deadline, even when the batch
+                // shape would otherwise park on a single completion forever.
+                const park_ms = $mod.parkMsUntilDue();
+                if (park_ms == std.math.maxInt(i64)) {
+                    if (wait_nr > 1) {
+                        $mod.ringWaitTimeout(&w.ring, wait_nr, WAIT_COALESCE_NS) catch continue;
+                    } else {
+                        _ = w.ring.submit_and_wait(1) catch continue;
+                    }
                 } else {
-                    _ = w.ring.submit_and_wait(1) catch continue;
+                    const park_ns = park_ms *% std.time.ns_per_ms;
+                    const ns = if (wait_nr > 1) @min(WAIT_COALESCE_NS, park_ns) else park_ns;
+                    $mod.ringWaitTimeout(&w.ring, @max(wait_nr, 1), ns) catch continue;
                 }
                 const got = w.ring.copy_cqes(&cqes, 0) catch continue;
+                // Due parked conns re-enter here — park_until already cleared,
+                // so advance picks their staged pending up as the next send SQE.
+                while ($mod.parkDue()) |pst| {
+                    w.advance(pst);
+                }
                 @import("root").koru_orisha.stampHttpDateLine();
                 var i: usize = 0;
                 for (cqes[0..got]) |cqe| {
@@ -4663,6 +4839,22 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
         // empty would wire as 1005 (no status), not the 1000 a refused
         // protocol upgrade must send.
         if (!x.keep_alive) _ = wsSendFrame(st, 0x8, "\x03\xe8");
+    } else if (delay > 0) {
+        // Async delay: stage the WHOLE response in the conn's queue and park
+        // it — no write hits the wire until fireParked. appendPending never
+        // flushes inline on a parked conn's behalf (the arm gates hold the
+        // conn suspended), and ordering is free: pipelined replies queue
+        // behind it exactly as HTTP requires.
+        const dl: []const u8 = if (date_hole != 0) @import("root").koru_orisha.httpDateLine() else "";
+        const segs4: [4][]const u8 = if (date_hole != 0)
+            .{ head[0..date_hole], dl, head[date_hole..], body }
+        else
+            .{ head, body, "", "" };
+        if (!appendPending(st, &segs4)) {
+            x.keep_alive = false;
+            return .{ .broken = "write failed" };
+        }
+        st.park_until = std.time.milliTimestamp() + delay;
     } else {
         if (!writevAllConn(st, head, body, date_hole, head_static, body_static)) {
             x.keep_alive = false;
