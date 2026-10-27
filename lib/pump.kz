@@ -5898,9 +5898,8 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
             else
                 -1;
             const h2c_listen_fd: $mod.posix.fd_t = if ($mod.h2c_listen_port != 0)
-                $mod.openReusePortListener($mod.h2c_listen_port) orelse {
-                    return .{ .failed = "Failed to listen on h2c port" };
-                }
+                $mod.openReusePortListener($mod.h2c_listen_port) orelse
+                    std.debug.panic("Pump: io_uring worker failed to listen on :{}\n", .{$mod.h2c_listen_port})
             else -1;
             const h2_tls_listen_fd: $mod.posix.fd_t = if ($mod.h2_tls_listen_port != 0)
                 $mod.openReusePortListener($mod.h2_tls_listen_port) orelse {
