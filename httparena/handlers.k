@@ -18,6 +18,7 @@ pub tor baseline { req: *orisha:Request } -> orisha:Response
 pub tor json { req: *orisha:Request, count: string } -> orisha:Response
 pub tor ws-upgrade { req: *orisha:Request } -> orisha:Response
 pub tor echo { req: *orisha:Request } -> orisha:Response
+pub tor grpc-sum { req: *orisha:Request } -> orisha:Response
 pub tor delay { req: *orisha:Request, ms: string } -> orisha:Response
 pub tor static-file { req: *orisha:Request, file: string } -> orisha:Response
 
@@ -284,6 +285,12 @@ ws-upgrade = orisha:ws-accept(req): acc
 // body alike, borrowed from the request arena (sent inside the arm, freed
 // with it). An absent body answers 200 with nothing, as the contract asks.
 echo = orisha:body(req): b -> { status: 200, body: b orelse "", content_type: "application/octet-stream" }
+
+// unary-grpc: BenchmarkService/GetSum — the length-prefixed protobuf
+// frame decodes to SumRequest{a,b}, the reply frame carries {result=a+b}.
+// body_static: the frame lives in the worker's grpc scratch, same
+// discipline as int-body.
+grpc-sum = orisha:body(req): b |> orisha:grpc-sum-reply(body: b): f -> { status: 200, body: f, content_type: "application/grpc", body_static: true }
 
 // async: /delay/{ms} answers the ms count back, after ms. The pump stages
 // the reply and parks the conn for delay_ms — each request's timer is its

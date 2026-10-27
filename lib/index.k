@@ -182,6 +182,11 @@ pub tor serve-file { req: *Request, path: string } -> orisha:Response
 // never freed.
 pub tor int-body { n: i64 } -> string
 
+// gRPC unary GetSum codec: the length-prefixed SumRequest frame in, the
+// SumReply frame out. Threadlocal scratch, body_static — same discipline
+// as int-body.
+pub tor grpc-sum-reply { body: ?string } -> string
+
 // ============================================================================
 // REQUEST HEADERS — lazy reads over the raw block
 // ============================================================================

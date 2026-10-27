@@ -2428,21 +2428,34 @@ fn h2Reply(st: *ConnState, x: *Exchange, head: []const u8, body: []const u8, del
         hn += h2EncodePair(hblk[hn..], ":status", status);
     }
     hn = h2ContentHeaders(&hblk, hn, body.len, head);
+    // A gRPC stream's status lives in trailers: the DATA frames carry the
+    // message, then a trailing HEADERS closes with grpc-status — END_STREAM
+    // moves off DATA entirely (RFC 7540 §8.1 + the gRPC wire spec).
+    const is_grpc = std.mem.indexOf(u8, head, "application/grpc") != null;
     var fh: [9]u8 = undefined;
     h2WriteFrameHeadSlice(&fh, 0x1, 0x4, x.h2_stream, hn); // HEADERS, END_HEADERS
     w.appendSlice(a, &fh) catch return false;
     w.appendSlice(a, hblk[0..hn]) catch return false;
-    // DATA: one or more frames, END_STREAM on the last.
+    // DATA: one or more frames, END_STREAM on the last unless trailers
+    // follow (gRPC).
     var off: usize = 0;
     while (true) {
         const chunk = @min(body.len - off, st.h2_peer_max_frame);
         const last = off + chunk >= body.len;
         var dh: [9]u8 = undefined;
-        h2WriteFrameHeadSlice(dh[0..9], 0x0, if (last) 0x1 else 0x0, x.h2_stream, chunk);
+        h2WriteFrameHeadSlice(dh[0..9], 0x0, if (last and !is_grpc) 0x1 else 0x0, x.h2_stream, chunk);
         w.appendSlice(a, dh[0..9]) catch return false;
         w.appendSlice(a, body[off .. off + chunk]) catch return false;
         off += chunk;
         if (last) break;
+    }
+    if (is_grpc) {
+        var tbl: [32]u8 = undefined;
+        const tn = h2EncodePair(&tbl, "grpc-status", "0");
+        var th: [9]u8 = undefined;
+        h2WriteFrameHeadSlice(&th, 0x1, 0x4 | 0x1, x.h2_stream, tn); // HEADERS, END_HEADERS|END_STREAM
+        w.appendSlice(a, &th) catch return false;
+        w.appendSlice(a, tbl[0..tn]) catch return false;
     }
     if (delay_ms > 0) s.park_until = std.time.milliTimestamp() + delay_ms;
     // Emit what the windows allow; the rest stays staged in sendq.

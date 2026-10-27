@@ -1003,6 +1003,67 @@ threadlocal var int_body_buf: [32]u8 = undefined;
     return s;
 }
 
+// gRPC unary codec — the wire contract of BenchmarkService/GetSum. The
+// request body is a length-prefixed frame (1 flag byte + 4-byte BE len)
+// wrapping protobuf SumRequest{field1 varint a, field2 varint b}; the
+// answer is the same frame shape around SumReply{field1 varint a+b},
+// proto3-omitted entirely when the sum is 0. Worker-scoped buffer, the
+// same zero-alloc discipline as int-body.
+threadlocal var grpc_body_buf: [64]u8 = undefined;
+
+fn grpcVarint(bytes: []const u8, i: *usize) u64 {
+    var v: u64 = 0;
+    var shift: u6 = 0;
+    while (i.* < bytes.len) {
+        const byte = bytes[i.*];
+        i.* += 1;
+        v |= @as(u64, byte & 0x7f) << shift;
+        if (byte & 0x80 == 0) return v;
+        shift += 7;
+    }
+    return v;
+}
+
+~proc grpc-sum-reply|zig {
+    const raw = body orelse "";
+    var a: u64 = 0;
+    var b: u64 = 0;
+    if (raw.len >= 5) {
+        const msglen: usize = @intCast(std.mem.readInt(u32, raw[1..5], .big));
+        const msg = raw[5 .. @min(raw.len, 5 + msglen)];
+        var i: usize = 0;
+        while (i < msg.len) {
+            const tag = msg[i];
+            i += 1;
+            const val = grpcVarint(msg, &i);
+            if (tag == 0x08) a = val else if (tag == 0x10) b = val;
+        }
+    }
+    const sum: u32 = @truncate(a + b);
+    var n: usize = 0;
+    var msgbuf: [8]u8 = undefined;
+    if (sum != 0) {
+        msgbuf[0] = 0x08;
+        var v: u64 = sum;
+        var mi: usize = 1;
+        while (true) {
+            msgbuf[mi] = @truncate(v);
+            v >>= 7;
+            if (v == 0) {
+                mi += 1;
+                break;
+            }
+            msgbuf[mi] |= 0x80;
+            mi += 1;
+        }
+        n = mi;
+    }
+    std.mem.writeInt(u32, grpc_body_buf[1..5], @intCast(n), .big);
+    grpc_body_buf[0] = 0;
+    @memcpy(grpc_body_buf[5 .. 5 + n], msgbuf[0..n]);
+    return grpc_body_buf[0 .. 5 + n];
+}
+
 // Per-request disk read for the runtime-static seam — the sibling of
 // `orisha:static`, which embeds at compile time and therefore can never
 // answer the benchmark's mid-run file rewrites. STATIC_DIR mirrors
