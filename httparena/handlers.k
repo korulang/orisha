@@ -64,9 +64,7 @@ clamp-count = if(want <= 0)
 // pump frees it via release-body. fmt:ln's scoped borrow can't leave the
 // frame (KORU030 since scratch@scoped).
 tor respond-int { n: i64 } -> orisha:Response
-respond-int = std/string:from-int(n)
-| ok s |> std/string:detach(s): b -> { status: 200, body: b, content_type: "text/plain", body_allocated: true }
-| err _ -> { status: 500, body: "internal error", content_type: "text/plain" }
+respond-int = orisha:int-body(n): b -> { status: 200, body: b, content_type: "text/plain", body_static: true }
 
 tor respond-plain { body: string } -> orisha:Response
 respond-plain -> { status: 200, body, content_type: "application/json", body_allocated: true }

@@ -175,6 +175,13 @@ pub tor release-body { body: string, allocated: bool }
 // refused with 404 — `path` is attacker-shaped input, not a filename hint.
 pub tor serve-file { req: *Request, path: string } -> orisha:Response
 
+// A decimal i64 rendered into threadlocal scratch — the zero-alloc body
+// producer for integer answers (baseline, delay). The slice is valid until
+// the next int-body call on this worker; `reply` stages (copies) it
+// synchronously, so it rides out as `body_static` — never allocated,
+// never freed.
+pub tor int-body { n: i64 } -> string
+
 // ============================================================================
 // REQUEST HEADERS — lazy reads over the raw block
 // ============================================================================

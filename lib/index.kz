@@ -989,6 +989,20 @@ fn pageCachePut(key: u128, status: u16, content_type: ?[]const u8, content_encod
     return .{ .head = head_slice, .body = body_out, .body_allocated = body_allocated, .date_hole = 0, .close = res.close, .head_static = false, .body_static = body_static and !body_allocated, .delay_ms = res.delay_ms };
 }
 
+// A formatted integer for a response body, rendered into a threadlocal
+// scratch — the zix pattern: `bufPrint` into a fixed buffer, no String
+// alloc, nothing to free. Safe because staging copies the bytes into
+// send_buf/pending during `reply` — the slice must only outlive the call,
+// and a second response staged later reuses the same scratch without harm.
+threadlocal var int_body_buf: [32]u8 = undefined;
+
+~proc int-body|zig {
+    const s = std.fmt.bufPrint(&int_body_buf, "{d}", .{n}) catch {
+        return "0";
+    };
+    return s;
+}
+
 // Per-request disk read for the runtime-static seam — the sibling of
 // `orisha:static`, which embeds at compile time and therefore can never
 // answer the benchmark's mid-run file rewrites. STATIC_DIR mirrors

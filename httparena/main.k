@@ -13,6 +13,7 @@ import std/compress
 orisha:handler = orisha:router(req)
 ! [GET /pipeline] -> { status: 200, body: "ok", content_type: "text/plain", body_static: true }
 ! [GET /baseline11] |> httparena/handlers:baseline(req)
+! [GET /baseline2] |> httparena/handlers:baseline(req)
 ! [POST /baseline11] |> httparena/handlers:baseline(req)
 ! [GET /json/:count] p |> httparena/handlers:json(req, p.count)
 ! [GET /ws] |> httparena/handlers:ws-upgrade(req)
