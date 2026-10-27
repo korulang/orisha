@@ -114,6 +114,7 @@ const SendPlanEntry = struct {
 const URING_ENTRIES: u16 = 4096;
 const URING_ACCEPT: u64 = std.math.maxInt(u64);
 const URING_ACCEPT_TLS: u64 = URING_ACCEPT - 1;
+const URING_ACCEPT_H2C: u64 = URING_ACCEPT - 2;
 
 // One read is not one request.
 //
@@ -307,7 +308,7 @@ const MAX_TRACKED_FD = 1 << 20;
 // The connection's protocol mode. `http` is every connection at accept; a 101
 // answer flips it to `ws`, after which bytes on the wire are websocket frames
 // and `requestLen` never sees them again.
-pub const ConnMode = enum { http, ws };
+pub const ConnMode = enum { http, ws, h2c };
 
 // One writer at a time on a websocket connection. `ws-send` in a frame arm
 // and `ws-send-fd` from a pusher thread can both target the same socket;
@@ -366,6 +367,9 @@ pub const ConnState = struct {
     ssl: ?*ServerTls = null,
     mode: ConnMode = .http,
     ws_mu: SendMutex = .{},
+    // h2c: the 24-byte client preface has been consumed and our SETTINGS
+    // frame is out — every frame after that is parsed header-first.
+    h2_prefaced: bool = false,
     // Async delay: a handler's `delay_ms` stages its whole response and
     // parks the conn — no read or write arm — until this timestamp. The
     // parked list is per-worker (one thread, one loop), parked gates every
@@ -1510,6 +1514,62 @@ const ServerTlsCtx = if (HAS_OPENSSL) @import("root").koru_koru.koru_openssl.Ser
 
 var tls_server_ctx: ?*ServerTlsCtx = null;
 var tls_listen_port: u16 = 0;
+// Prior-knowledge HTTP/2 cleartext listener — the harness's h2c port is
+// fixed at 8082 and the entry opts in via H2C_PORT, the same env-driven
+// shape as STATIC_DIR: zero stays a `.k`-surface-free opt-out.
+var h2c_listen_port: u16 = 0;
+
+fn h2cPortEnv() u16 {
+    const s = std.posix.getenv("H2C_PORT") orelse return 0;
+    return std.fmt.parseInt(u16, s, 10) catch 0;
+}
+
+// ── HTTP/2 cleartext (h2c) — prior-knowledge per the arena profile ──────────
+// Skeleton shape: the client preface and the SETTINGS exchange are protocol
+// overhead every h2c conn pays once; frames are parsed header-first and the
+// ones this skeleton doesn't serve yet are ignored per RFC 7540 §5.5 —
+// stream machinery (HEADERS/DATA/flow control) lands on top of this.
+const H2_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+const H2_SETTINGS_FRAME = [_]u8{ 0, 0, 0, 0x04, 0x00, 0, 0, 0, 0 };
+const H2_SETTINGS_ACK = [_]u8{ 0, 0, 0, 0x04, 0x01, 0, 0, 0, 0 };
+
+// Bytes from a h2c conn. Consumes what it can; what it can't needs more
+// wire (or a dead conn). Returns the consumed count like scanRequest does.
+fn h2cProcess(st: *ConnState, bytes: []const u8) usize {
+    if (!st.h2_prefaced) {
+        if (bytes.len < H2_PREFACE.len) return 0;
+        if (!std.mem.eql(u8, bytes[0..H2_PREFACE.len], H2_PREFACE)) {
+            st.ring_dead = true;
+            return bytes.len;
+        }
+        st.h2_prefaced = true;
+        _ = appendPending(st, &.{&H2_SETTINGS_FRAME});
+        return H2_PREFACE.len;
+    }
+    var consumed: usize = 0;
+    while (consumed + 9 <= bytes.len) {
+        const len = (@as(u32, bytes[consumed]) << 16) | (@as(u32, bytes[consumed + 1]) << 8) | bytes[consumed + 2];
+        const typ = bytes[consumed + 3];
+        const flags = bytes[consumed + 4];
+        if (consumed + 9 + len > bytes.len) break;
+        const payload = bytes[consumed + 9 .. consumed + 9 + len];
+        consumed += 9 + len;
+        switch (typ) {
+            // SETTINGS → ack it once (the client's first frame is always this)
+            0x04 => if (flags & 0x01 == 0) {
+                _ = appendPending(st, &.{&H2_SETTINGS_ACK});
+            },
+            // PING → echo the opaque payload back with ACK
+            0x06 => if (flags & 0x01 == 0 and payload.len == 8) {
+                var ack: [17]u8 = .{ 0, 0, 8, 0x06, 0x01, 0, 0, 0, 0 } ++ @as([8]u8, undefined);
+                @memcpy(ack[9..], payload);
+                _ = appendPending(st, &.{&ack});
+            },
+            else => {},
+        }
+    }
+    return consumed;
+}
 
 // TLS exists only where a system openssl can be linked — this must stay the
 // same condition as koru/openssl's ~std/build:requires, which emits no link
@@ -2455,6 +2515,7 @@ fn workerCount() usize {
 ~proc init|zig {
     $mod.ignoreSigpipe();
 
+    $mod.h2c_listen_port = $mod.h2cPortEnv();
     if ($mod.maybeStartTls(tls_port, cert_path, key_path)) |err_msg| {
         return .{ .failed = err_msg };
     }
@@ -3117,6 +3178,7 @@ fn workerCount() usize {
 ~proc drive|zig {
     $mod.ignoreSigpipe();
 
+    $mod.h2c_listen_port = $mod.h2cPortEnv();
     if ($mod.maybeStartTls(tls_port, cert_path, key_path)) |err_msg| {
         return .{ .failed = err_msg };
     }
@@ -3383,6 +3445,7 @@ fn workerCount() usize {
 
     const linux = std.os.linux;
 
+    $mod.h2c_listen_port = $mod.h2cPortEnv();
     if ($mod.maybeStartTls(tls_port, cert_path, key_path)) |err_msg| {
         return .{ .failed = err_msg };
     }
@@ -3772,6 +3835,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
 }
 
 ~proc drive|io-uring {
+    $mod.h2c_listen_port = $mod.h2cPortEnv();
     if ($mod.maybeStartTls(tls_port, cert_path, key_path)) |err_msg| {
         return .{ .failed = err_msg };
     }
@@ -3820,6 +3884,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
         ring: linux.IoUring,
         listen_fd: $mod.posix.fd_t,
         tls_listen_fd: $mod.posix.fd_t,
+        h2c_listen_fd: $mod.posix.fd_t = -1,
         // Provided-buffer pool for cleartext multishot recv: the kernel picks
         // the destination per packet and the op stays armed for the conn's
         // life — no per-recv SQE prep, and reads proceed while a send is in
@@ -4079,9 +4144,10 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
 
         fn handleCqe(w: *@This(), cqe: linux.io_uring_cqe) void {
             const ud = cqe.user_data;
-            if (ud == $mod.URING_ACCEPT or ud == $mod.URING_ACCEPT_TLS) {
+            if (ud == $mod.URING_ACCEPT or ud == $mod.URING_ACCEPT_TLS or ud == $mod.URING_ACCEPT_H2C) {
                 const is_tls = ud == $mod.URING_ACCEPT_TLS;
-                const accept_fd = if (is_tls) w.tls_listen_fd else w.listen_fd;
+                const is_h2c = ud == $mod.URING_ACCEPT_H2C;
+                const accept_fd = if (is_tls) w.tls_listen_fd else if (is_h2c) w.h2c_listen_fd else w.listen_fd;
                 // Multishot: this one SQE reaps the whole connect storm.
                 // F_MORE cleared means the op retired — re-arm it once.
                 if (cqe.res >= 0) {
@@ -4096,6 +4162,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                         st.len = 0;
                         st.owner_ring = @ptrCast(w);
                         var ready = true;
+                        if (is_h2c) st.mode = .h2c;
                         if (is_tls) {
                             // Socket-BIO SSL — OpenSSL keeps the wire, the
                             // ring supplies readiness. ENABLE_KTLS on the ctx
@@ -4509,6 +4576,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
         // conn sets st.ring_dead rather than reporting it out of band.
         fn dispatchHttpSlice(w: *@This(), st: *$mod.ConnState, bytes: []const u8) usize {
             _ = w;
+            if (st.mode == .h2c) return $mod.h2cProcess(st, bytes);
             st.batching = true;
             var consumed: usize = 0;
             var alive = true;
@@ -4556,7 +4624,14 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                 }
             else
                 -1;
-            var w = @This(){ .ring = ring, .listen_fd = listen_fd, .tls_listen_fd = tls_listen_fd };
+            const h2c_listen_fd: $mod.posix.fd_t = if ($mod.h2c_listen_port != 0)
+                $mod.openReusePortListener($mod.h2c_listen_port) orelse {
+                    std.debug.print("Pump: io_uring worker failed to listen on :{}\n", .{$mod.h2c_listen_port});
+                    return;
+                }
+            else
+                -1;
+            var w = @This(){ .ring = ring, .listen_fd = listen_fd, .tls_listen_fd = tls_listen_fd, .h2c_listen_fd = h2c_listen_fd };
             // 1024 pool buffers of 8K per worker — far more than the deepest
             // CQE batch (512) can hold hostage, since each buffer is recycled
             // the moment its CQE is processed. Requests bigger than a buffer
@@ -4573,6 +4648,12 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                 std.debug.print("Pump: io_uring accept arm failed\n", .{});
                 return;
             };
+            if (h2c_listen_fd >= 0) {
+                _ = w.ring.accept_multishot($mod.URING_ACCEPT_H2C, h2c_listen_fd, null, null, 0) catch {
+                    std.debug.print("Pump: io_uring h2c accept arm failed\n", .{});
+                    return;
+                };
+            }
             if (tls_listen_fd >= 0) {
                 _ = w.ring.accept_multishot($mod.URING_ACCEPT_TLS, tls_listen_fd, null, null, 0) catch {
                     std.debug.print("Pump: io_uring TLS accept arm failed\n", .{});
