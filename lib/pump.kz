@@ -281,6 +281,98 @@ fn scanRequest(buf: []const u8, head: *Head) ?usize {
     }
 }
 
+// The race variant's scanner: identical contract to scanRequest — same take
+// (headers + body), same semantic fields — minus the pairs array. Routes in a
+// race build read only field-captured headers (accept-encoding,
+// if-none-match answer through headValueParsed's field path); a handler that
+// name-searches arbitrary headers needs the full scan, i.e. drive|io-uring.
+fn scanRequestLite(buf: []const u8, head: *Head) ?usize {
+    var content_len: ?usize = null;
+    var cl_seen = false;
+    var te_seen = false;
+    var conn_seen = false;
+    var ae_seen = false;
+    var inm_seen = false;
+    var pos: usize = 0;
+    var first_line = true;
+    while (true) {
+        const nl = indexOfLineEnd(buf, pos) orelse return null;
+        const line = buf[pos..nl];
+        pos = nl + 2;
+        if (line.len == 0) {
+            var take = pos;
+            if (content_len) |body_len| {
+                take += body_len;
+            } else if (head.chunked) {
+                take += chunkedMessageLen(buf[pos..]) orelse return null;
+            }
+            if (take > buf.len) return null;
+            head.head_len = @intCast(pos);
+            return take;
+        }
+        if (first_line) {
+            first_line = false;
+            if (std.mem.indexOfScalar(u8, line, ' ')) |sp| {
+                head.method_len = @intCast(sp);
+                const rest = line[sp + 1 ..];
+                head.target_off = @intCast(sp + 1);
+                head.target_len = @intCast(std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len);
+            }
+            continue;
+        }
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..colon], " \t");
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        const c0 = if (name.len == 0) 0 else std.ascii.toLower(name[0]);
+        switch (c0) {
+            'c' => {
+                if (name.len == 14 and std.ascii.eqlIgnoreCase(name, "content-length")) {
+                    if (!cl_seen) {
+                        cl_seen = true;
+                        content_len = std.fmt.parseInt(usize, value, 10) catch null;
+                    }
+                } else if (name.len == 10 and std.ascii.eqlIgnoreCase(name, "connection")) {
+                    if (!conn_seen) {
+                        conn_seen = true;
+                        var lower_buf: [64]u8 = undefined;
+                        if (value.len <= lower_buf.len) {
+                            const lower = std.ascii.lowerString(&lower_buf, value);
+                            if (std.mem.indexOf(u8, lower, "close") != null) head.wants_close = true;
+                        }
+                    }
+                }
+            },
+            't' => {
+                if (name.len == 17 and std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
+                    if (!te_seen) {
+                        te_seen = true;
+                        var lower_buf: [128]u8 = undefined;
+                        if (value.len <= lower_buf.len) {
+                            const lower = std.ascii.lowerString(&lower_buf, value);
+                            if (std.mem.indexOf(u8, lower, "chunked") != null) head.chunked = true;
+                        }
+                    }
+                }
+            },
+            'a' => {
+                if (name.len == 15 and !ae_seen and std.ascii.eqlIgnoreCase(name, "accept-encoding")) {
+                    ae_seen = true;
+                    head.accept_encoding_off = @intCast(@intFromPtr(value.ptr) - @intFromPtr(buf.ptr));
+                    head.accept_encoding_len = @intCast(value.len);
+                }
+            },
+            'i' => {
+                if (name.len == 13 and !inm_seen and std.ascii.eqlIgnoreCase(name, "if-none-match")) {
+                    inm_seen = true;
+                    head.if_none_match_off = @intCast(@intFromPtr(value.ptr) - @intFromPtr(buf.ptr));
+                    head.if_none_match_len = @intCast(value.len);
+                }
+            },
+            else => {},
+        }
+    }
+}
+
 // A request can arrive in pieces, so a connection needs somewhere to keep the
 // part that has not finished yet.
 //
@@ -6055,6 +6147,507 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
     }
     std.debug.print("Orisha listening on http://0.0.0.0:{}\n", .{port});
     std.debug.print("Pump: io_uring, {} workers (ring + listener each), keep-alive, TCP_NODELAY\n", .{spawned + 1});
+    W.run(port);
+
+    return .{ .stopped = "Server stopped" };
+}
+
+// ---------------------------------------------------------------------------
+// race — h1-only io_uring, minimal machinery. Selected by `--build=race`.
+//
+// Same ring shape as drive|io-uring (single-issuer, DEFER_TASKRUN, provided-
+// buffer multishot recv, multishot accept) with everything the h1 arena path
+// does not need removed: no TLS/socket-BIO, no h2c, no ws frames, no parked-
+// conn deadlines. Dispatch and the send path reuse the same ConnState and
+// staging fields — the difference is the absence of the branches, not a
+// second implementation of them.
+// ---------------------------------------------------------------------------
+
+~proc drive|race {
+    if (@import("builtin").os.tag != .linux) {
+        return .{ .failed = "io_uring is a Linux mechanism — build with --build=linux for this host" };
+    }
+
+    $mod.ignoreSigpipe();
+
+    const linux = std.os.linux;
+    const n_workers = $mod.workerCount();
+
+    const W = struct {
+        const TAG_SEND: u64 = 1;
+        const CQE_BATCH = 512;
+        const SUBMIT_STRIDE = 16; // push staged SQEs every N completions in a deep batch
+        // Coalesced completion wait, same policy as drive|io-uring.
+        const WAIT_COALESCE_MAX: u32 = 32;
+        const WAIT_COALESCE_NS: i64 = 20_000;
+
+        ring: linux.IoUring,
+        listen_fd: $mod.posix.fd_t,
+        // Provided-buffer pool for multishot recv — same design as
+        // drive|io-uring's: a plain (non-incremental) ring so each CQE is one
+        // fresh buffer. Null when registration is refused; conns then fall
+        // back to one-shot st.buf recvs.
+        bufgrp: ?*Pool = null,
+        ms_seen: bool = false,
+
+        const Pool = struct {
+            ring: *linux.IoUring,
+            buffers: []u8,
+            br: *linux.io_uring_buf_ring,
+            mask: u16,
+            size: u32,
+
+            fn init(ring: *linux.IoUring, size: u32, count: u16) !Pool {
+                const buffers = try $mod.pumpAlloc().alloc(u8, @as(usize, size) * count);
+                errdefer $mod.pumpAlloc().free(buffers);
+                const br = try linux.IoUring.setup_buf_ring(ring.fd, count, 1, .{ .inc = false });
+                linux.IoUring.buf_ring_init(br);
+                const mask = linux.IoUring.buf_ring_mask(count);
+                var i: u16 = 0;
+                while (i < count) : (i += 1) {
+                    const pos = @as(usize, size) * i;
+                    linux.IoUring.buf_ring_add(br, buffers[pos .. pos + size], i, mask, i);
+                }
+                linux.IoUring.buf_ring_advance(br, count);
+                return .{ .ring = ring, .buffers = buffers, .br = br, .mask = mask, .size = size };
+            }
+
+            fn arm(p: *Pool, user_data: u64, fd: $mod.posix.fd_t) !*linux.io_uring_sqe {
+                const sqe = try p.ring.get_sqe();
+                sqe.prep_rw(.RECV, fd, 0, 0, 0);
+                sqe.flags |= linux.IOSQE_BUFFER_SELECT;
+                sqe.buf_index = 1;
+                sqe.user_data = user_data;
+                sqe.ioprio |= linux.IORING_RECV_MULTISHOT;
+                return sqe;
+            }
+
+            fn sliceAt(p: *Pool, buffer_id: u16, n: usize) []u8 {
+                const pos = @as(usize, p.size) * buffer_id;
+                return p.buffers[pos .. pos + n];
+            }
+
+            fn release(p: *Pool, cqe: linux.io_uring_cqe) void {
+                const bid = cqe.buffer_id() catch return;
+                const pos = @as(usize, p.size) * bid;
+                linux.IoUring.buf_ring_add(p.br, p.buffers[pos .. pos + p.size], bid, p.mask, 0);
+                linux.IoUring.buf_ring_advance(p.br, 1);
+            }
+        };
+
+        fn udSend(st: *$mod.ConnState) u64 {
+            return @intFromPtr(st) | TAG_SEND;
+        }
+
+        fn cqeConn(ud: u64) *$mod.ConnState {
+            return @ptrFromInt(@as(usize, @intCast(ud & ~@as(u64, 3))));
+        }
+
+        // Same two-step as drive|io-uring: detach + close now, st freed once
+        // the armed recv's terminal CQE retires it. No TLS, no ws pushers.
+        fn teardown(w: *@This(), st: *$mod.ConnState) void {
+            if (!st.ring_closing) {
+                st.ring_closing = true;
+                st.ring_dead = true;
+                if (st.fd >= 0) {
+                    $mod.detachConn(st.fd);
+                    $mod.posix.shutdown(@intCast(st.fd), .both) catch {};
+                    $mod.posix.close(@intCast(st.fd));
+                    st.fd = -1;
+                }
+            }
+            w.maybeFreeRing(st);
+        }
+
+        fn maybeFreeRing(w: *@This(), st: *$mod.ConnState) void {
+            _ = w;
+            if (!st.ring_closing or st.recv_armed or st.poll_armed or st.send_len != 0) return;
+            st.ws_mu.lock();
+            $mod.closeConnMem(st);
+            st.ws_mu.unlock();
+            $mod.pumpAlloc().destroy(st);
+        }
+
+        fn submitRecv(w: *@This(), st: *$mod.ConnState) bool {
+            if (st.recv_armed) return true;
+            if (w.bufgrp) |bg| {
+                if (!st.ms_off) {
+                    _ = bg.arm(@intFromPtr(st), st.fd) catch {
+                        _ = w.ring.submit() catch {};
+                        _ = bg.arm(@intFromPtr(st), st.fd) catch return false;
+                    };
+                    st.recv_armed = true;
+                    return true;
+                }
+            }
+            const buf = st.buf[st.len..];
+            _ = w.ring.recv(@intFromPtr(st), st.fd, .{ .buffer = buf }, 0) catch {
+                _ = w.ring.submit() catch {};
+                _ = w.ring.recv(@intFromPtr(st), st.fd, .{ .buffer = buf }, 0) catch return false;
+            };
+            return true;
+        }
+
+        fn submitSend(w: *@This(), st: *$mod.ConnState) bool {
+            if (st.send_iov_n > 0) {
+                _ = w.ring.writev(udSend(st), st.fd, st.send_iov[st.send_iov_pos..st.send_iov_n], 0) catch {
+                    _ = w.ring.submit() catch {};
+                    _ = w.ring.writev(udSend(st), st.fd, st.send_iov[st.send_iov_pos..st.send_iov_n], 0) catch return false;
+                };
+                return true;
+            }
+            // MSG_MORE measured catastrophic here (-97%): a corked send stalls
+            // the pipeline — the response sits unpushed until autocork expiry
+            // and the client waits on it before refilling the window.
+            _ = w.ring.send(udSend(st), st.fd, st.send_buf[st.send_off..st.send_len], linux.MSG.NOSIGNAL) catch {
+                _ = w.ring.submit() catch {};
+                _ = w.ring.send(udSend(st), st.fd, st.send_buf[st.send_off..st.send_len], linux.MSG.NOSIGNAL) catch return false;
+            };
+            return true;
+        }
+
+        // Next-op selection, h1 only: staged output outranks new reads — a
+        // burst of pipelined replies coalesces into one send — then recv.
+        // No parks, no socket-BIO, no ws lock.
+        fn advance(w: *@This(), st: *$mod.ConnState) void {
+            if (st.send_len != 0 or st.send_iov_n != 0) return;
+            const pn = $mod.pendingLen(st);
+            const drain_n = if (st.spill_mark == std.math.maxInt(usize))
+                pn
+            else
+                @min(pn, st.spill_mark -| st.pending_off);
+            var drained_lo: usize = 0;
+            var drained_n: usize = 0;
+            if (drain_n > 0) {
+                drained_lo = st.send_staged;
+                const room = st.send_staged + drain_n;
+                if (st.send_buf.len < room) {
+                    const nb = $mod.pumpAlloc().alloc(u8, @max(4096, st.send_buf.len * 2, room)) catch {
+                        w.teardown(st);
+                        return;
+                    };
+                    @memcpy(nb[0..st.send_staged], st.send_buf[0..st.send_staged]);
+                    if (st.send_buf.len > 0) $mod.pumpAlloc().free(st.send_buf);
+                    st.send_buf = nb;
+                }
+                @memcpy(st.send_buf[st.send_staged..][0..drain_n], st.pending.items[st.pending_off..][0..drain_n]);
+                st.send_staged += drain_n;
+                drained_n = drain_n;
+                st.pending_off += drain_n;
+                if (st.pending_off == st.pending.items.len) {
+                    st.pending.clearRetainingCapacity();
+                    st.pending_off = 0;
+                }
+            }
+            if (st.send_plan_n > 0) {
+                var n: usize = 0;
+                if (drained_n > 0) {
+                    st.send_iov[0] = .{ .base = st.send_buf.ptr + drained_lo, .len = drained_n };
+                    n = 1;
+                }
+                for (st.send_plan[0..st.send_plan_n]) |e| {
+                    st.send_iov[n] = .{
+                        .base = if (e.buf) st.send_buf.ptr + e.base else @ptrFromInt(e.base),
+                        .len = e.len,
+                    };
+                    n += 1;
+                }
+                st.send_iov_n = n;
+                st.send_iov_pos = 0;
+                st.send_plan_n = 0;
+                st.send_base = 0;
+                st.send_staged = 0;
+                st.send_date_len = 0;
+                st.spill_mark = std.math.maxInt(usize);
+                if (!w.submitSend(st)) {
+                    st.send_iov_n = 0;
+                    w.teardown(st);
+                }
+                return;
+            }
+            if (st.send_staged > 0) {
+                st.send_off = st.send_base;
+                st.send_base = 0;
+                st.send_len = st.send_staged;
+                st.send_staged = 0;
+                if (!w.submitSend(st)) {
+                    st.send_len = 0;
+                    w.teardown(st);
+                }
+                return;
+            }
+            if (st.ring_dead or (st.len == st.buf.len and !$mod.growReqBuf(st))) {
+                w.teardown(st);
+                return;
+            }
+            if (!w.submitRecv(st)) w.teardown(st);
+        }
+
+        fn handleCqe(w: *@This(), cqe: linux.io_uring_cqe) void {
+            const ud = cqe.user_data;
+            if (ud == $mod.URING_ACCEPT) {
+                // Multishot accept: this one SQE reaps the whole storm —
+                // re-arm when F_MORE clears.
+                if (cqe.res >= 0) {
+                    const cfd: $mod.posix.fd_t = @intCast(cqe.res);
+                    $mod.disableNagle(cfd);
+                    // Multishot recv terminates at the first delivery on a
+                    // blocking fd — O_NONBLOCK keeps it armed across CQEs.
+                    $mod.markNonBlocking(cfd);
+                    if ($mod.connState(cfd)) |st| {
+                        st.len = 0;
+                        st.owner_ring = @ptrCast(w);
+                        if (!w.submitRecv(st)) w.teardown(st);
+                    } else {
+                        $mod.posix.close(cfd);
+                    }
+                }
+                if (cqe.flags & linux.IORING_CQE_F_MORE == 0) {
+                    _ = w.ring.accept_multishot(ud, w.listen_fd, null, null, 0) catch {
+                        _ = w.ring.submit() catch {};
+                        _ = w.ring.accept_multishot(ud, w.listen_fd, null, null, 0) catch {};
+                    };
+                }
+                return;
+            }
+
+            const st = cqeConn(ud);
+            if (ud & TAG_SEND != 0) {
+                if (cqe.res <= 0) {
+                    st.send_len = 0;
+                    st.send_iov_n = 0;
+                    w.teardown(st);
+                    return;
+                }
+                if (st.send_iov_n > 0) {
+                    var rem: usize = @intCast(cqe.res);
+                    var pos = st.send_iov_pos;
+                    while (rem > 0 and pos < st.send_iov_n) {
+                        const l = st.send_iov[pos].len;
+                        if (rem >= l) {
+                            rem -= l;
+                            pos += 1;
+                        } else {
+                            st.send_iov[pos].base += rem;
+                            st.send_iov[pos].len -= rem;
+                            rem = 0;
+                        }
+                    }
+                    st.send_iov_pos = pos;
+                    if (pos < st.send_iov_n) {
+                        if (!w.submitSend(st)) {
+                            st.send_iov_n = 0;
+                            w.teardown(st);
+                        }
+                        return;
+                    }
+                    st.send_iov_n = 0;
+                    st.send_iov_pos = 0;
+                    w.advance(st);
+                    return;
+                }
+                st.send_off += @intCast(cqe.res);
+                if (st.send_off < st.send_len) {
+                    if (!w.submitSend(st)) {
+                        st.send_len = 0;
+                        w.teardown(st);
+                    }
+                    return;
+                }
+                st.send_len = 0;
+                st.send_off = 0;
+                w.advance(st);
+                return;
+            }
+
+            // recv completion: armed = multishot pool CQE naming a buffer id;
+            // unarmed = one-shot st.buf recv, op consumed.
+            if (st.recv_armed) {
+                w.msRecvCqe(st, cqe);
+                return;
+            }
+            if (cqe.res <= 0 or st.ring_dead) {
+                w.teardown(st);
+                return;
+            }
+            st.len += @intCast(cqe.res);
+            w.dispatchReadable(st);
+            w.advance(st);
+        }
+
+        // Multishot recv CQE — same contract as drive|io-uring's: dispatch in
+        // place when the buffer holds a whole batch, copy the tail into
+        // st.buf otherwise; buffer goes back on the F_BUFFER flag.
+        fn msRecvCqe(w: *@This(), st: *$mod.ConnState, cqe: linux.io_uring_cqe) void {
+            if (!w.ms_seen) {
+                w.ms_seen = true;
+                std.debug.print("Pump: multishot recv live on provided buffers\n", .{});
+            }
+            const bg = w.bufgrp.?;
+            const pre_dead = st.ring_dead;
+            var dispatched = false;
+            if (cqe.res > 0) {
+                const n: usize = @intCast(cqe.res);
+                if (cqe.buffer_id()) |bid| {
+                    const buf = bg.sliceAt(bid, n);
+                    if (!pre_dead and st.len == 0 and st.recv_hold.items.len == 0) {
+                        const consumed = w.dispatchH1(st, buf);
+                        dispatched = true;
+                        if (consumed < buf.len and !st.ring_dead) {
+                            const tail = buf[consumed..];
+                            if (tail.len > st.buf.len) {
+                                while (st.buf.len < tail.len and $mod.growReqBuf(st)) {}
+                                if (tail.len > st.buf.len) st.ring_dead = true;
+                            }
+                            if (tail.len <= st.buf.len and !st.ring_dead) {
+                                @memcpy(st.buf[0..tail.len], tail);
+                                st.len = tail.len;
+                            }
+                        }
+                    } else {
+                        w.drainRecvHold(st);
+                        const room = st.buf.len - st.len;
+                        const fit = @min(room, n);
+                        @memcpy(st.buf[st.len..][0..fit], buf[0..fit]);
+                        st.len += fit;
+                        if (n > fit) {
+                            st.recv_hold.appendSlice($mod.pumpAlloc(), buf[fit..n]) catch {
+                                st.ring_dead = true;
+                            };
+                        }
+                    }
+                } else |_| {
+                    st.ring_dead = true;
+                }
+            }
+            // The buffer goes back whenever the kernel consumed one —
+            // F_BUFFER, not res, is the signal.
+            if (cqe.flags & linux.IORING_CQE_F_BUFFER != 0) bg.release(cqe);
+            if (cqe.flags & linux.IORING_CQE_F_MORE == 0) st.recv_armed = false;
+            if (pre_dead or cqe.res == 0) {
+                w.teardown(st);
+                return;
+            }
+            if (cqe.res < 0) {
+                if (cqe.res == -@as(i32, @intFromEnum(linux.E.NOBUFS))) {
+                    st.ms_off = true;
+                    w.advance(st);
+                    return;
+                }
+                w.teardown(st);
+                return;
+            }
+            if (!dispatched) w.dispatchReadable(st);
+            w.drainRecvHold(st);
+            w.advance(st);
+        }
+
+        fn drainRecvHold(w: *@This(), st: *$mod.ConnState) void {
+            while (!st.ring_dead and (st.len < st.buf.len or $mod.growReqBuf(st)) and st.recv_hold_off < st.recv_hold.items.len) {
+                const room = st.buf.len - st.len;
+                const avail = st.recv_hold.items.len - st.recv_hold_off;
+                const n = @min(room, avail);
+                @memcpy(st.buf[st.len..][0..n], st.recv_hold.items[st.recv_hold_off..][0..n]);
+                st.len += n;
+                st.recv_hold_off += n;
+                if (st.recv_hold_off == st.recv_hold.items.len) {
+                    st.recv_hold.clearRetainingCapacity();
+                    st.recv_hold_off = 0;
+                }
+                w.dispatchReadable(st);
+            }
+        }
+
+        fn dispatchReadable(w: *@This(), st: *$mod.ConnState) void {
+            const consumed = w.dispatchH1(st, st.buf[0..st.len]);
+            st.len = $mod.retainTail(st.buf, st.len, consumed);
+            if (!st.ring_dead and st.len == st.buf.len and !$mod.growReqBuf(st)) st.ring_dead = true;
+        }
+
+        // h1 only — no preface sniff, no h2c, no ws. Same scan loop as
+        // drive|io-uring's h1 branch: complete requests dispatch through
+        // scanRequest → Exchange → arrived; replies stage for one send.
+        fn dispatchH1(w: *@This(), st: *$mod.ConnState, bytes: []const u8) usize {
+            _ = w;
+            st.batching = true;
+            var consumed: usize = 0;
+            var alive = true;
+            var head_pairs: [$mod.HEAD_PAIRS_MAX]$mod.HeadPair = undefined;
+            while (consumed < bytes.len) {
+                var head: $mod.Head = .{ .pairs = &head_pairs };
+                const take = $mod.scanRequestLite(bytes[consumed..], &head) orelse break;
+                var exchange = $mod.Exchange{ .fd = st.fd, .st = st, .raw = bytes[consumed .. consumed + take], .head = &head };
+                if (head.wants_close) exchange.keep_alive = false;
+                arrived(&exchange);
+                consumed += take;
+                if (!exchange.keep_alive) {
+                    alive = false;
+                    break;
+                }
+            }
+            st.batching = false;
+            if (!alive) st.ring_dead = true;
+            return consumed;
+        }
+
+        fn run(port_: u16) void {
+            // Ring + listener on the worker thread — SINGLE_ISSUER wants the
+            // ring owned by the thread that drives it. DEFER_TASKRUN stays:
+            // dropping it measured -15% on this workload.
+            const ring = linux.IoUring.init($mod.URING_ENTRIES, linux.IORING_SETUP_SINGLE_ISSUER | linux.IORING_SETUP_DEFER_TASKRUN) catch
+                linux.IoUring.init($mod.URING_ENTRIES, 0) catch {
+                    std.debug.print("Pump: io_uring refused — io_uring_setup failed\n", .{});
+                    return;
+                };
+            const listen_fd = $mod.openReusePortListener(port_) orelse {
+                std.debug.print("Pump: io_uring worker failed to listen on :{}\n", .{port_});
+                return;
+            };
+            var w = @This(){ .ring = ring, .listen_fd = listen_fd };
+            var bg_store: ?Pool = Pool.init(&w.ring, 4096, 1024) catch |e| blk: {
+                std.debug.print("Pump: provided-buffer pool refused ({s}) — conns use one-shot recv\n", .{@errorName(e)});
+                break :blk null;
+            };
+            if (bg_store) |*bg| {
+                w.bufgrp = bg;
+                std.debug.print("Pump: buffer pool armed\n", .{});
+            }
+            _ = w.ring.accept_multishot($mod.URING_ACCEPT, listen_fd, null, null, 0) catch {
+                std.debug.print("Pump: io_uring accept arm failed\n", .{});
+                return;
+            };
+
+            const coalesce_max: u32 = if (w.ring.features & linux.IORING_FEAT_EXT_ARG != 0) WAIT_COALESCE_MAX else 1;
+
+            var wait_nr: u32 = 1;
+            var cqes: [CQE_BATCH]linux.io_uring_cqe = undefined;
+            while (true) {
+                // No parked conns, no deadlines: the wait shape is always the
+                // coalesced batch or the single park.
+                if (wait_nr > 1) {
+                    $mod.ringWaitTimeout(&w.ring, wait_nr, WAIT_COALESCE_NS) catch continue;
+                } else {
+                    _ = w.ring.submit_and_wait(1) catch continue;
+                }
+                const got = w.ring.copy_cqes(&cqes, 0) catch continue;
+                @import("root").koru_orisha.stampHttpDateLine();
+                var i: usize = 0;
+                for (cqes[0..got]) |cqe| {
+                    i += 1;
+                    if (i % SUBMIT_STRIDE == 0) _ = w.ring.submit() catch {};
+                    w.handleCqe(cqe);
+                }
+                wait_nr = @min(@max(@as(u32, @intCast(got / 2)), 1), coalesce_max);
+            }
+        }
+    };
+
+    var spawned: usize = 0;
+    while (spawned + 1 < n_workers) : (spawned += 1) {
+        _ = std.Thread.spawn(.{}, W.run, .{port}) catch break;
+    }
+    std.debug.print("Orisha listening on http://0.0.0.0:{}\n", .{port});
+    std.debug.print("Pump: io_uring race, {} workers\n", .{spawned + 1});
     W.run(port);
 
     return .{ .stopped = "Server stopped" };

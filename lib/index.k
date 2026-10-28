@@ -295,6 +295,15 @@ pub tor generation-bump {}
 | skipped _ |> _
 | invalid-event _ |> _
 
+// h1-only io_uring with the arena-irrelevant machinery removed — no TLS, no
+// h2c, no ws frames, no parked-conn deadlines.
+[build(race)]std/build:variants {
+    "orisha/pump:drive": "race"
+}
+| configured _ |> _
+| skipped _ |> _
+| invalid-event _ |> _
+
 // A unikernel selects BOTH: the loop, and the writer. `reply`'s default body
 // goes through `posix.write`, which has no implementation on a freestanding
 // target, and it is reached from the `arrived` arm on every request — so it is
