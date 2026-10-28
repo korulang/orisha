@@ -609,6 +609,11 @@ const PageEntry = struct {
 var page_cache_mu: std.Thread.Mutex = .{};
 var page_cache_map: ?std.AutoHashMap(u128, PageEntry) = null;
 var page_cache_gen: std.atomic.Value(u64) = .init(1);
+// Flips on the first store and never back. Until then the map is empty by
+// construction, so a lookup can only miss — and the miss used to cost a
+// SHA-256 key plus a process-wide lock on every GET, for programs (the
+// HttpArena entry among them) that never mark a response cacheable.
+var page_cache_live: std.atomic.Value(bool) = .init(false);
 const PAGE_CACHE_MAX: usize = 1024;
 
 pub fn generationBump() void {
@@ -700,7 +705,11 @@ fn pageCachePut(key: u128, status: u16, content_type: ?[]const u8, content_encod
         .body = a.dupe(u8, body) catch return,
     };
     if (map.fetchRemove(key)) |old| pageCacheFree(old.value);
-    map.put(key, owned) catch pageCacheFree(owned);
+    map.put(key, owned) catch {
+        pageCacheFree(owned);
+        return;
+    };
+    page_cache_live.store(true, .release);
 }
 
 ~proc answer|zig {
@@ -767,7 +776,8 @@ fn pageCachePut(key: u128, status: u16, content_type: ?[]const u8, content_encod
     defer for (served_small) |s| {
         if (s) |v| koru_allocator().free(v);
     };
-    const page_key: u128 = if (std.mem.eql(u8, method, "GET")) pageCacheKey(
+    const is_get = std.mem.eql(u8, method, "GET");
+    const page_key: u128 = if (is_get and page_cache_live.load(.acquire)) pageCacheKey(
         method,
         path,
         query,
@@ -950,9 +960,19 @@ fn pageCachePut(key: u128, status: u16, content_type: ?[]const u8, content_encod
 
     // Store the finished response — post-gzip, so each negotiated encoding
     // lands under its own key and hits never pay deflate twice. Opted-in GET
-    // 200s only; the lookup key was built before dispatch and stays valid.
-    if (res.cacheable and page_key != 0 and res.status == 200) {
-        pageCachePut(page_key, res.status, res.content_type, content_encoding, res.extra_headers, body_out);
+    // 200s only; the lookup key was built before dispatch and stays valid —
+    // or, while the cache has never held an entry, is built here for the
+    // first store.
+    if (res.cacheable and is_get and res.status == 200) {
+        const store_key = if (page_key != 0) page_key else pageCacheKey(
+            method,
+            path,
+            query,
+            $mod.headValueParsed(parsed, raw, "cookie"),
+            $mod.headValueParsed(parsed, raw, "host"),
+            aeWantsGzip(accept_encoding),
+        );
+        pageCachePut(store_key, res.status, res.content_type, content_encoding, res.extra_headers, body_out);
     }
 
     // A bufPrint failure answers null now, not the canned 500, so the leg
