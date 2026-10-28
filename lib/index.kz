@@ -637,6 +637,13 @@ fn pageCacheKey(method: []const u8, path: []const u8, query: ?[]const u8, cookie
     return std.mem.readInt(u128, out[0..16], .little);
 }
 
+// Opaque boundary for callers — the key hash is readonly, and LLVM will
+// speculate an inlinable readonly call past a guarding flag load. A noinline
+// edge keeps pageCacheKey behind the live/cacheable checks that gate it.
+noinline fn pageCacheKeyCold(method: []const u8, path: []const u8, query: ?[]const u8, cookie: ?[]const u8, host: ?[]const u8, ae_gzip: bool) u128 {
+    return pageCacheKey(method, path, query, cookie, host, ae_gzip);
+}
+
 fn pageCacheFree(e: PageEntry) void {
     const a = koru_allocator();
     a.free(e.body);
@@ -777,17 +784,22 @@ fn pageCachePut(key: u128, status: u16, content_type: ?[]const u8, content_encod
         if (s) |v| koru_allocator().free(v);
     };
     const is_get = std.mem.eql(u8, method, "GET");
-    const page_key: u128 = if (is_get and page_cache_live.load(.acquire)) pageCacheKey(
-        method,
-        path,
-        query,
-        $mod.headValueParsed(parsed, raw, "cookie"),
-        $mod.headValueParsed(parsed, raw, "host"),
-        aeWantsGzip(accept_encoding),
-    ) else 0;
-
+    var page_key: u128 = 0;
     const res = res_blk: {
-        if (page_key != 0) {
+        // Everything that touches the cache lives behind the one live check —
+        // the hash and the header lookups feeding it must not be speculated
+        // ahead of the flag load (measured on arm64: LLVM hoisted the readonly
+        // pageCacheKey above it, paying SHA-256 on every request).
+        if (is_get and page_cache_live.load(.acquire)) {
+            @branchHint(.unlikely);
+            page_key = pageCacheKeyCold(
+                method,
+                path,
+                query,
+                $mod.headValueParsed(parsed, raw, "cookie"),
+                $mod.headValueParsed(parsed, raw, "host"),
+                aeWantsGzip(accept_encoding),
+            );
             if (pageCacheGet(page_key)) |hit| {
                 served_small = hit.small;
                 break :res_blk hit.res;
@@ -964,7 +976,8 @@ fn pageCachePut(key: u128, status: u16, content_type: ?[]const u8, content_encod
     // or, while the cache has never held an entry, is built here for the
     // first store.
     if (res.cacheable and is_get and res.status == 200) {
-        const store_key = if (page_key != 0) page_key else pageCacheKey(
+        @branchHint(.unlikely);
+        const store_key = if (page_key != 0) page_key else pageCacheKeyCold(
             method,
             path,
             query,
