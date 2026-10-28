@@ -1,0 +1,31 @@
+{
+  "framework": "orisha",
+  "tests": [
+    {
+      "default": {
+        "json_url": "/json",
+        "db_url": "/db",
+        "query_url": "/queries?queries=",
+        "cached_query_url": "/cached-worlds?queries=",
+        "fortune_url": "/fortunes",
+        "update_url": "/updates?queries=",
+        "plaintext_url": "/plaintext",
+        "port": 8080,
+        "approach": "Realistic",
+        "classification": "Platform",
+        "database": "Postgres",
+        "framework": "None",
+        "language": "Koru",
+        "flavor": "None",
+        "orm": "Raw",
+        "platform": "None",
+        "webserver": "None",
+        "os": "Linux",
+        "database_os": "Linux",
+        "display_name": "orisha",
+        "notes": "Koru — compile-time specialized native server (io_uring pump), native pgwire driver, per-request serialization",
+        "versus": "koru"
+      }
+    }
+  ]
+}
