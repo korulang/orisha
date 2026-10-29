@@ -6665,9 +6665,17 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
             return null;
         }
 
-        fn pgPark(w: *@This(), st: *$mod.ConnState, n: u32, wrap_array: bool, update: bool) void {
-            const pg = w.pgPick() orelse return;
+        // false = no conn / no room — the caller falls through to arrived()
+        // so the request gets a real response rather than a silent park.
+        fn pgPark(w: *@This(), st: *$mod.ConnState, n: u32, wrap_array: bool, update: bool) bool {
+            const pg = w.pgPick() orelse return false;
             const a = $mod.pumpAlloc();
+            var wt: $mod.PgWaiter = .{ .st = st, .expected = n, .kind = if (wrap_array) 1 else 0 };
+            if (wrap_array) wt.buf.append(a, '[') catch return false;
+            // waiter lands BEFORE the binds — a bind never outlives its
+            // response path.
+            pg.waiters.append(a, wt) catch return false;
+            st.pg_pending += n;
             var i: u32 = 0;
             while (i < n) : (i += 1) {
                 const id = std.crypto.random.intRangeAtMost(u32, 1, 10000);
@@ -6678,19 +6686,17 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                     pg.bindExec(id);
                 }
             }
-            var wt: $mod.PgWaiter = .{ .st = st, .expected = n, .kind = if (wrap_array) 1 else 0 };
-            if (wrap_array) wt.buf.append(a, '[') catch return;
-            pg.waiters.append(a, wt) catch return;
-            st.pg_pending += n;
+            return true;
         }
 
         // /fortunes parks unbounded — the whole table streams until 'C'.
-        fn pgParkFortunes(w: *@This(), st: *$mod.ConnState) void {
-            const pg = w.pgPick() orelse return;
-            pg.bindExecFortune();
+        fn pgParkFortunes(w: *@This(), st: *$mod.ConnState) bool {
+            const pg = w.pgPick() orelse return false;
             const wt: $mod.PgWaiter = .{ .st = st, .expected = 0, .kind = 2 };
-            pg.waiters.append($mod.pumpAlloc(), wt) catch return;
+            pg.waiters.append($mod.pumpAlloc(), wt) catch return false;
             st.pg_pending = 1;
+            pg.bindExecFortune();
+            return true;
         }
 
         // fortunes: buf holds id\x01msg\x02 records — parse, append the
@@ -6823,8 +6829,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                         } else {
                             wt.buf.print(a, "{{\"id\":{s},\"randomNumber\":{s}}},", .{ id_s, rn_s }) catch {};
                         }
-                        wt.st.pg_pending -= 1;
-                        pg.pending_binds -= 1;
+                        wt.st.pg_pending -|= 1;
                         if (wt.expected > 0) {
                             wt.expected -= 1;
                             if (wt.expected == 0) {
@@ -6836,16 +6841,14 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                                 done.buf.deinit(a);
                             }
                         }
-                    } else if (pg.pending_binds > 0) {
-                        pg.pending_binds -= 1;
                     }
                 } else if (t == 'C') {
                     pg.rx_pos += mlen;
+                    pg.pending_binds -|= 1;
                     if (pg.waiters.items.len > 0 and pg.waiters.items[0].kind == 2) {
                         const a = $mod.pumpAlloc();
                         var done = pg.waiters.orderedRemove(0);
                         done.st.pg_pending = 0;
-                        pg.pending_binds -|= 1;
                         const html = w.renderFortunes(done.buf.items);
                         done.buf.deinit(a);
                         w.pgRespondHtml(done.st, html);
@@ -7088,15 +7091,17 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                 const target = bytes[t_off .. t_off + head.target_len];
                 if (w.pg[0] != null and st.pg_pending == 0 and
                     std.mem.eql(u8, method, "GET") and std.mem.eql(u8, target, "/db")) {
-                    w.pgPark(st, 1, false, false);
-                    consumed += take;
-                    continue;
+                    if (w.pgPark(st, 1, false, false)) {
+                        consumed += take;
+                        continue;
+                    }
                 }
                 if (w.pg[0] != null and st.pg_pending == 0 and
                     std.mem.eql(u8, method, "GET") and std.mem.eql(u8, target, "/fortunes")) {
-                    w.pgParkFortunes(st);
-                    consumed += take;
-                    continue;
+                    if (w.pgParkFortunes(st)) {
+                        consumed += take;
+                        continue;
+                    }
                 }
                 if (w.pg[0] != null and st.pg_pending == 0 and
                     std.mem.eql(u8, method, "GET") and
@@ -7112,9 +7117,10 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                         }
                         if (any) n = @min(@max(v, 1), 20);
                     }
-                    w.pgPark(st, n, true, std.mem.startsWith(u8, target, "/updates"));
-                    consumed += take;
-                    continue;
+                    if (w.pgPark(st, n, true, std.mem.startsWith(u8, target, "/updates"))) {
+                        consumed += take;
+                        continue;
+                    }
                 }
                 if (st.pg_pending > 0) break;
                 var exchange = $mod.Exchange{ .fd = st.fd, .st = st, .raw = bytes[consumed .. consumed + take], .head = &head };
