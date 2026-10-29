@@ -119,6 +119,9 @@ const URING_ACCEPT: u64 = std.math.maxInt(u64);
 const URING_ACCEPT_TLS: u64 = URING_ACCEPT - 1;
 const URING_ACCEPT_H2C: u64 = URING_ACCEPT - 2;
 const URING_ACCEPT_H2TLS: u64 = URING_ACCEPT - 3;
+// The per-worker Postgres conn: its fd rides the ring as a peer of the
+// client conns — a readable CQE here means parked exchanges can resume.
+const URING_PG: u64 = URING_ACCEPT - 4;
 
 // One read is not one request.
 //
@@ -626,6 +629,9 @@ pub const ConnState = struct {
     ring_closing: bool = false,
     recv_hold: std.ArrayListUnmanaged(u8) = .{},
     recv_hold_off: usize = 0,
+    // Db exchanges in flight on this conn — pipelined requests behind a
+    // /db wait until its row stages (wire order is request order).
+    pg_pending: u32 = 0,
     // The kernel owns the record layer — set when sslKtlsState reports both
     // directions offloaded and the conn has gone cleartext-shaped. Teardown
     // uses it to send close_notify through a control message on the fd.
@@ -633,6 +639,180 @@ pub const ConnState = struct {
 };
 
 var conn_states: [MAX_TRACKED_FD]?*ConnState = .{null} ** MAX_TRACKED_FD;
+
+// ---------------------------------------------------------------------------
+// Postgres — the driver's twin inside the pump. pg/index.kz is the public
+// surface; this is the same protocol specialized for the exchange-park job:
+// one prepared statement, batched binds, rows feeding a FIFO of parked
+// conns. Trust auth only (TFB/arena topology); the conn is blocking for its
+// startup handshake, nonblocking once armed on the ring.
+// ---------------------------------------------------------------------------
+const PgConn = struct {
+    fd: posix.fd_t,
+    tx: std.ArrayListUnmanaged(u8) = .{},
+    rx: [65536]u8 = undefined,
+    rx_len: usize = 0,
+    rx_pos: usize = 0,
+    msg_rem: u32 = 0,
+    // FIFO of conns whose next response is a db row — rows pair in bind
+    // order, which is request order.
+    waiters: std.ArrayListUnmanaged(*ConnState) = .{},
+    // in-flight binds for which no row may come back (conn torn down) —
+    // rows with no waiter are dropped, not mismatched.
+    pending_binds: u32 = 0,
+
+    fn sendAll(fd: posix.fd_t, buf: []const u8) !void {
+        var n: usize = 0;
+        var spins: u32 = 0;
+        while (n < buf.len) {
+            n += posix.send(fd, buf[n..], 0) catch |e| switch (e) {
+                // nonblocking fd — the buffer drains eventually; the batch
+                // is small enough that a brief wait beats losing the send.
+                error.WouldBlock => {
+                    spins += 1;
+                    if (spins > 1 << 22) return e;
+                    continue;
+                },
+                else => return e,
+            };
+        }
+    }
+
+    fn readFull(fd: posix.fd_t, buf: []u8) !void {
+        var n: usize = 0;
+        while (n < buf.len) {
+            const r = try posix.read(fd, buf[n..]);
+            if (r == 0) return error.Eof;
+            n += r;
+        }
+    }
+
+    fn put32(tx: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, v: u32) !void {
+        var x: [4]u8 = undefined; std.mem.writeInt(u32, &x, v, .big);
+        try tx.appendSlice(a, &x);
+    }
+    fn put16(tx: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, v: u16) !void {
+        var x: [2]u8 = undefined; std.mem.writeInt(u16, &x, v, .big);
+        try tx.appendSlice(a, &x);
+    }
+    fn frame(tx: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, t: u8, payload: []const u8) !void {
+        try tx.append(a, t); try put32(tx, a, @intCast(payload.len + 4)); try tx.appendSlice(a, payload);
+    }
+
+    // Blocking startup + trust-auth handshake + prepare of the world stmt.
+    fn connect() ?*PgConn {
+        const a = pumpAlloc();
+        const host = posix.getenv("PG_HOST") orelse "127.0.0.1";
+        const port_s = posix.getenv("PG_PORT") orelse "5432";
+        const user = posix.getenv("PG_USER") orelse "benchmarkdbuser";
+        const db = posix.getenv("PG_DB") orelse "hello_world";
+        const port = std.fmt.parseInt(u16, port_s, 10) catch 5432;
+        const addr = std.net.Address.parseIp(host, port) catch return null;
+        const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch return null;
+        $mod.posix.connect(fd, &addr.any, addr.getOsSockLen()) catch {
+            $mod.posix.close(fd); return null;
+        };
+        const pg = a.create(PgConn) catch {
+            posix.close(fd); return null;
+        };
+        pg.* = .{ .fd = fd };
+        // startup frame
+        var p: std.ArrayListUnmanaged(u8) = .{};
+        defer p.deinit(a);
+        put32(&p, a, 196608) catch return pg;
+        p.appendSlice(a, "user") catch return pg;
+        p.append(a, 0) catch return pg;
+        p.appendSlice(a, user) catch return pg;
+        p.append(a, 0) catch return pg;
+        p.appendSlice(a, "database") catch return pg;
+        p.append(a, 0) catch return pg;
+        p.appendSlice(a, db) catch return pg;
+        p.append(a, 0) catch return pg;
+        p.append(a, 0) catch return pg;
+        put32(&pg.tx, a, @intCast(p.items.len + 4)) catch return pg;
+        pg.tx.appendSlice(a, p.items) catch return pg;
+        sendAll(fd, pg.tx.items) catch return pg;
+        pg.tx.clearRetainingCapacity();
+        // drain to ReadyForQuery
+        var hdr: [5]u8 = undefined;
+        while (true) {
+            readFull(fd, &hdr) catch return pg;
+            const len = std.mem.readInt(u32, hdr[1..5], .big) - 4;
+            var buf: [1024]u8 = undefined;
+            readFull(fd, buf[0..@min(len, 1024)]) catch return pg;
+            var skip: usize = @min(len, 1024);
+            while (skip < len) : (skip += 1024) {
+                readFull(fd, buf[0..@min(len - skip, 1024)]) catch return pg;
+            }
+            if (hdr[0] == 'Z') break;
+            if (hdr[0] == 'E') return pg; // auth/config error — dead conn
+        }
+        // prepare s1 — no Describe, the row shape is compile-time known
+        const stmt = "s1";
+        const sql = "SELECT id, randomNumber FROM world WHERE id = $1";
+        var pp: std.ArrayListUnmanaged(u8) = .{};
+        defer pp.deinit(a);
+        pp.appendSlice(a, stmt) catch return pg;
+        pp.append(a, 0) catch return pg;
+        pp.appendSlice(a, sql) catch return pg;
+        pp.append(a, 0) catch return pg;
+        put16(&pp, a, 0) catch return pg;
+        frame(&pg.tx, a, 'P', pp.items) catch return pg;
+        frame(&pg.tx, a, 'S', "") catch return pg;
+        sendAll(fd, pg.tx.items) catch return pg;
+        pg.tx.clearRetainingCapacity();
+        while (true) {
+            readFull(fd, &hdr) catch return pg;
+            const len = std.mem.readInt(u32, hdr[1..5], .big) - 4;
+            var buf: [1024]u8 = undefined;
+            readFull(fd, buf[0..@min(len, 1024)]) catch return pg;
+            var skip: usize = @min(len, 1024);
+            while (skip < len) : (skip += 1024) {
+                readFull(fd, buf[0..@min(len - skip, 1024)]) catch return pg;
+            }
+            if (hdr[0] == 'Z') break;
+            if (hdr[0] == 'E') return pg;
+        }
+        // nonblocking from here on — the ring polls readability; reads
+        // must not block a worker.
+        markNonBlocking(pg.fd);
+        return pg;
+    }
+
+    // B+E for the world stmt appended to tx — flushed by the caller once
+    // the scan loop is done (all of a conn's parked requests ride one send).
+    fn bindExec(pg: *PgConn, id: u32) void {
+        const a = pumpAlloc();
+        var bp: std.ArrayListUnmanaged(u8) = .{};
+        defer bp.deinit(a);
+        bp.append(a, 0) catch return;
+        bp.appendSlice(a, "s1") catch return;
+        bp.append(a, 0) catch return;
+        put16(&bp, a, 0) catch return;
+        put16(&bp, a, 1) catch return;
+        var idb: [10]u8 = undefined;
+        const ids = std.fmt.bufPrint(&idb, "{}", .{id}) catch return;
+        put32(&bp, a, @intCast(ids.len)) catch return;
+        bp.appendSlice(a, ids) catch return;
+        put16(&bp, a, 0) catch return;
+        frame(&pg.tx, a, 'B', bp.items) catch return;
+        var ep: std.ArrayListUnmanaged(u8) = .{};
+        defer ep.deinit(a);
+        ep.append(a, 0) catch return;
+        put32(&ep, a, 0) catch return;
+        frame(&pg.tx, a, 'E', ep.items) catch return;
+        // Sync per bind — postgres buffers extended-protocol output until
+        // Sync; without it the row never flushes and the poll never fires.
+        frame(&pg.tx, a, 'S', "") catch return;
+        pg.pending_binds += 1;
+    }
+
+    fn flush(pg: *PgConn) void {
+        if (pg.tx.items.len == 0) return;
+        sendAll(pg.fd, pg.tx.items) catch {};
+        pg.tx.clearRetainingCapacity();
+    }
+};
 
 // The "no index is ever touched twice" claim is false: the accept thread
 // writes the slot (registerClient → connState) while a worker detaches it
@@ -5292,6 +5472,9 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
         // semantics. A plain ring keeps each CQE = one fresh buffer.
         bufgrp: ?*Pool = null,
         ms_seen: bool = false,
+        // The worker's db conn — null when PG_HOST is unreachable at
+        // startup; /db then falls through to the app's own handler.
+        pg: ?*$mod.PgConn = null,
 
         const Pool = struct {
             ring: *linux.IoUring,
@@ -6189,6 +6372,9 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
         // back to one-shot st.buf recvs.
         bufgrp: ?*Pool = null,
         ms_seen: bool = false,
+        // The worker's db conn — null when PG_HOST is unreachable at
+        // startup; /db then falls through to the app's own handler.
+        pg: ?*$mod.PgConn = null,
 
         const Pool = struct {
             ring: *linux.IoUring,
@@ -6383,8 +6569,119 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
             if (!w.submitRecv(st)) w.teardown(st);
         }
 
+        // The conn's next response is a db row — the exchange parks here:
+        // its bind joins the worker's batched tx and the conn waits for
+        // PG_READ. id is a fresh world row per request.
+        fn pgPark(w: *@This(), st: *$mod.ConnState) void {
+            const pg = w.pg.?;
+            const id = std.crypto.random.intRangeAtMost(u32, 1, 10000);
+            pg.bindExec(id);
+            pg.waiters.append($mod.pumpAlloc(), st) catch return;
+            st.pg_pending += 1;
+        }
+
+        // PG_READ: drain response frames; each DataRow completes the front
+        // waiter's exchange — stage its response, resume its tail scan.
+        fn pgReadCqe(w: *@This(), cqe: linux.io_uring_cqe) void {
+            const pg = w.pg.?;
+            if (cqe.res <= 0) {
+                // Lost the db conn — every parked exchange fails out.
+                while (pg.waiters.items.len > 0) {
+                    const st = pg.waiters.orderedRemove(0);
+                    st.pg_pending = 0;
+                    w.teardown(st);
+                }
+                pg.pending_binds = 0;
+                _ = w.ring.poll_add($mod.URING_PG, pg.fd, linux.POLL.IN) catch {};
+                return;
+            }
+            // poll says readable — drain to EAGAIN
+            while (true) {
+                const n = $mod.posix.read(pg.fd, pg.rx[pg.rx_len..]) catch |e| switch (e) {
+                    error.WouldBlock => 0,
+                    else => 0,
+                };
+                if (n == 0) break;
+                pg.rx_len += n;
+            }
+            while (true) {
+                if (pg.msg_rem > 0) {
+                    if (pg.rx_pos + pg.msg_rem <= pg.rx_len) {
+                        pg.rx_pos += pg.msg_rem; pg.msg_rem = 0;
+                    } else {
+                        const avail = pg.rx_len - pg.rx_pos;
+                        pg.rx_pos += avail; pg.msg_rem -= @intCast(avail);
+                        break;
+                    }
+                }
+                if (pg.rx_len - pg.rx_pos < 5) break;
+                const t = pg.rx[pg.rx_pos];
+                const mlen = std.mem.readInt(u32, pg.rx[pg.rx_pos + 1 ..][0..4], .big) - 4;
+                if (pg.rx_len - (pg.rx_pos + 5) < mlen) break;
+                pg.rx_pos += 5;
+                if (t == 'D') {
+                    // id int4-text, randomNumber int4-text
+                    const ncols = std.mem.readInt(u16, pg.rx[pg.rx_pos..][0..2], .big);
+                    var o = pg.rx_pos + 2;
+                    var id_s: []const u8 = "0";
+                    var rn_s: []const u8 = "0";
+                    var ci: usize = 0;
+                    while (ci < ncols) : (ci += 1) {
+                        const fl = std.mem.readInt(u32, pg.rx[o..][0..4], .big);
+                        o += 4;
+                        if (fl == 0xFFFFFFFF) continue;
+                        if (ci == 0) id_s = pg.rx[o .. o + fl];
+                        if (ci == 1) rn_s = pg.rx[o .. o + fl];
+                        o += fl;
+                    }
+                    pg.rx_pos += mlen;
+                    if (pg.waiters.items.len > 0) {
+                        const st = pg.waiters.orderedRemove(0);
+                        st.pg_pending -= 1;
+                        pg.pending_binds -= 1;
+                        w.pgRespond(st, id_s, rn_s);
+                    } else if (pg.pending_binds > 0) {
+                        pg.pending_binds -= 1;
+                    }
+                } else {
+                    pg.rx_pos += mlen;
+                }
+            }
+            if (pg.rx_pos > 0) {
+                std.mem.copyForwards(u8, pg.rx[0..], pg.rx[pg.rx_pos..pg.rx_len]);
+                pg.rx_len -= pg.rx_pos;
+                pg.rx_pos = 0;
+            }
+            _ = w.ring.poll_add($mod.URING_PG, pg.fd, linux.POLL.IN) catch {};
+        }
+
+        // The row resolved — stage the world JSON as the parked exchange's
+        // wire response, then resume the conn's queued requests.
+        fn pgRespond(w: *@This(), st: *$mod.ConnState, id_s: []const u8, rn_s: []const u8) void {
+            var jb: [48]u8 = undefined;
+            const body = std.fmt.bufPrint(&jb, "{{\"id\":{s},\"randomNumber\":{s}}}", .{ id_s, rn_s }) catch return;
+            var rb: [256]u8 = undefined;
+            const dl = @import("root").koru_orisha.httpDateLine();
+            const resp = std.fmt.bufPrint(&rb,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nServer: koru-orisha\r\n{s}\r\n{s}",
+                .{ body.len, dl[0..], body }) catch return;
+            st.pending.appendSlice($mod.pumpAlloc(), resp) catch {
+                w.teardown(st);
+                return;
+            };
+            w.advance(st);
+            if (st.pg_pending == 0 and st.len > 0 and !st.ring_dead) {
+                w.dispatchReadable(st);
+            }
+            w.advance(st);
+        }
+
         fn handleCqe(w: *@This(), cqe: linux.io_uring_cqe) void {
             const ud = cqe.user_data;
+            if (ud == $mod.URING_PG) {
+                w.pgReadCqe(cqe);
+                return;
+            }
             if (ud == $mod.URING_ACCEPT) {
                 // Multishot accept: this one SQE reaps the whole storm —
                 // re-arm when F_MORE clears.
@@ -6568,7 +6865,6 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
         // drive|io-uring's h1 branch: complete requests dispatch through
         // scanRequest → Exchange → arrived; replies stage for one send.
         fn dispatchH1(w: *@This(), st: *$mod.ConnState, bytes: []const u8) usize {
-            _ = w;
             st.batching = true;
             var consumed: usize = 0;
             var alive = true;
@@ -6576,6 +6872,22 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
             while (consumed < bytes.len) {
                 var head: $mod.Head = .{ .pairs = &head_pairs };
                 const take = $mod.scanRequestLite(bytes[consumed..], &head) orelse break;
+                // Db park: a /db request's response waits on its row, so it
+                // skips arrived() entirely. Consecutive /db requests co-park
+                // (their binds ride one flush, rows pair in order); a route
+                // that is not /db behind a parked one must wait — wire order
+                // is request order — so the scan stops there.
+                const m_off = consumed + head.method_off;
+                const t_off = consumed + head.target_off;
+                const method = bytes[m_off .. m_off + head.method_len];
+                const target = bytes[t_off .. t_off + head.target_len];
+                if (w.pg != null and st.pg_pending == 0 and
+                    std.mem.eql(u8, method, "GET") and std.mem.eql(u8, target, "/db")) {
+                    w.pgPark(st);
+                    consumed += take;
+                    continue;
+                }
+                if (st.pg_pending > 0) break;
                 var exchange = $mod.Exchange{ .fd = st.fd, .st = st, .raw = bytes[consumed .. consumed + take], .head = &head };
                 if (head.wants_close) exchange.keep_alive = false;
                 arrived(&exchange);
@@ -6617,6 +6929,17 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                 return;
             };
 
+            // The db conn joins the ring as a peer — a readable CQE on it
+            // means parked exchanges can resume. Blocking only through the
+            // startup handshake; nonblocking once armed.
+            if ($mod.PgConn.connect()) |pg| {
+                w.pg = pg;
+                _ = w.ring.poll_add($mod.URING_PG, pg.fd, linux.POLL.IN) catch {
+                    std.debug.print("Pump: pg poll arm failed\n", .{});
+                };
+                std.debug.print("Pump: pg conn armed on the ring\n", .{});
+            }
+
             const coalesce_max: u32 = if (w.ring.features & linux.IORING_FEAT_EXT_ARG != 0) WAIT_COALESCE_MAX else 1;
 
             var wait_nr: u32 = 1;
@@ -6637,6 +6960,9 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                     if (i % SUBMIT_STRIDE == 0) _ = w.ring.submit() catch {};
                     w.handleCqe(cqe);
                 }
+                // Db binds staged this batch go out as one send — the conn's
+                // parked requests share a roundtrip.
+                if (w.pg) |pg| pg.flush();
                 wait_nr = @min(@max(@as(u32, @intCast(got / 2)), 1), coalesce_max);
             }
         }
