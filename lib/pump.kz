@@ -654,7 +654,8 @@ const PgWaiter = struct {
     // rows until complete — 0 means unbounded (fortunes completes on
     // CommandComplete, not a count).
     expected: u32,
-    kind: u8, // 0 object, 1 array, 2 fortunes
+    kind: u8, // 0 object, 1 array, 2 fortunes, 3 updates (D pairs, emit 2nd)
+    seen: u32 = 0,
     buf: std.ArrayListUnmanaged(u8) = .{},
 };
 
@@ -6784,15 +6785,19 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
             const a = $mod.pumpAlloc();
             var wt: $mod.PgWaiter = .{ .st = st, .expected = n, .kind = if (wrap_array) 1 else 0 };
             if (wrap_array) wt.buf.append(a, '[') catch return false;
+            if (update) { wt.kind = 3; wt.expected = 2 * n; }
             // waiter lands BEFORE the binds — a bind never outlives its
             // response path.
             pg.waiters.append(a, wt) catch return false;
-            st.pg_pending += n;
+            st.pg_pending += wt.expected;
             var i: u32 = 0;
             while (i < n) : (i += 1) {
                 const id = std.crypto.random.intRangeAtMost(u32, 1, 10000);
                 if (update) {
+                    // TFB counts statements: a real read AND a real write
+                    // per row — SELECT then UPDATE...RETURNING.
                     const rn = std.crypto.random.intRangeAtMost(u32, 1, 10000);
+                    pg.bindExec(id);
                     pg.bindExecUpdate(id, rn);
                 } else {
                     pg.bindExec(id);
@@ -6857,12 +6862,17 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
         }
 
         fn pgRespondHtml(w: *@This(), st: *$mod.ConnState, body: []const u8) void {
-            var rb: [8192]u8 = undefined;
+            var hb: [256]u8 = undefined;
             const dl = @import("root").koru_orisha.httpDateLine();
-            const resp = std.fmt.bufPrint(&rb,
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html; charset=utf-8\r\nServer: koru-orisha\r\n{s}\r\n{s}",
-                .{ body.len, dl[0..], body }) catch return;
-            st.pending.appendSlice($mod.pumpAlloc(), resp) catch {
+            const a = $mod.pumpAlloc();
+            const hdrs = std.fmt.bufPrint(&hb,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html; charset=utf-8\r\nServer: koru-orisha\r\n{s}\r\n",
+                .{ body.len, dl[0..] }) catch return;
+            st.pending.appendSlice(a, hdrs) catch {
+                w.teardown(st);
+                return;
+            };
+            st.pending.appendSlice(a, body) catch {
                 w.teardown(st);
                 return;
             };
@@ -6938,6 +6948,12 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                             wt.buf.append(a, 1) catch {};
                             wt.buf.appendSlice(a, rn_s) catch {};
                             wt.buf.append(a, 2) catch {};
+                        } else if (wt.kind == 3) {
+                            // updates: SELECT row, then UPDATE...RETURNING —
+                            // emit only the post-write row.
+                            wt.seen += 1;
+                            if (wt.seen & 1 == 0)
+                                wt.buf.print(a, "{{\"id\":{s},\"randomNumber\":{s}}},", .{ id_s, rn_s }) catch {};
                         } else {
                             wt.buf.print(a, "{{\"id\":{s},\"randomNumber\":{s}}},", .{ id_s, rn_s }) catch {};
                         }
@@ -6948,7 +6964,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                                 var done = pg.waiters.orderedRemove(0);
                                 if (done.buf.items.len > 0 and done.buf.items[done.buf.items.len - 1] == ',')
                                     done.buf.items.len -= 1;
-                                if (done.kind == 1) done.buf.append(a, ']') catch {};
+                                if (done.kind == 1 or done.kind == 3) done.buf.append(a, ']') catch {};
                                 w.pgRespond(done.st, done.buf.items);
                                 done.buf.deinit(a);
                             }
@@ -6980,12 +6996,20 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
         // The row resolved — stage the world JSON as the parked exchange's
         // wire response, then resume the conn's queued requests.
         fn pgRespond(w: *@This(), st: *$mod.ConnState, body: []const u8) void {
-            var rb: [2048]u8 = undefined;
+            // headers into a small stack buf; body appends straight into
+            // pending — a 500-row array is ~20KB and must not bounce off a
+            // fixed stage buffer.
+            var hb: [256]u8 = undefined;
             const dl = @import("root").koru_orisha.httpDateLine();
-            const resp = std.fmt.bufPrint(&rb,
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nServer: koru-orisha\r\n{s}\r\n{s}",
-                .{ body.len, dl[0..], body }) catch return;
-            st.pending.appendSlice($mod.pumpAlloc(), resp) catch {
+            const a = $mod.pumpAlloc();
+            const hdrs = std.fmt.bufPrint(&hb,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nServer: koru-orisha\r\n{s}\r\n",
+                .{ body.len, dl[0..] }) catch return;
+            st.pending.appendSlice(a, hdrs) catch {
+                w.teardown(st);
+                return;
+            };
+            st.pending.appendSlice(a, body) catch {
                 w.teardown(st);
                 return;
             };
@@ -7227,7 +7251,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                             v = v * 10 + (target[e] - '0');
                             any = true;
                         }
-                        if (any) n = @min(@max(v, 1), 20);
+                        if (any) n = @min(@max(v, 1), 500);
                     }
                     if (w.pgPark(st, n, true, std.mem.startsWith(u8, target, "/updates"))) {
                         consumed += take;
