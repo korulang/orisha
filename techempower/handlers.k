@@ -21,7 +21,7 @@ plaintext -> { status: 200, body: "HTTP/1.1 200 OK\r\nContent-Length: 13\r\nCont
 
 // TODO(tfb-audit): instantiate + serialize per request via std/json:emit —
 // the ownership handoff (emitted! -> body custody) lands with the db pass.
-json -> { status: 200, body: "HTTP/1.1 200 OK\r\nContent-Length: 27\r\nContent-Type: application/json\r\nServer: koru-orisha\r\n\r\n{\"message\":\"Hello, World!\"}", content_type: "application/json", body_static: true, wire: true, wire_date_hole: 63 }
+json -> { status: 200, body: "HTTP/1.1 200 OK\r\nContent-Length: 27\r\nContent-Type: application/json\r\nServer: koru-orisha\r\n\r\n{\"message\":\"Hello, World!\"}", content_type: "application/json", body_static: true, wire: true, wire_date_hole: 69 }
 
 tor respond { body: string<*> } -> orisha:Response
 respond -> { status: 200, body, content_type: "application/json", body_allocated: true, extra_headers: "Server: koru-orisha\r\n" }
