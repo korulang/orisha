@@ -712,16 +712,114 @@ const PgConn = struct {
     }
 
     // Blocking startup + trust-auth handshake + prepare of the world stmt.
+    fn readMsg(fd: posix.fd_t, hdr: *[5]u8, buf: []u8, len: *u32) !void {
+        readFull(fd, hdr) catch return error.Read;
+        len.* = std.mem.readInt(u32, hdr[1..5], .big) - 4;
+        const take: usize = @min(len.*, buf.len);
+        readFull(fd, buf[0..take]) catch return error.Read;
+        var skip: usize = take;
+        var sink: [512]u8 = undefined;
+        while (skip < len.*) : (skip += @min(len.* - skip, 512)) {
+            readFull(fd, sink[0..@min(len.* - skip, 512)]) catch return error.Read;
+        }
+    }
+
+    // SCRAM-SHA-256 — TFB's postgres demands password auth; the dance is
+    // fixed (client-first → server-first → proof) so this is mechanical.
+    fn scramAuth(fd: posix.fd_t, pg: *PgConn, user: []const u8, pass: []const u8) !void {
+        const a = pumpAlloc();
+        const H = std.crypto.auth.hmac.sha2.HmacSha256;
+        var nonce: [24]u8 = undefined;
+        std.crypto.random.bytes(&nonce);
+        var nb: [64]u8 = undefined;
+        const nb_s = std.base64.standard.Encoder.encode(&nb, &nonce);
+        // client-first: gs2 header + bare
+        var cf: std.ArrayListUnmanaged(u8) = .{};
+        defer cf.deinit(a);
+        try cf.writer(a).print("n,,n={s},r={s}", .{ user, nb_s });
+        var msg: std.ArrayListUnmanaged(u8) = .{};
+        defer msg.deinit(a);
+        try msg.appendSlice(a, "SCRAM-SHA-256");
+        try msg.append(a, 0);
+        put32(&msg, a, @intCast(cf.items.len)) catch return error.Auth;
+        try msg.appendSlice(a, cf.items);
+        frame(&pg.tx, a, 'p', msg.items) catch return error.Auth;
+        sendAll(fd, pg.tx.items) catch return error.Auth;
+        pg.tx.clearRetainingCapacity();
+        // server-first: r=<nonce>,s=<salt>,i=<iters>
+        var hdr: [5]u8 = undefined;
+        var buf: [2048]u8 = undefined;
+        var mlen: u32 = 0;
+        readMsg(fd, &hdr, &buf, &mlen) catch return error.Auth;
+        if (hdr[0] != 'R' or std.mem.readInt(u32, buf[0..4], .big) != 11) return error.Auth;
+        const sf = buf[4 .. 4 + mlen - 4];
+        var rnonce: []const u8 = "";
+        var salt_b64: []const u8 = "";
+        var iters: u32 = 4096;
+        var it = std.mem.splitScalar(u8, sf, ',');
+        while (it.next()) |kv| {
+            if (std.mem.startsWith(u8, kv, "r=")) rnonce = kv[2..];
+            if (std.mem.startsWith(u8, kv, "s=")) salt_b64 = kv[2..];
+            if (std.mem.startsWith(u8, kv, "i=")) iters = std.fmt.parseInt(u32, kv[2..], 10) catch 4096;
+        }
+        if (rnonce.len == 0 or !std.mem.startsWith(u8, rnonce, nb_s)) return error.Auth;
+        var salt: [64]u8 = undefined;
+        std.base64.standard.Decoder.decode(&salt, salt_b64) catch return error.Auth;
+        const salt_dec = salt[0..(std.base64.standard.Decoder.calcSizeForSlice(salt_b64) catch return error.Auth)];
+        // pbkdf2-sha256 by hand — the emit std overlay has Hmac but not pw.
+        var salted: [32]u8 = undefined;
+        {
+            var blk: [68]u8 = undefined;
+            @memcpy(blk[0..salt_dec.len], salt_dec);
+            std.mem.writeInt(u32, blk[salt_dec.len..][0..4], 1, .big);
+            var t: [32]u8 = undefined;
+            H.create(&t, blk[0 .. salt_dec.len + 4], pass);
+            salted = t;
+            var it2: u32 = 1;
+            while (it2 < iters) : (it2 += 1) {
+                H.create(&t, &t, pass);
+                for (0..32) |j| salted[j] ^= t[j];
+            }
+        }
+        var ckey: [32]u8 = undefined;
+        H.create(&ckey, "Client Key", &salted);
+        var skey: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(&ckey, &skey, .{});
+        const bare = cf.items[3..]; // strip "n,,"
+        var am: std.ArrayListUnmanaged(u8) = .{};
+        defer am.deinit(a);
+        try am.writer(a).print("{s},{s},c=biws,r={s}", .{ bare, sf, rnonce });
+        var csig: [32]u8 = undefined;
+        H.create(&csig, am.items, &skey);
+        var proof: [32]u8 = undefined;
+        for (0..32) |i| proof[i] = ckey[i] ^ csig[i];
+        var pb: [64]u8 = undefined;
+        const pb_s = std.base64.standard.Encoder.encode(&pb, &proof);
+        msg.clearRetainingCapacity();
+        try msg.writer(a).print("c=biws,r={s},p={s}", .{ rnonce, pb_s });
+        frame(&pg.tx, a, 'p', msg.items) catch return error.Auth;
+        sendAll(fd, pg.tx.items) catch return error.Auth;
+        pg.tx.clearRetainingCapacity();
+        // SASLFinal (type 12) then AuthOk (0) — drain is caller's job
+    }
+
     fn connect() ?*PgConn {
         const a = pumpAlloc();
-        const host = posix.getenv("PG_HOST") orelse "127.0.0.1";
+        const host = posix.getenv("PG_HOST") orelse "tfb-database";
         const port_s = posix.getenv("PG_PORT") orelse "5432";
         const user = posix.getenv("PG_USER") orelse "benchmarkdbuser";
+        const pass = posix.getenv("PG_PASS") orelse "benchmarkdbpass";
         const db = posix.getenv("PG_DB") orelse "hello_world";
         const port = std.fmt.parseInt(u16, port_s, 10) catch 5432;
-        const addr = std.net.Address.parseIp(host, port) catch return null;
+        const list = std.net.getAddressList(a, host, port) catch return null;
+        defer list.deinit();
+        var addr: ?std.net.Address = null;
+        for (list.addrs) |ad| {
+            if (ad.any.family == posix.AF.INET) { addr = ad; break; }
+        }
+        const address = addr orelse return null;
         const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch return null;
-        $mod.posix.connect(fd, &addr.any, addr.getOsSockLen()) catch {
+        $mod.posix.connect(fd, &address.any, address.getOsSockLen()) catch {
             $mod.posix.close(fd); return null;
         };
         const pg = a.create(PgConn) catch {
@@ -745,19 +843,33 @@ const PgConn = struct {
         pg.tx.appendSlice(a, p.items) catch return pg;
         sendAll(fd, pg.tx.items) catch return pg;
         pg.tx.clearRetainingCapacity();
-        // drain to ReadyForQuery
+        // drain to ReadyForQuery — auth-aware: SASL (10) runs the SCRAM
+        // dance, cleartext (3) answers with the password, AuthOk (0) and
+        // param/status frames pass through.
         var hdr: [5]u8 = undefined;
+        var mbuf: [2048]u8 = undefined;
+        var mlen: u32 = 0;
+        var authed = false;
         while (true) {
-            readFull(fd, &hdr) catch return pg;
-            const len = std.mem.readInt(u32, hdr[1..5], .big) - 4;
-            var buf: [1024]u8 = undefined;
-            readFull(fd, buf[0..@min(len, 1024)]) catch return pg;
-            var skip: usize = @min(len, 1024);
-            while (skip < len) : (skip += 1024) {
-                readFull(fd, buf[0..@min(len - skip, 1024)]) catch return pg;
-            }
+            readMsg(fd, &hdr, &mbuf, &mlen) catch return pg;
             if (hdr[0] == 'Z') break;
             if (hdr[0] == 'E') return pg; // auth/config error — dead conn
+            if (hdr[0] == 'R' and !authed) {
+                const at = std.mem.readInt(u32, mbuf[0..4], .big);
+                if (at == 10) {
+                    scramAuth(fd, pg, user, pass) catch return pg;
+                    authed = true;
+                } else if (at == 3) {
+                    var pm: std.ArrayListUnmanaged(u8) = .{};
+                    defer pm.deinit(a);
+                    pm.appendSlice(a, pass) catch return pg;
+                    pm.append(a, 0) catch return pg;
+                    frame(&pg.tx, a, 'p', pm.items) catch return pg;
+                    sendAll(fd, pg.tx.items) catch return pg;
+                    pg.tx.clearRetainingCapacity();
+                    authed = true;
+                }
+            }
         }
         // prepare s1 — no Describe, the row shape is compile-time known
         const stmt = "s1";
