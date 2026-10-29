@@ -647,6 +647,13 @@ var conn_states: [MAX_TRACKED_FD]?*ConnState = .{null} ** MAX_TRACKED_FD;
 // conns. Trust auth only (TFB/arena topology); the conn is blocking for its
 // startup handshake, nonblocking once armed on the ring.
 // ---------------------------------------------------------------------------
+const PgWaiter = struct {
+    st: *ConnState,
+    expected: u32,
+    wrap_array: bool,
+    buf: std.ArrayListUnmanaged(u8) = .{},
+};
+
 const PgConn = struct {
     fd: posix.fd_t,
     tx: std.ArrayListUnmanaged(u8) = .{},
@@ -654,9 +661,10 @@ const PgConn = struct {
     rx_len: usize = 0,
     rx_pos: usize = 0,
     msg_rem: u32 = 0,
-    // FIFO of conns whose next response is a db row — rows pair in bind
-    // order, which is request order.
-    waiters: std.ArrayListUnmanaged(*ConnState) = .{},
+    // FIFO of parked exchanges — rows pair in bind order, which is
+    // request order. expected counts the rows a parked request needs:
+    // 1 for /db, N for /queries. buf accumulates the JSON body.
+    waiters: std.ArrayListUnmanaged(PgWaiter) = .{},
     // in-flight binds for which no row may come back (conn torn down) —
     // rows with no waiter are dropped, not mismatched.
     pending_binds: u32 = 0,
@@ -6572,12 +6580,18 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
         // The conn's next response is a db row — the exchange parks here:
         // its bind joins the worker's batched tx and the conn waits for
         // PG_READ. id is a fresh world row per request.
-        fn pgPark(w: *@This(), st: *$mod.ConnState) void {
+        fn pgPark(w: *@This(), st: *$mod.ConnState, n: u32, wrap_array: bool) void {
             const pg = w.pg.?;
-            const id = std.crypto.random.intRangeAtMost(u32, 1, 10000);
-            pg.bindExec(id);
-            pg.waiters.append($mod.pumpAlloc(), st) catch return;
-            st.pg_pending += 1;
+            const a = $mod.pumpAlloc();
+            var i: u32 = 0;
+            while (i < n) : (i += 1) {
+                const id = std.crypto.random.intRangeAtMost(u32, 1, 10000);
+                pg.bindExec(id);
+            }
+            var wt: $mod.PgWaiter = .{ .st = st, .expected = n, .wrap_array = wrap_array };
+            if (wrap_array) wt.buf.append(a, '[') catch return;
+            pg.waiters.append(a, wt) catch return;
+            st.pg_pending += n;
         }
 
         // PG_READ: drain response frames; each DataRow completes the front
@@ -6587,9 +6601,10 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
             if (cqe.res <= 0) {
                 // Lost the db conn — every parked exchange fails out.
                 while (pg.waiters.items.len > 0) {
-                    const st = pg.waiters.orderedRemove(0);
-                    st.pg_pending = 0;
-                    w.teardown(st);
+                    var rm = pg.waiters.orderedRemove(0);
+                    rm.st.pg_pending = 0;
+                    rm.buf.deinit($mod.pumpAlloc());
+                    w.teardown(rm.st);
                 }
                 pg.pending_binds = 0;
                 _ = w.ring.poll_add($mod.URING_PG, pg.fd, linux.POLL.IN) catch {};
@@ -6636,10 +6651,21 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                     }
                     pg.rx_pos += mlen;
                     if (pg.waiters.items.len > 0) {
-                        const st = pg.waiters.orderedRemove(0);
-                        st.pg_pending -= 1;
+                        const a = $mod.pumpAlloc();
+                        const wt = &pg.waiters.items[0];
+                        wt.buf.print(a, "{{\"id\":{s},\"randomNumber\":{s}}},", .{ id_s, rn_s }) catch {};
+                        wt.st.pg_pending -= 1;
                         pg.pending_binds -= 1;
-                        w.pgRespond(st, id_s, rn_s);
+                        wt.expected -= 1;
+                        if (wt.expected == 0) {
+                            var done = pg.waiters.orderedRemove(0);
+                            // strip the trailing comma; close the array
+                            if (done.buf.items.len > 0 and done.buf.items[done.buf.items.len - 1] == ',')
+                                done.buf.items.len -= 1;
+                            if (done.wrap_array) done.buf.append(a, ']') catch {};
+                            w.pgRespond(done.st, done.buf.items);
+                            done.buf.deinit(a);
+                        }
                     } else if (pg.pending_binds > 0) {
                         pg.pending_binds -= 1;
                     }
@@ -6657,10 +6683,8 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
 
         // The row resolved — stage the world JSON as the parked exchange's
         // wire response, then resume the conn's queued requests.
-        fn pgRespond(w: *@This(), st: *$mod.ConnState, id_s: []const u8, rn_s: []const u8) void {
-            var jb: [48]u8 = undefined;
-            const body = std.fmt.bufPrint(&jb, "{{\"id\":{s},\"randomNumber\":{s}}}", .{ id_s, rn_s }) catch return;
-            var rb: [256]u8 = undefined;
+        fn pgRespond(w: *@This(), st: *$mod.ConnState, body: []const u8) void {
+            var rb: [2048]u8 = undefined;
             const dl = @import("root").koru_orisha.httpDateLine();
             const resp = std.fmt.bufPrint(&rb,
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nServer: koru-orisha\r\n{s}\r\n{s}",
@@ -6883,7 +6907,24 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                 const target = bytes[t_off .. t_off + head.target_len];
                 if (w.pg != null and st.pg_pending == 0 and
                     std.mem.eql(u8, method, "GET") and std.mem.eql(u8, target, "/db")) {
-                    w.pgPark(st);
+                    w.pgPark(st, 1, false);
+                    consumed += take;
+                    continue;
+                }
+                if (w.pg != null and st.pg_pending == 0 and
+                    std.mem.eql(u8, method, "GET") and std.mem.startsWith(u8, target, "/queries")) {
+                    var n: u32 = 1;
+                    if (std.mem.indexOf(u8, target, "queries=")) |qi| {
+                        var e = qi + 8;
+                        var v: u32 = 0;
+                        var any = false;
+                        while (e < target.len and target[e] >= '0' and target[e] <= '9') : (e += 1) {
+                            v = v * 10 + (target[e] - '0');
+                            any = true;
+                        }
+                        if (any) n = @min(@max(v, 1), 20);
+                    }
+                    w.pgPark(st, n, true);
                     consumed += take;
                     continue;
                 }
