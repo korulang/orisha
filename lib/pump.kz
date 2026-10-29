@@ -758,11 +758,20 @@ const PgConn = struct {
         // prepare s1 — no Describe, the row shape is compile-time known
         const stmt = "s1";
         const sql = "SELECT id, randomNumber FROM world WHERE id = $1";
+        const stmt2 = "s2";
+        const sql2 = "UPDATE world SET randomNumber = $2 WHERE id = $1 RETURNING id, randomNumber";
         var pp: std.ArrayListUnmanaged(u8) = .{};
         defer pp.deinit(a);
         pp.appendSlice(a, stmt) catch return pg;
         pp.append(a, 0) catch return pg;
         pp.appendSlice(a, sql) catch return pg;
+        pp.append(a, 0) catch return pg;
+        put16(&pp, a, 0) catch return pg;
+        frame(&pg.tx, a, 'P', pp.items) catch return pg;
+        pp.clearRetainingCapacity();
+        pp.appendSlice(a, stmt2) catch return pg;
+        pp.append(a, 0) catch return pg;
+        pp.appendSlice(a, sql2) catch return pg;
         pp.append(a, 0) catch return pg;
         put16(&pp, a, 0) catch return pg;
         frame(&pg.tx, a, 'P', pp.items) catch return pg;
@@ -811,6 +820,35 @@ const PgConn = struct {
         frame(&pg.tx, a, 'E', ep.items) catch return;
         // Sync per bind — postgres buffers extended-protocol output until
         // Sync; without it the row never flushes and the poll never fires.
+        frame(&pg.tx, a, 'S', "") catch return;
+        pg.pending_binds += 1;
+    }
+
+    // B+E+S for the update stmt — (id, newRandomNumber) as text params.
+    fn bindExecUpdate(pg: *PgConn, id: u32, rn: u32) void {
+        const a = pumpAlloc();
+        var bp: std.ArrayListUnmanaged(u8) = .{};
+        defer bp.deinit(a);
+        bp.append(a, 0) catch return;
+        bp.appendSlice(a, "s2") catch return;
+        bp.append(a, 0) catch return;
+        put16(&bp, a, 0) catch return;
+        put16(&bp, a, 2) catch return;
+        var ib: [10]u8 = undefined;
+        const is_ = std.fmt.bufPrint(&ib, "{}", .{id}) catch return;
+        put32(&bp, a, @intCast(is_.len)) catch return;
+        bp.appendSlice(a, is_) catch return;
+        var rb: [10]u8 = undefined;
+        const rs = std.fmt.bufPrint(&rb, "{}", .{rn}) catch return;
+        put32(&bp, a, @intCast(rs.len)) catch return;
+        bp.appendSlice(a, rs) catch return;
+        put16(&bp, a, 0) catch return;
+        frame(&pg.tx, a, 'B', bp.items) catch return;
+        var ep: std.ArrayListUnmanaged(u8) = .{};
+        defer ep.deinit(a);
+        ep.append(a, 0) catch return;
+        put32(&ep, a, 0) catch return;
+        frame(&pg.tx, a, 'E', ep.items) catch return;
         frame(&pg.tx, a, 'S', "") catch return;
         pg.pending_binds += 1;
     }
@@ -6580,13 +6618,18 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
         // The conn's next response is a db row — the exchange parks here:
         // its bind joins the worker's batched tx and the conn waits for
         // PG_READ. id is a fresh world row per request.
-        fn pgPark(w: *@This(), st: *$mod.ConnState, n: u32, wrap_array: bool) void {
+        fn pgPark(w: *@This(), st: *$mod.ConnState, n: u32, wrap_array: bool, update: bool) void {
             const pg = w.pg.?;
             const a = $mod.pumpAlloc();
             var i: u32 = 0;
             while (i < n) : (i += 1) {
                 const id = std.crypto.random.intRangeAtMost(u32, 1, 10000);
-                pg.bindExec(id);
+                if (update) {
+                    const rn = std.crypto.random.intRangeAtMost(u32, 1, 10000);
+                    pg.bindExecUpdate(id, rn);
+                } else {
+                    pg.bindExec(id);
+                }
             }
             var wt: $mod.PgWaiter = .{ .st = st, .expected = n, .wrap_array = wrap_array };
             if (wrap_array) wt.buf.append(a, '[') catch return;
@@ -6907,12 +6950,13 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                 const target = bytes[t_off .. t_off + head.target_len];
                 if (w.pg != null and st.pg_pending == 0 and
                     std.mem.eql(u8, method, "GET") and std.mem.eql(u8, target, "/db")) {
-                    w.pgPark(st, 1, false);
+                    w.pgPark(st, 1, false, false);
                     consumed += take;
                     continue;
                 }
                 if (w.pg != null and st.pg_pending == 0 and
-                    std.mem.eql(u8, method, "GET") and std.mem.startsWith(u8, target, "/queries")) {
+                    std.mem.eql(u8, method, "GET") and
+                    (std.mem.startsWith(u8, target, "/queries") or std.mem.startsWith(u8, target, "/updates"))) {
                     var n: u32 = 1;
                     if (std.mem.indexOf(u8, target, "queries=")) |qi| {
                         var e = qi + 8;
@@ -6924,7 +6968,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                         }
                         if (any) n = @min(@max(v, 1), 20);
                     }
-                    w.pgPark(st, n, true);
+                    w.pgPark(st, n, true, std.mem.startsWith(u8, target, "/updates"));
                     consumed += take;
                     continue;
                 }
