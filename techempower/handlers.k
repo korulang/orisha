@@ -10,8 +10,6 @@
 // Date itself; Server rides on extra_headers.
 
 import orisha
-import std/json
-import std/string
 
 pub tor plaintext { req: *orisha:Request } -> orisha:Response
 pub tor json { req: *orisha:Request } -> orisha:Response

@@ -1,7 +1,7 @@
 // Orisha on TechEmpower — import the framework, wire the TFB routes, listen.
 //
 //   cd orisha/techempower
-//   koruc main.k --release=fast && ./a.out
+//   koruc main.k --release=fast --build=race && ./a.out
 
 import orisha
 import techempower/handlers

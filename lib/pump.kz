@@ -7283,6 +7283,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                         st.pending.appendSlice($mod.pumpAlloc(), unavailable) catch {};
                         w.advance(st);
                     }
+                    if (!exchange.keep_alive) alive = false;
                     break;
                 }
                 if (!exchange.keep_alive) {
