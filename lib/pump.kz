@@ -119,9 +119,11 @@ const URING_ACCEPT: u64 = std.math.maxInt(u64);
 const URING_ACCEPT_TLS: u64 = URING_ACCEPT - 1;
 const URING_ACCEPT_H2C: u64 = URING_ACCEPT - 2;
 const URING_ACCEPT_H2TLS: u64 = URING_ACCEPT - 3;
-// The per-worker Postgres conn: its fd rides the ring as a peer of the
-// client conns — a readable CQE here means parked exchanges can resume.
+// The per-worker Postgres conns: each rides the ring as a peer of the
+// client conns — a readable CQE means parked exchanges can resume.
+// Pool slot i's userdata is URING_PG - i.
 const URING_PG: u64 = URING_ACCEPT - 4;
+const PG_POOL: usize = 4;
 
 // One read is not one request.
 //
@@ -5550,9 +5552,11 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
         // semantics. A plain ring keeps each CQE = one fresh buffer.
         bufgrp: ?*Pool = null,
         ms_seen: bool = false,
-        // The worker's db conn — null when PG_HOST is unreachable at
-        // startup; /db then falls through to the app's own handler.
-        pg: ?*$mod.PgConn = null,
+        // The worker's db pool — conns share the parked-exchange load;
+        // null slots mean PG_HOST was unreachable at startup and the db
+        // routes fall through to the app's own handler.
+        pg: [$mod.PG_POOL]?*$mod.PgConn = .{null} ** $mod.PG_POOL,
+        pg_rr: usize = 0,
 
         const Pool = struct {
             ring: *linux.IoUring,
@@ -6450,9 +6454,11 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
         // back to one-shot st.buf recvs.
         bufgrp: ?*Pool = null,
         ms_seen: bool = false,
-        // The worker's db conn — null when PG_HOST is unreachable at
-        // startup; /db then falls through to the app's own handler.
-        pg: ?*$mod.PgConn = null,
+        // The worker's db pool — conns share the parked-exchange load;
+        // null slots mean PG_HOST was unreachable at startup and the db
+        // routes fall through to the app's own handler.
+        pg: [$mod.PG_POOL]?*$mod.PgConn = .{null} ** $mod.PG_POOL,
+        pg_rr: usize = 0,
 
         const Pool = struct {
             ring: *linux.IoUring,
@@ -6650,8 +6656,17 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
         // The conn's next response is a db row — the exchange parks here:
         // its bind joins the worker's batched tx and the conn waits for
         // PG_READ. id is a fresh world row per request.
+        fn pgPick(w: *@This()) ?*$mod.PgConn {
+            var k: usize = 0;
+            while (k < $mod.PG_POOL) : (k += 1) {
+                w.pg_rr = (w.pg_rr + 1) % $mod.PG_POOL;
+                if (w.pg[w.pg_rr]) |pg| return pg;
+            }
+            return null;
+        }
+
         fn pgPark(w: *@This(), st: *$mod.ConnState, n: u32, wrap_array: bool, update: bool) void {
-            const pg = w.pg.?;
+            const pg = w.pgPick() orelse return;
             const a = $mod.pumpAlloc();
             var i: u32 = 0;
             while (i < n) : (i += 1) {
@@ -6671,7 +6686,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
 
         // /fortunes parks unbounded — the whole table streams until 'C'.
         fn pgParkFortunes(w: *@This(), st: *$mod.ConnState) void {
-            const pg = w.pg.?;
+            const pg = w.pgPick() orelse return;
             pg.bindExecFortune();
             const wt: $mod.PgWaiter = .{ .st = st, .expected = 0, .kind = 2 };
             pg.waiters.append($mod.pumpAlloc(), wt) catch return;
@@ -6743,7 +6758,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
         // PG_READ: drain response frames; each DataRow completes the front
         // waiter's exchange — stage its response, resume its tail scan.
         fn pgReadCqe(w: *@This(), cqe: linux.io_uring_cqe) void {
-            const pg = w.pg.?;
+            const pg = w.pg[@intCast($mod.URING_PG - cqe.user_data)] orelse return;
             if (cqe.res <= 0) {
                 // Lost the db conn — every parked exchange fails out.
                 while (pg.waiters.items.len > 0) {
@@ -6753,7 +6768,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                     w.teardown(rm.st);
                 }
                 pg.pending_binds = 0;
-                _ = w.ring.poll_add($mod.URING_PG, pg.fd, linux.POLL.IN) catch {};
+                _ = w.ring.poll_add(cqe.user_data, pg.fd, linux.POLL.IN) catch {};
                 return;
             }
             // poll says readable — drain to EAGAIN
@@ -6844,7 +6859,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                 pg.rx_len -= pg.rx_pos;
                 pg.rx_pos = 0;
             }
-            _ = w.ring.poll_add($mod.URING_PG, pg.fd, linux.POLL.IN) catch {};
+            _ = w.ring.poll_add(cqe.user_data, pg.fd, linux.POLL.IN) catch {};
         }
 
         // The row resolved — stage the world JSON as the parked exchange's
@@ -6868,7 +6883,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
 
         fn handleCqe(w: *@This(), cqe: linux.io_uring_cqe) void {
             const ud = cqe.user_data;
-            if (ud == $mod.URING_PG) {
+            if (ud <= $mod.URING_PG and ud > $mod.URING_PG - $mod.PG_POOL) {
                 w.pgReadCqe(cqe);
                 return;
             }
@@ -7071,19 +7086,19 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                 const t_off = consumed + head.target_off;
                 const method = bytes[m_off .. m_off + head.method_len];
                 const target = bytes[t_off .. t_off + head.target_len];
-                if (w.pg != null and st.pg_pending == 0 and
+                if (w.pg[0] != null and st.pg_pending == 0 and
                     std.mem.eql(u8, method, "GET") and std.mem.eql(u8, target, "/db")) {
                     w.pgPark(st, 1, false, false);
                     consumed += take;
                     continue;
                 }
-                if (w.pg != null and st.pg_pending == 0 and
+                if (w.pg[0] != null and st.pg_pending == 0 and
                     std.mem.eql(u8, method, "GET") and std.mem.eql(u8, target, "/fortunes")) {
                     w.pgParkFortunes(st);
                     consumed += take;
                     continue;
                 }
-                if (w.pg != null and st.pg_pending == 0 and
+                if (w.pg[0] != null and st.pg_pending == 0 and
                     std.mem.eql(u8, method, "GET") and
                     (std.mem.startsWith(u8, target, "/queries") or std.mem.startsWith(u8, target, "/updates") or std.mem.startsWith(u8, target, "/cached-worlds"))) {
                     var n: u32 = 1;
@@ -7146,13 +7161,16 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
             // The db conn joins the ring as a peer — a readable CQE on it
             // means parked exchanges can resume. Blocking only through the
             // startup handshake; nonblocking once armed.
-            if ($mod.PgConn.connect()) |pg| {
-                w.pg = pg;
-                _ = w.ring.poll_add($mod.URING_PG, pg.fd, linux.POLL.IN) catch {
-                    std.debug.print("Pump: pg poll arm failed\n", .{});
-                };
-                std.debug.print("Pump: pg conn armed on the ring\n", .{});
+            var pi: usize = 0;
+            while (pi < $mod.PG_POOL) : (pi += 1) {
+                if ($mod.PgConn.connect()) |pg| {
+                    w.pg[pi] = pg;
+                    _ = w.ring.poll_add($mod.URING_PG - pi, pg.fd, linux.POLL.IN) catch {
+                        std.debug.print("Pump: pg poll arm failed\n", .{});
+                    };
+                }
             }
+            if (w.pg[0] != null) std.debug.print("Pump: pg pool armed on the ring\n", .{});
 
             const coalesce_max: u32 = if (w.ring.features & linux.IORING_FEAT_EXT_ARG != 0) WAIT_COALESCE_MAX else 1;
 
@@ -7174,9 +7192,12 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                     if (i % SUBMIT_STRIDE == 0) _ = w.ring.submit() catch {};
                     w.handleCqe(cqe);
                 }
-                // Db binds staged this batch go out as one send — the conn's
-                // parked requests share a roundtrip.
-                if (w.pg) |pg| pg.flush();
+                // Db binds staged this batch go out as one send per conn —
+                // parked requests share a roundtrip on their pool slot.
+                var fi: usize = 0;
+                while (fi < $mod.PG_POOL) : (fi += 1) {
+                    if (w.pg[fi]) |pg| pg.flush();
+                }
                 wait_nr = @min(@max(@as(u32, @intCast(got / 2)), 1), coalesce_max);
             }
         }
