@@ -623,6 +623,9 @@ pub const ConnState = struct {
     // recv_hold parks the overflow when a pool buffer delivers more than
     // st.buf has room for — a streamed request must not be cut mid-parse.
     recv_armed: bool = false,
+    // one-shot recv SQE in flight — maybeFreeRing must wait for its
+    // terminal CQE just like recv_armed's (x86-only bufgrp fallback path).
+    recv_oneshot_armed: bool = false,
     // Set on -ENOBUFS: the pool ran dry, so this conn finishes on plain
     // one-shot recvs into st.buf. Without it, ENOBUFS → re-arm → ENOBUFS
     // is a submit/reap spin per conn — measured as a throughput collapse
@@ -5750,7 +5753,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
 
         fn maybeFreeRing(w: *@This(), st: *$mod.ConnState) void {
             _ = w;
-            if (!st.ring_closing or st.recv_armed or st.poll_armed or st.send_len != 0) return;
+            if (!st.ring_closing or st.recv_armed or st.recv_oneshot_armed or st.poll_armed or st.send_len != 0) return;
             // Nothing can still reference st: recv folded, no send in flight,
             // fd already detached and closed. A `ws-send-fd` pusher could be
             // mid-write — same wait releaseConn does. The unlock must precede
@@ -5783,7 +5786,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
             // Cleartext: one multishot recv rides the provided-buffer pool for
             // the conn's whole life — nothing to re-arm per batch. Already
             // armed conns (and the send-in-flight window) just return.
-            if (st.recv_armed) return true;
+            if (st.recv_armed or st.recv_oneshot_armed) return true;
             if (w.bufgrp) |bg| {
                 if (!st.ms_off) {
                     _ = bg.arm(@intFromPtr(st), st.fd) catch {
@@ -5799,6 +5802,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                 _ = w.ring.submit() catch {};
                 _ = w.ring.recv(@intFromPtr(st), st.fd, .{ .buffer = buf }, 0) catch return false;
             };
+            st.recv_oneshot_armed = true;
             return true;
         }
 
@@ -6053,6 +6057,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                 w.msRecvCqe(st, cqe);
                 return;
             }
+            st.recv_oneshot_armed = false;
             if (cqe.res <= 0 or st.ring_dead) {
                 w.teardown(st);
                 return;
@@ -6639,12 +6644,28 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                     st.fd = -1;
                 }
             }
+            // Unlink this conn's parked pg waiters BEFORE the free — a waiter
+            // outliving its st calls teardown/pgRespond on freed memory
+            // (the amd64 double-free: pg-conn loss drains waiters and
+            // re-tears-down an already-destroyed ConnState).
+            const a = $mod.pumpAlloc();
+            for (w.pg) |mpg| {
+                const pg = mpg orelse continue;
+                var i: usize = 0;
+                while (i < pg.waiters.items.len) {
+                    if (pg.waiters.items[i].st == st) {
+                        var rm = pg.waiters.orderedRemove(i);
+                        rm.buf.deinit(a);
+                    } else i += 1;
+                }
+            }
+            st.pg_pending = 0;
             w.maybeFreeRing(st);
         }
 
         fn maybeFreeRing(w: *@This(), st: *$mod.ConnState) void {
             _ = w;
-            if (!st.ring_closing or st.recv_armed or st.poll_armed or st.send_len != 0) return;
+            if (!st.ring_closing or st.recv_armed or st.recv_oneshot_armed or st.poll_armed or st.send_len != 0) return;
             st.ws_mu.lock();
             $mod.closeConnMem(st);
             st.ws_mu.unlock();
@@ -6652,7 +6673,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
         }
 
         fn submitRecv(w: *@This(), st: *$mod.ConnState) bool {
-            if (st.recv_armed) return true;
+            if (st.recv_armed or st.recv_oneshot_armed) return true;
             if (w.bufgrp) |bg| {
                 if (!st.ms_off) {
                     _ = bg.arm(@intFromPtr(st), st.fd) catch {
@@ -6668,6 +6689,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                 _ = w.ring.submit() catch {};
                 _ = w.ring.recv(@intFromPtr(st), st.fd, .{ .buffer = buf }, 0) catch return false;
             };
+            st.recv_oneshot_armed = true;
             return true;
         }
 
@@ -7107,6 +7129,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                 w.msRecvCqe(st, cqe);
                 return;
             }
+            st.recv_oneshot_armed = false;
             if (cqe.res <= 0 or st.ring_dead) {
                 w.teardown(st);
                 return;
