@@ -649,8 +649,10 @@ var conn_states: [MAX_TRACKED_FD]?*ConnState = .{null} ** MAX_TRACKED_FD;
 // ---------------------------------------------------------------------------
 const PgWaiter = struct {
     st: *ConnState,
+    // rows until complete — 0 means unbounded (fortunes completes on
+    // CommandComplete, not a count).
     expected: u32,
-    wrap_array: bool,
+    kind: u8, // 0 object, 1 array, 2 fortunes
     buf: std.ArrayListUnmanaged(u8) = .{},
 };
 
@@ -760,6 +762,8 @@ const PgConn = struct {
         const sql = "SELECT id, randomNumber FROM world WHERE id = $1";
         const stmt2 = "s2";
         const sql2 = "UPDATE world SET randomNumber = $2 WHERE id = $1 RETURNING id, randomNumber";
+        const stmt3 = "s3";
+        const sql3 = "SELECT id, message FROM fortune";
         var pp: std.ArrayListUnmanaged(u8) = .{};
         defer pp.deinit(a);
         pp.appendSlice(a, stmt) catch return pg;
@@ -772,6 +776,13 @@ const PgConn = struct {
         pp.appendSlice(a, stmt2) catch return pg;
         pp.append(a, 0) catch return pg;
         pp.appendSlice(a, sql2) catch return pg;
+        pp.append(a, 0) catch return pg;
+        put16(&pp, a, 0) catch return pg;
+        frame(&pg.tx, a, 'P', pp.items) catch return pg;
+        pp.clearRetainingCapacity();
+        pp.appendSlice(a, stmt3) catch return pg;
+        pp.append(a, 0) catch return pg;
+        pp.appendSlice(a, sql3) catch return pg;
         pp.append(a, 0) catch return pg;
         put16(&pp, a, 0) catch return pg;
         frame(&pg.tx, a, 'P', pp.items) catch return pg;
@@ -820,6 +831,27 @@ const PgConn = struct {
         frame(&pg.tx, a, 'E', ep.items) catch return;
         // Sync per bind — postgres buffers extended-protocol output until
         // Sync; without it the row never flushes and the poll never fires.
+        frame(&pg.tx, a, 'S', "") catch return;
+        pg.pending_binds += 1;
+    }
+
+    // B+E+S for the fortune stmt — no params, unbounded rows.
+    fn bindExecFortune(pg: *PgConn) void {
+        const a = pumpAlloc();
+        var bp: std.ArrayListUnmanaged(u8) = .{};
+        defer bp.deinit(a);
+        bp.append(a, 0) catch return;
+        bp.appendSlice(a, "s3") catch return;
+        bp.append(a, 0) catch return;
+        put16(&bp, a, 0) catch return;
+        put16(&bp, a, 0) catch return;
+        put16(&bp, a, 0) catch return;
+        frame(&pg.tx, a, 'B', bp.items) catch return;
+        var ep: std.ArrayListUnmanaged(u8) = .{};
+        defer ep.deinit(a);
+        ep.append(a, 0) catch return;
+        put32(&ep, a, 0) catch return;
+        frame(&pg.tx, a, 'E', ep.items) catch return;
         frame(&pg.tx, a, 'S', "") catch return;
         pg.pending_binds += 1;
     }
@@ -6631,10 +6663,81 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                     pg.bindExec(id);
                 }
             }
-            var wt: $mod.PgWaiter = .{ .st = st, .expected = n, .wrap_array = wrap_array };
+            var wt: $mod.PgWaiter = .{ .st = st, .expected = n, .kind = if (wrap_array) 1 else 0 };
             if (wrap_array) wt.buf.append(a, '[') catch return;
             pg.waiters.append(a, wt) catch return;
             st.pg_pending += n;
+        }
+
+        // /fortunes parks unbounded — the whole table streams until 'C'.
+        fn pgParkFortunes(w: *@This(), st: *$mod.ConnState) void {
+            const pg = w.pg.?;
+            pg.bindExecFortune();
+            const wt: $mod.PgWaiter = .{ .st = st, .expected = 0, .kind = 2 };
+            pg.waiters.append($mod.pumpAlloc(), wt) catch return;
+            st.pg_pending = 1;
+        }
+
+        // fortunes: buf holds id\x01msg\x02 records — parse, append the
+        // extra fortune, sort by message, render the TFB table.
+        fn renderFortunes(w: *@This(), recs: []const u8) []const u8 {
+            const a = $mod.pumpAlloc();
+            const P = struct { id: []const u8, msg: []const u8 };
+            var rows: [64]P = undefined;
+            var n: usize = 0;
+            var i: usize = 0;
+            while (i < recs.len and n < 64) {
+                const s1 = std.mem.indexOfScalarPos(u8, recs, i, 1) orelse break;
+                const s2 = std.mem.indexOfScalarPos(u8, recs, s1 + 1, 2) orelse break;
+                rows[n] = .{ .id = recs[i..s1], .msg = recs[s1 + 1 .. s2] };
+                n += 1;
+                i = s2 + 1;
+            }
+            rows[n] = .{ .id = "0", .msg = "Additional fortune added at request time." };
+            n += 1;
+            std.mem.sort(P, rows[0..n], {}, struct {
+                fn lt(_: void, x: P, y: P) bool {
+                    return std.mem.order(u8, x.msg, y.msg) == .lt;
+                }
+            }.lt);
+            var out: std.ArrayListUnmanaged(u8) = .{};
+            out.appendSlice(a, "<!DOCTYPE html><html><head><title>Fortunes</title></head><body><table><tr><th>id</th><th>message</th></tr>") catch return "";
+            for (rows[0..n]) |r| {
+                out.appendSlice(a, "<tr><td>") catch {};
+                out.appendSlice(a, r.id) catch {};
+                out.appendSlice(a, "</td><td>") catch {};
+                for (r.msg) |ch| {
+                    switch (ch) {
+                        '&' => out.appendSlice(a, "&amp;") catch {},
+                        '<' => out.appendSlice(a, "&lt;") catch {},
+                        '>' => out.appendSlice(a, "&gt;") catch {},
+                        '"' => out.appendSlice(a, "&quot;") catch {},
+                        '\'' => out.appendSlice(a, "&#39;") catch {},
+                        else => out.append(a, ch) catch {},
+                    }
+                }
+                out.appendSlice(a, "</td></tr>") catch {};
+            }
+            out.appendSlice(a, "</table></body></html>") catch {};
+            _ = w;
+            return out.items;
+        }
+
+        fn pgRespondHtml(w: *@This(), st: *$mod.ConnState, body: []const u8) void {
+            var rb: [8192]u8 = undefined;
+            const dl = @import("root").koru_orisha.httpDateLine();
+            const resp = std.fmt.bufPrint(&rb,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html; charset=utf-8\r\nServer: koru-orisha\r\n{s}\r\n{s}",
+                .{ body.len, dl[0..], body }) catch return;
+            st.pending.appendSlice($mod.pumpAlloc(), resp) catch {
+                w.teardown(st);
+                return;
+            };
+            w.advance(st);
+            if (st.pg_pending == 0 and st.len > 0 and !st.ring_dead) {
+                w.dispatchReadable(st);
+            }
+            w.advance(st);
         }
 
         // PG_READ: drain response frames; each DataRow completes the front
@@ -6696,21 +6799,41 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                     if (pg.waiters.items.len > 0) {
                         const a = $mod.pumpAlloc();
                         const wt = &pg.waiters.items[0];
-                        wt.buf.print(a, "{{\"id\":{s},\"randomNumber\":{s}}},", .{ id_s, rn_s }) catch {};
+                        if (wt.kind == 2) {
+                            // fortune: id \x01 msg \x02 record
+                            wt.buf.appendSlice(a, id_s) catch {};
+                            wt.buf.append(a, 1) catch {};
+                            wt.buf.appendSlice(a, rn_s) catch {};
+                            wt.buf.append(a, 2) catch {};
+                        } else {
+                            wt.buf.print(a, "{{\"id\":{s},\"randomNumber\":{s}}},", .{ id_s, rn_s }) catch {};
+                        }
                         wt.st.pg_pending -= 1;
                         pg.pending_binds -= 1;
-                        wt.expected -= 1;
-                        if (wt.expected == 0) {
-                            var done = pg.waiters.orderedRemove(0);
-                            // strip the trailing comma; close the array
-                            if (done.buf.items.len > 0 and done.buf.items[done.buf.items.len - 1] == ',')
-                                done.buf.items.len -= 1;
-                            if (done.wrap_array) done.buf.append(a, ']') catch {};
-                            w.pgRespond(done.st, done.buf.items);
-                            done.buf.deinit(a);
+                        if (wt.expected > 0) {
+                            wt.expected -= 1;
+                            if (wt.expected == 0) {
+                                var done = pg.waiters.orderedRemove(0);
+                                if (done.buf.items.len > 0 and done.buf.items[done.buf.items.len - 1] == ',')
+                                    done.buf.items.len -= 1;
+                                if (done.kind == 1) done.buf.append(a, ']') catch {};
+                                w.pgRespond(done.st, done.buf.items);
+                                done.buf.deinit(a);
+                            }
                         }
                     } else if (pg.pending_binds > 0) {
                         pg.pending_binds -= 1;
+                    }
+                } else if (t == 'C') {
+                    pg.rx_pos += mlen;
+                    if (pg.waiters.items.len > 0 and pg.waiters.items[0].kind == 2) {
+                        const a = $mod.pumpAlloc();
+                        var done = pg.waiters.orderedRemove(0);
+                        done.st.pg_pending = 0;
+                        pg.pending_binds -|= 1;
+                        const html = w.renderFortunes(done.buf.items);
+                        done.buf.deinit(a);
+                        w.pgRespondHtml(done.st, html);
                     }
                 } else {
                     pg.rx_pos += mlen;
@@ -6955,8 +7078,14 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                     continue;
                 }
                 if (w.pg != null and st.pg_pending == 0 and
+                    std.mem.eql(u8, method, "GET") and std.mem.eql(u8, target, "/fortunes")) {
+                    w.pgParkFortunes(st);
+                    consumed += take;
+                    continue;
+                }
+                if (w.pg != null and st.pg_pending == 0 and
                     std.mem.eql(u8, method, "GET") and
-                    (std.mem.startsWith(u8, target, "/queries") or std.mem.startsWith(u8, target, "/updates"))) {
+                    (std.mem.startsWith(u8, target, "/queries") or std.mem.startsWith(u8, target, "/updates") or std.mem.startsWith(u8, target, "/cached-worlds"))) {
                     var n: u32 = 1;
                     if (std.mem.indexOf(u8, target, "queries=")) |qi| {
                         var e = qi + 8;
