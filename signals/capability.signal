@@ -1,0 +1,6 @@
+name: capability
+kind: inferred
+shape: categorical
+face: in
+membrane: false
+note: exchanges can now suspend on fd readiness (pg conn via URING_PG poll) — the park machinery generalizes past the /delay deadline model
