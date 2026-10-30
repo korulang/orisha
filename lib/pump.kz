@@ -712,16 +712,9 @@ const PgConn = struct {
     // request order. expected counts the rows a parked request needs:
     // 1 for /db, N for /queries. buf accumulates the JSON body.
     waiters: std.ArrayListUnmanaged(PgWaiter) = .{},
-    // set when the server returns ErrorResponse for the in-flight query —
-    // 'Z' pops the waiter as a 500 only on error, never on success.
-    query_errored: bool = false,
     // in-flight binds for which no row may come back (conn torn down) —
     // rows with no waiter are dropped, not mismatched.
     pending_binds: u32 = 0,
-    // queries whose waiter already resolved on their last 'D' — the 'C'
-    // that follows still belongs to them and must not complete the new
-    // head waiter.
-    await_c: u32 = 0,
 
     fn sendAll(fd: posix.fd_t, buf: []const u8) !void {
         var n: usize = 0;
@@ -6864,15 +6857,13 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                                 if (done.kind == 1 or done.kind == 3) done.buf.append(a, ']') catch {};
                                 w.pgRespond(done.st, done.buf.items);
                                 done.buf.deinit(a);
-                                pg.await_c += 1;
                             }
                         }
                     }
                 } else if (t == 'C') {
                     pg.rx_pos += mlen;
-                    if (pg.await_c > 0) {
-                        pg.await_c -= 1;
-                    } else if (pg.waiters.items.len > 0 and pg.waiters.items[0].kind == 2) {
+                    pg.pending_binds -|= 1;
+                    if (pg.waiters.items.len > 0 and pg.waiters.items[0].kind == 2) {
                         const a = $mod.pumpAlloc();
                         var done = pg.waiters.orderedRemove(0);
                         done.st.pg_pending = 0;
@@ -6893,20 +6884,16 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                         done.buf.deinit(a);
                         w.pgRespond(done.st, out.items);
                     }
-                } else if (t == 'E') {
-                    pg.rx_pos += mlen;
-                    pg.query_errored = true;
                 } else if (t == 'Z') {
                     pg.rx_pos += mlen;
-                    pg.pending_binds -|= 1;
                     // ReadyForQuery after an ErrorResponse settles nothing a
                     // 'C' would — a still-parked waiter is an errored query.
-                    // On success the waiter already resolved on 'D'/'C', so
-                    // pop only when this query actually errored.
-                    if (pg.query_errored and pg.waiters.items.len > 0) {
+                    // Pop it and answer 500 so the conn never hangs.
+                    if (pg.waiters.items.len > 0) {
                         const a = $mod.pumpAlloc();
                         var done = pg.waiters.orderedRemove(0);
                         done.st.pg_pending = 0;
+                        pg.pending_binds -|= 1;
                         done.buf.deinit(a);
                         const unavailable = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
                         done.st.pending.appendSlice(a, unavailable) catch {
@@ -6917,7 +6904,6 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                         if (done.st.len > 0 and !done.st.ring_dead)
                             w.dispatchReadable(done.st);
                     }
-                    pg.query_errored = false;
                 } else {
                     pg.rx_pos += mlen;
                 }
@@ -7618,15 +7604,13 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                                 if (done.kind == 1 or done.kind == 3) done.buf.append(a, ']') catch {};
                                 w.pgRespond(done.st, done.buf.items);
                                 done.buf.deinit(a);
-                                pg.await_c += 1;
                             }
                         }
                     }
                 } else if (t == 'C') {
                     pg.rx_pos += mlen;
-                    if (pg.await_c > 0) {
-                        pg.await_c -= 1;
-                    } else if (pg.waiters.items.len > 0 and pg.waiters.items[0].kind == 2) {
+                    pg.pending_binds -|= 1;
+                    if (pg.waiters.items.len > 0 and pg.waiters.items[0].kind == 2) {
                         const a = $mod.pumpAlloc();
                         var done = pg.waiters.orderedRemove(0);
                         done.st.pg_pending = 0;
@@ -7647,20 +7631,16 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                         done.buf.deinit(a);
                         w.pgRespond(done.st, out.items);
                     }
-                } else if (t == 'E') {
-                    pg.rx_pos += mlen;
-                    pg.query_errored = true;
                 } else if (t == 'Z') {
                     pg.rx_pos += mlen;
-                    pg.pending_binds -|= 1;
                     // ReadyForQuery after an ErrorResponse settles nothing a
                     // 'C' would — a still-parked waiter is an errored query.
-                    // On success the waiter already resolved on 'D'/'C', so
-                    // pop only when this query actually errored.
-                    if (pg.query_errored and pg.waiters.items.len > 0) {
+                    // Pop it and answer 500 so the conn never hangs.
+                    if (pg.waiters.items.len > 0) {
                         const a = $mod.pumpAlloc();
                         var done = pg.waiters.orderedRemove(0);
                         done.st.pg_pending = 0;
+                        pg.pending_binds -|= 1;
                         done.buf.deinit(a);
                         const unavailable = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
                         done.st.pending.appendSlice(a, unavailable) catch {
@@ -7671,7 +7651,6 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                         if (done.st.len > 0 and !done.st.ring_dead)
                             w.dispatchReadable(done.st);
                     }
-                    pg.query_errored = false;
                 } else {
                     pg.rx_pos += mlen;
                 }
