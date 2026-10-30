@@ -3645,16 +3645,30 @@ fn workerCount() usize {
             // `sslFill` can't substitute here — its `more` carries no byte
             // count, and this read must advance st.len.
             const s = tls.ssl orelse return .gone;
-            const rc = mod.c.SSL_read(s, @ptrCast(st.buf[st.len..].ptr), @intCast(st.buf.len - st.len));
-            if (rc > 0) {
-                st.len += @intCast(rc);
-                return .more;
+            // Drain, don't sample: one SSL_read delivers at most one record
+            // (~16KiB plaintext). A caller that stops at .more strands the
+            // rest of the flight inside OpenSSL — socket drained, no EPOLLIN,
+            // conn parked with bytes it will never see. The TLS chunked echo
+            // hung exactly there: the terminating "0\r\n\r\n" record sat
+            // pending while the parse waited for it.
+            var got_any = false;
+            while (true) {
+                // A full st.buf would hand SSL_read a zero-length window —
+                // OpenSSL treats that as an error and the conn dies mid-body.
+                // Grow before every read so a large body always has room.
+                if (st.len == st.buf.len and !$mod.growReqBuf(st)) return if (got_any) .more else .gone;
+                const rc = mod.c.SSL_read(s, @ptrCast(st.buf[st.len..].ptr), @intCast(st.buf.len - st.len));
+                if (rc > 0) {
+                    st.len += @intCast(rc);
+                    got_any = true;
+                    continue;
+                }
+                const err_code = mod.c.SSL_get_error(s, rc);
+                return switch (err_code) {
+                    mod.c.SSL_ERROR_WANT_READ, mod.c.SSL_ERROR_WANT_WRITE => if (got_any) .more else .idle,
+                    else => .gone,
+                };
             }
-            const err_code = mod.c.SSL_get_error(s, rc);
-            return switch (err_code) {
-                mod.c.SSL_ERROR_WANT_READ, mod.c.SSL_ERROR_WANT_WRITE => .idle,
-                else => .gone,
-            };
         }
     }
     const n = $mod.posix.read(@intCast(st.fd), st.buf[st.len..]) catch |err| switch (err) {
