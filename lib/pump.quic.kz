@@ -1,0 +1,2125 @@
+// ============================================================================
+// pump.quic.kz — QUIC v1 + HTTP/3 for the io_uring pump.
+// Joined via `~part quic` in pump.kz; merged into the pump module at load.
+//
+// RFC 9000 (transport), 9001 (TLS use via OpenSSL 3.5 third-party QUIC TLS
+// API), 9002 (loss recovery + NewReno), 9114 (HTTP/3), 9204 (QPACK, static
+// table only — our SETTINGS pin MAX_TABLE_CAPACITY=0 and BLOCKED_STREAMS=0).
+//
+// All per-connection state lives in QuicLane, embedded per-worker in the
+// drive|io-uring W struct — SO_REUSEPORT hashes a client's 4-tuple to one
+// worker, so no conn state is ever shared between workers.
+// ============================================================================
+
+const oss = if (HAS_OPENSSL) @import("root").koru_koru.koru_openssl.c else struct {};
+
+const QUIC_VERSION_1: u32 = 0x00000001;
+const QUIC_INITIAL_SALT = [20]u8{ 0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a };
+const QUIC_MAX_DGRAM: usize = 1200;
+const QUIC_IDLE_MS: i64 = 30_000;
+const QUIC_SCID_LEN: usize = 8;
+const QUIC_MAX_STREAMS_BIDI: u64 = 1024;
+const QUIC_MAX_STREAMS_UNI: u64 = 64;
+const QUIC_MAX_DATA: u64 = 64 * 1024 * 1024;
+const QUIC_MAX_STREAM_DATA: u64 = 4 * 1024 * 1024;
+const QUIC_K_GRANULARITY_US: i64 = 1000;
+const QUIC_PKT_THRESH: u64 = 3;
+const QUIC_CWND_INIT: usize = 10 * QUIC_MAX_DGRAM;
+
+const AesGcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+const AesHp = std.crypto.core.aes.Aes128;
+const HkdfQ = std.crypto.kdf.hkdf.HkdfSha256;
+
+// ── env + ctx ────────────────────────────────────────────────────────────────
+
+var h3_listen_port: u16 = 0;
+
+fn h3PortEnv() u16 {
+    const s = std.posix.getenv("H3_PORT") orelse return 0;
+    return std.fmt.parseInt(u16, s, 10) catch 0;
+}
+
+fn quicAlpnSelect(ssl: ?*oss.SSL, out: [*c][*c]const u8, outlen: [*c]u8, in: [*c]const u8, inlen: c_uint, arg: ?*anyopaque) callconv(.c) c_int {
+    _ = ssl;
+    _ = arg;
+    const list: [*c]const u8 = in;
+    var i: usize = 0;
+    while (i < inlen) {
+        const l: usize = list[i];
+        if (i + 1 + l > inlen) break;
+        if (l == 2 and list[i + 1] == 'h' and list[i + 2] == '3') {
+            out.* = list + i + 1;
+            outlen.* = 2;
+            return 0; // SSL_TLSEXT_ERR_OK
+        }
+        i += 1 + l;
+    }
+    return 2; // SSL_TLSEXT_ERR_ALERT_FATAL — h3-only policy
+}
+
+// The QUIC TLS ctx: TLS1.3 only, one ciphersuite so our AES-128-GCM packet
+// crypto always matches the negotiated suite. No KTLS — QUIC owns the
+// record layer entirely.
+fn maybeStartH3(port_env: u16, cert_path: ?[]const u8, key_path: ?[]const u8) ?[]const u8 {
+    if (!HAS_OPENSSL) {
+        return if (port_env != 0) "H3_PORT set, but this target cannot link openssl" else null;
+    }
+    if (port_env == 0) return null;
+    const cert = cert_path orelse "/certs/server.crt";
+    const key = key_path orelse "/certs/server.key";
+    var cz: [256]u8 = undefined;
+    var kz: [256]u8 = undefined;
+    if (cert.len >= cz.len or key.len >= kz.len) return "h3: cert path too long";
+    @memcpy(cz[0..cert.len], cert);
+    cz[cert.len] = 0;
+    @memcpy(kz[0..key.len], key);
+    kz[key.len] = 0;
+    const ctx = oss.SSL_CTX_new(oss.TLS_method());
+    if (ctx == null) return "h3: SSL_CTX_new failed";
+    _ = oss.SSL_CTX_set_min_proto_version(ctx, oss.TLS1_3_VERSION);
+    _ = oss.SSL_CTX_set_max_proto_version(ctx, oss.TLS1_3_VERSION);
+    if (oss.SSL_CTX_set_ciphersuites(ctx, "TLS_AES_128_GCM_SHA256") != 1) {
+        oss.SSL_CTX_free(ctx);
+        return "h3: SSL_CTX_set_ciphersuites failed";
+    }
+    if (oss.SSL_CTX_use_certificate_chain_file(ctx, @ptrCast(&cz)) != 1) {
+        oss.SSL_CTX_free(ctx);
+        return "h3: certificate chain load failed";
+    }
+    if (oss.SSL_CTX_use_PrivateKey_file(ctx, @ptrCast(&kz), oss.SSL_FILETYPE_PEM) != 1) {
+        oss.SSL_CTX_free(ctx);
+        return "h3: private key load failed";
+    }
+    oss.SSL_CTX_set_alpn_select_cb(ctx, quicAlpnSelect, null);
+    quic_ssl_ctx = ctx;
+    h3_listen_port = port_env;
+    return null;
+}
+
+var quic_ssl_ctx: ?*oss.SSL_CTX = null;
+
+// ── dual-stack UDP socket ────────────────────────────────────────────────────
+
+fn openQuicSocket(port: u16) ?posix.fd_t {
+    const fd = posix.socket(posix.AF.INET6, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0) catch return null;
+    const one = std.mem.toBytes(@as(c_int, 1));
+    const zero = std.mem.toBytes(@as(c_int, 0));
+    posix.setsockopt(fd, posix.IPPROTO.IPV6, 26, &zero) catch { // IPV6_V6ONLY off — v4 arrives mapped
+        posix.close(fd);
+        return null;
+    };
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, &one) catch {
+        posix.close(fd);
+        return null;
+    };
+    var addr = std.net.Address.initIp6([_]u8{0} ** 16, port, 0, 0);
+    posix.bind(fd, &addr.any, addr.getOsSockLen()) catch {
+        posix.close(fd);
+        return null;
+    };
+    return fd;
+}
+
+// ── varint ───────────────────────────────────────────────────────────────────
+
+fn qvLen(v: u64) usize {
+    if (v < 1 << 6) return 1;
+    if (v < 1 << 14) return 2;
+    if (v < 1 << 30) return 4;
+    return 8;
+}
+
+fn qvPut(out: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, v: u64) void {
+    var b: [8]u8 = undefined;
+    const n = qvPutSlice(&b, v);
+    out.appendSlice(a, b[0..n]) catch {};
+}
+
+fn qvPutSlice(b: []u8, v: u64) usize {
+    if (v < 1 << 6) {
+        b[0] = @intCast(v);
+        return 1;
+    }
+    if (v < 1 << 14) {
+        b[0] = 0x40 | @as(u8, @intCast(v >> 8));
+        b[1] = @intCast(v & 0xff);
+        return 2;
+    }
+    if (v < 1 << 30) {
+        std.mem.writeInt(u32, b[0..4], @intCast(v), .big);
+        b[0] |= 0x80;
+        return 4;
+    }
+    std.mem.writeInt(u64, b[0..8], v, .big);
+    b[0] |= 0xc0;
+    return 8;
+}
+
+fn qvGet(buf: []const u8, pos: *usize) ?u64 {
+    if (pos.* >= buf.len) return null;
+    const b0 = buf[pos.*];
+    switch (b0 >> 6) {
+        0 => {
+            pos.* += 1;
+            return b0;
+        },
+        1 => {
+            if (pos.* + 2 > buf.len) return null;
+            const v = (@as(u64, b0 & 0x3f) << 8) | buf[pos.* + 1];
+            pos.* += 2;
+            return v;
+        },
+        2 => {
+            if (pos.* + 4 > buf.len) return null;
+            const v = @as(u64, std.mem.readInt(u32, buf[pos.*..][0..4], .big) & 0x3fffffff);
+            pos.* += 4;
+            return v;
+        },
+        else => {
+            if (pos.* + 8 > buf.len) return null;
+            const v = std.mem.readInt(u64, buf[pos.*..][0..8], .big) & 0x3fffffffffffffff;
+            pos.* += 8;
+            return v;
+        },
+    }
+}
+
+// ── offset ranges (recv pn sets, stream/crypto reassembly) ──────────────────
+
+const QRange = struct { off: u64, len: u64 };
+
+fn rangesAdd(rs: *std.ArrayListUnmanaged(QRange), a: std.mem.Allocator, off: u64, len: u64) void {
+    if (len == 0) return;
+    // Insertion keeps the list sorted ascending by off, merging overlaps.
+    var no = off;
+    var ne = off + len;
+    var i: usize = 0;
+    while (i < rs.items.len) {
+        const r = rs.items[i];
+        if (r.off + r.len < no) {
+            i += 1;
+            continue;
+        }
+        if (r.off > ne) break;
+        no = @min(no, r.off);
+        ne = @max(ne, r.off + r.len);
+        _ = rs.orderedRemove(i);
+    }
+    rs.insert(a, i, .{ .off = no, .len = ne - no }) catch {};
+}
+
+fn rangesHas(rs: *const std.ArrayListUnmanaged(QRange), off: u64) bool {
+    for (rs.items) |r| {
+        if (off < r.off) return false;
+        if (off < r.off + r.len) return true;
+    }
+    return false;
+}
+
+// Contiguous prefix length: how far ranges reach from 0 without a gap.
+fn rangesContig(rs: *const std.ArrayListUnmanaged(QRange)) u64 {
+    var end: u64 = 0;
+    for (rs.items) |r| {
+        if (r.off > end) break;
+        end = @max(end, r.off + r.len);
+    }
+    return end;
+}
+
+fn rangesCover(rs: *const std.ArrayListUnmanaged(QRange), off: u64, len: u64) bool {
+    const need_end = off + len;
+    for (rs.items) |r| {
+        if (r.off > off) return false;
+        if (r.off + r.len >= need_end) return true;
+    }
+    return false;
+}
+
+// ── QUIC TLS key derivation (RFC 9001 §5) ────────────────────────────────────
+
+const QKeys = struct {
+    key: [16]u8 = undefined,
+    iv: [12]u8 = undefined,
+    hp: [16]u8 = undefined,
+    present: bool = false,
+};
+
+fn hkdfLabel(secret: []const u8, label: []const u8, out: []u8) void {
+    var info: [64]u8 = undefined;
+    var n: usize = 0;
+    std.mem.writeInt(u16, info[n..][0..2], @intCast(out.len), .big);
+    n += 2;
+    const full_len = 6 + label.len;
+    info[n] = @intCast(full_len);
+    n += 1;
+    @memcpy(info[n .. n + 6], "tls13 ");
+    n += 6;
+    @memcpy(info[n .. n + label.len], label);
+    n += label.len;
+    info[n] = 0;
+    n += 1;
+    var prk: [32]u8 = undefined;
+    @memcpy(&prk, secret[0..32]);
+    HkdfQ.expand(out, info[0..n], prk);
+}
+
+fn keysFromSecret(ks: *QKeys, secret: []const u8) void {
+    hkdfLabel(secret, "quic key", &ks.key);
+    hkdfLabel(secret, "quic iv", &ks.iv);
+    hkdfLabel(secret, "quic hp", &ks.hp);
+    ks.present = true;
+}
+
+fn initialSecrets(dcid: []const u8, client_secret: *[32]u8, server_secret: *[32]u8) void {
+    const prk = HkdfQ.extract(&QUIC_INITIAL_SALT, dcid);
+    hkdfLabel(&prk, "client in", client_secret);
+    hkdfLabel(&prk, "server in", server_secret);
+}
+
+fn pnNonce(iv: *const [12]u8, pn: u64) [12]u8 {
+    var n = iv.*;
+    var p: [8]u8 = undefined;
+    std.mem.writeInt(u64, &p, pn, .big);
+    for (0..8) |i| n[4 + i] ^= p[i];
+    return n;
+}
+
+// ── QPACK static table — RFC 9204 Appendix A, 99 entries, 0-indexed ─────────
+
+const QPACK_STATIC = [99]HpackPair{
+    .{ .name = ":authority", .value = "" },
+    .{ .name = ":path", .value = "/" },
+    .{ .name = "age", .value = "0" },
+    .{ .name = "content-disposition", .value = "" },
+    .{ .name = "content-length", .value = "0" },
+    .{ .name = "cookie", .value = "" },
+    .{ .name = "date", .value = "" },
+    .{ .name = "etag", .value = "" },
+    .{ .name = "if-modified-since", .value = "" },
+    .{ .name = "if-none-match", .value = "" },
+    .{ .name = "last-modified", .value = "" },
+    .{ .name = "link", .value = "" },
+    .{ .name = "location", .value = "" },
+    .{ .name = "referer", .value = "" },
+    .{ .name = "set-cookie", .value = "" },
+    .{ .name = ":method", .value = "CONNECT" },
+    .{ .name = ":method", .value = "DELETE" },
+    .{ .name = ":method", .value = "GET" },
+    .{ .name = ":method", .value = "HEAD" },
+    .{ .name = ":method", .value = "OPTIONS" },
+    .{ .name = ":method", .value = "POST" },
+    .{ .name = ":method", .value = "PUT" },
+    .{ .name = ":scheme", .value = "http" },
+    .{ .name = ":scheme", .value = "https" },
+    .{ .name = ":status", .value = "103" },
+    .{ .name = ":status", .value = "200" },
+    .{ .name = ":status", .value = "304" },
+    .{ .name = ":status", .value = "404" },
+    .{ .name = ":status", .value = "503" },
+    .{ .name = "accept", .value = "*/*" },
+    .{ .name = "accept", .value = "application/dns-message" },
+    .{ .name = "accept-encoding", .value = "gzip, deflate, br" },
+    .{ .name = "accept-ranges", .value = "bytes" },
+    .{ .name = "access-control-allow-headers", .value = "cache-control" },
+    .{ .name = "access-control-allow-headers", .value = "content-type" },
+    .{ .name = "access-control-allow-origin", .value = "*" },
+    .{ .name = "cache-control", .value = "max-age=0" },
+    .{ .name = "cache-control", .value = "max-age=2592000" },
+    .{ .name = "cache-control", .value = "max-age=604800" },
+    .{ .name = "cache-control", .value = "no-cache" },
+    .{ .name = "cache-control", .value = "no-store" },
+    .{ .name = "cache-control", .value = "public, max-age=31536000" },
+    .{ .name = "content-encoding", .value = "br" },
+    .{ .name = "content-encoding", .value = "gzip" },
+    .{ .name = "content-type", .value = "application/dns-message" },
+    .{ .name = "content-type", .value = "application/javascript" },
+    .{ .name = "content-type", .value = "application/json" },
+    .{ .name = "content-type", .value = "application/x-www-form-urlencoded" },
+    .{ .name = "content-type", .value = "image/gif" },
+    .{ .name = "content-type", .value = "image/jpeg" },
+    .{ .name = "content-type", .value = "image/png" },
+    .{ .name = "content-type", .value = "text/css" },
+    .{ .name = "content-type", .value = "text/html; charset=utf-8" },
+    .{ .name = "content-type", .value = "text/plain" },
+    .{ .name = "content-type", .value = "text/plain;charset=utf-8" },
+    .{ .name = "range", .value = "bytes=0-" },
+    .{ .name = "strict-transport-security", .value = "max-age=31536000" },
+    .{ .name = "strict-transport-security", .value = "max-age=31536000; includesubdomains" },
+    .{ .name = "strict-transport-security", .value = "max-age=31536000; includesubdomains; preload" },
+    .{ .name = "vary", .value = "accept-encoding" },
+    .{ .name = "vary", .value = "origin" },
+    .{ .name = "x-content-type-options", .value = "nosniff" },
+    .{ .name = "x-xss-protection", .value = "1; mode=block" },
+    .{ .name = ":status", .value = "100" },
+    .{ .name = ":status", .value = "204" },
+    .{ .name = ":status", .value = "206" },
+    .{ .name = ":status", .value = "302" },
+    .{ .name = ":status", .value = "400" },
+    .{ .name = ":status", .value = "403" },
+    .{ .name = ":status", .value = "421" },
+    .{ .name = ":status", .value = "425" },
+    .{ .name = ":status", .value = "500" },
+    .{ .name = "accept-language", .value = "" },
+    .{ .name = "access-control-allow-credentials", .value = "FALSE" },
+    .{ .name = "access-control-allow-credentials", .value = "TRUE" },
+    .{ .name = "access-control-allow-headers", .value = "*" },
+    .{ .name = "access-control-allow-methods", .value = "get" },
+    .{ .name = "access-control-allow-methods", .value = "get, post, options" },
+    .{ .name = "access-control-allow-methods", .value = "options" },
+    .{ .name = "access-control-expose-headers", .value = "content-length" },
+    .{ .name = "access-control-request-headers", .value = "content-type" },
+    .{ .name = "access-control-request-method", .value = "get" },
+    .{ .name = "access-control-request-method", .value = "post" },
+    .{ .name = "alt-svc", .value = "clear" },
+    .{ .name = "authorization", .value = "" },
+    .{ .name = "content-security-policy", .value = "script-src 'none'; object-src 'none'; base-uri 'none'" },
+    .{ .name = "early-data", .value = "1" },
+    .{ .name = "expect-ct", .value = "" },
+    .{ .name = "forwarded", .value = "" },
+    .{ .name = "if-range", .value = "" },
+    .{ .name = "origin", .value = "" },
+    .{ .name = "purpose", .value = "prefetch" },
+    .{ .name = "server", .value = "" },
+    .{ .name = "timing-allow-origin", .value = "*" },
+    .{ .name = "upgrade-insecure-requests", .value = "1" },
+    .{ .name = "user-agent", .value = "" },
+    .{ .name = "x-forwarded-for", .value = "" },
+    .{ .name = "x-frame-options", .value = "deny" },
+    .{ .name = "x-frame-options", .value = "sameorigin" },
+};
+
+// ── packet spaces + sent records (RFC 9002) ──────────────────────────────────
+
+const QSpace = enum(usize) { initial = 0, handshake = 1, app = 2 };
+
+const QRxSpace = struct {
+    ranges: std.ArrayListUnmanaged(QRange) = .{}, // received pns, ascending
+    largest: i64 = -1,
+    ack_pending: bool = false,
+};
+
+const QSentFrame = union(enum) {
+    ack,
+    crypto: QRange,
+    stream: struct { id: u64, off: u64, len: u64, fin: bool },
+    handshake_done,
+    max_data: u64,
+    max_stream_data: struct { id: u64, v: u64 },
+    max_streams_bidi: u64,
+    max_streams_uni: u64,
+    path_response: [8]u8,
+    conn_close: struct { code: u64, app: bool },
+    reset_stream: struct { id: u64, code: u64, final_size: u64 },
+    ping,
+};
+
+const QSentPacket = struct {
+    pn: u64 = 0,
+    time_us: i64 = 0,
+    size: usize = 0,
+    ack_eliciting: bool = false,
+    in_flight: bool = false,
+    frames: std.ArrayListUnmanaged(QSentFrame) = .{},
+};
+
+const QTxSpace = struct {
+    next_pn: u64 = 0,
+    sent: std.ArrayListUnmanaged(QSentPacket) = .{},
+    largest_acked: i64 = -1,
+};
+
+// Received CRYPTO reassembly per level + the OpenSSL pull cursor.
+const QCryptoRx = struct {
+    buf: std.ArrayListUnmanaged(u8) = .{},
+    ranges: std.ArrayListUnmanaged(QRange) = .{},
+    tls_off: u64 = 0, // consumed via release_rcd
+};
+
+// ── stream state ─────────────────────────────────────────────────────────────
+
+const QStream = struct {
+    id: u64 = 0,
+    conn: *QuicConn = undefined,
+    // Receive side: sparse buffer + ranges; fin_off = final size when FIN seen.
+    rx: std.ArrayListUnmanaged(u8) = .{},
+    rx_ranges: std.ArrayListUnmanaged(QRange) = .{},
+    rx_fin_off: ?u64 = null,
+    rx_hi: u64 = 0, // flow-control high-water we gave the peer
+    rx_dead: bool = false,
+    stype: i64 = -1, // uni stream type; -2 = request (bidi) stream
+    // H3 parse state
+    h3_off: u64 = 0,
+    h3_headers_done: bool = false,
+    h3_method: std.ArrayListUnmanaged(u8) = .{},
+    h3_path: std.ArrayListUnmanaged(u8) = .{},
+    h3_authority: std.ArrayListUnmanaged(u8) = .{},
+    h3_headers: std.ArrayListUnmanaged(u8) = .{},
+    h3_body: std.ArrayListUnmanaged(u8) = .{},
+    served: bool = false,
+    // Send side: sb holds every byte ever staged; retransmit ranges point
+    // back into it. sb_hi is the next unsent offset.
+    sb: std.ArrayListUnmanaged(u8) = .{},
+    sb_hi: u64 = 0,
+    sb_retx: std.ArrayListUnmanaged(QRange) = .{},
+    sb_acked: std.ArrayListUnmanaged(QRange) = .{},
+    sb_fin: bool = false, // FIN once sb is fully out
+    tx_done: bool = false, // fin sent AND acked
+    flow_hi: u64 = 0, // peer's max_stream_data for us
+    park_until: i64 = 0,
+    reset: bool = false,
+
+    fn deinit(s: *QStream, a: std.mem.Allocator) void {
+        s.rx.deinit(a);
+        s.rx_ranges.deinit(a);
+        s.h3_method.deinit(a);
+        s.h3_path.deinit(a);
+        s.h3_authority.deinit(a);
+        s.h3_headers.deinit(a);
+        s.h3_body.deinit(a);
+        s.sb.deinit(a);
+        s.sb_retx.deinit(a);
+        s.sb_acked.deinit(a);
+        a.destroy(s);
+    }
+};
+
+// ── the connection ───────────────────────────────────────────────────────────
+
+const QState = enum { hs, app, closing, draining, dead };
+
+const QuicConn = struct {
+    lane: *QuicLane = undefined,
+    peer: posix.sockaddr.storage = undefined,
+    peer_len: posix.socklen_t = 0,
+    scid: [QUIC_SCID_LEN]u8 = undefined,
+    scid_key: u64 = 0,
+    odcid: [32]u8 = undefined, // client's original DCID
+    odcid_len: u8 = 0,
+    odcid_key: u64 = 0,
+    dcid: [32]u8 = undefined, // client's SCID — our packets' DCID
+    dcid_len: u8 = 0,
+    state: QState = .hs,
+    ssl: ?*oss.SSL = null,
+    keys_rx: [3]QKeys = .{ .{}, .{}, .{} },
+    keys_tx: [3]QKeys = .{ .{}, .{}, .{} },
+    init_cli: [32]u8 = undefined,
+    init_srv: [32]u8 = undefined,
+    have_init: bool = false,
+    rx_space: [3]QRxSpace = .{ .{}, .{}, .{} },
+    tx_space: [3]QTxSpace = .{ .{}, .{}, .{} },
+    // TLS pull feed: contiguous CRYPTO per level, tls_off = released prefix.
+    crx: [3]QCryptoRx = .{ .{}, .{}, .{} },
+    tls_rx_level: usize = 0,
+    tls_tx_level: usize = 0,
+    ctx: [3]std.ArrayListUnmanaged(u8) = .{ .{}, .{}, .{} },
+    ctx_hi: [3]u64 = .{ 0, 0, 0 }, // next unsent crypto offset
+    ctx_retx: [3]std.ArrayListUnmanaged(QRange) = .{ .{}, .{}, .{} },
+    hs_pkt_seen: bool = false,
+    hs_confirmed: bool = false,
+    ctrl_opened: bool = false,
+    hs_done_sent: bool = false,
+    streams: std.AutoHashMapUnmanaged(u64, *QStream) = .{},
+    next_uni_id: u64 = 3, // server-initiated uni stream ids: 3,7,11,... (initiator bit + uni bit)
+    streams_bidi_top: i64 = -1, // highest client bidi id opened
+    streams_bidi_credit: u64 = QUIC_MAX_STREAMS_BIDI,
+    streams_bidi_done: u64 = 0,
+    // peer limits (their transport params)
+    peer_max_data: u64 = 0,
+    peer_imsd_bl: u64 = 0, // our send limit on client's bidi (request) streams
+    peer_imsd_uni: u64 = 0,
+    peer_imsu: u64 = 0,
+    peer_max_ack_delay: u64 = 25,
+    peer_ack_delay_exp: u64 = 3,
+    peer_got_tp: bool = false,
+    // our receive flow accounting
+    rx_consumed: u64 = 0,
+    rx_max_data: u64 = QUIC_MAX_DATA,
+    tx_data_sent: u64 = 0, // total stream bytes sent (peer_max_data budget)
+    // recovery (RFC 9002)
+    latest_rtt_us: i64 = 0,
+    smoothed_rtt_us: i64 = -1,
+    rttvar_us: i64 = 0,
+    pto_count: u32 = 0,
+    pto_base_us: i64 = 0,
+    cwnd: usize = QUIC_CWND_INIT,
+    ssthresh: usize = std.math.maxInt(usize),
+    recovery_start_us: i64 = 0,
+    in_recovery: bool = false,
+    bytes_in_flight: usize = 0,
+    loss_deadline_us: i64 = 0,
+    // anti-amplification + idle
+    rx_bytes_total: u64 = 0,
+    tx_bytes_limited: u64 = 0,
+    addr_validated: bool = false,
+    idle_deadline_ms: i64 = 0,
+    // close
+    close_pending: ?QSentFrame = null,
+    draining_until_ms: i64 = 0,
+    close_code: u64 = 0,
+    peer_kbit: u8 = 0,
+    ctrl_q: std.ArrayListUnmanaged(QSentFrame) = .{},
+    tp_buf: std.ArrayListUnmanaged(u8) = .{},
+    probe_pending: bool = false,
+    huff: HpackTable = .{},
+
+    fn a(conn: *QuicConn) std.mem.Allocator {
+        _ = conn;
+        return pumpAlloc();
+    }
+};
+
+// ── the lane: one per worker ─────────────────────────────────────────────────
+
+const H3Ready = struct { stream: *QStream, raw: []u8 };
+
+pub const QuicLane = struct {
+    fd: posix.fd_t = -1,
+    conns: std.AutoHashMapUnmanaged(u64, *QuicConn) = .{},
+    odcid_map: std.AutoHashMapUnmanaged(u64, *QuicConn) = .{},
+    ready: [64]H3Ready = undefined,
+    ready_n: usize = 0,
+    rxbuf: [65536]u8 = undefined,
+};
+
+fn quicPopReady(lane: *QuicLane) ?H3Ready {
+    if (lane.ready_n == 0) return null;
+    const r = lane.ready[0];
+    for (1..lane.ready_n) |i| lane.ready[i - 1] = lane.ready[i];
+    lane.ready_n -= 1;
+    return r;
+}
+
+fn dcidKey(bytes: []const u8) u64 {
+    var k: u64 = 1469598103934665603;
+    for (bytes) |b| {
+        k ^= b;
+        k *%= 1099511628211;
+    }
+    return k;
+}
+
+// ── OpenSSL QUIC-TLS callbacks ───────────────────────────────────────────────
+
+fn qtlsCryptoSend(ssl: ?*oss.SSL, buf: [*c]const u8, buf_len: usize, consumed: [*c]usize, arg: ?*anyopaque) callconv(.c) c_int {
+    _ = ssl;
+    const conn: *QuicConn = @ptrCast(@alignCast(arg));
+    const lvl = conn.tls_tx_level;
+    conn.ctx[lvl].appendSlice(conn.a(), buf[0..buf_len]) catch return 0;
+    consumed.* = buf_len;
+    return 1;
+}
+
+fn qtlsCryptoRecvRcd(ssl: ?*oss.SSL, buf: [*c][*c]const u8, bytes_read: [*c]usize, arg: ?*anyopaque) callconv(.c) c_int {
+    _ = ssl;
+    const conn: *QuicConn = @ptrCast(@alignCast(arg));
+    const lvl = conn.tls_rx_level;
+    const crx = &conn.crx[lvl];
+    const contig = rangesContig(&crx.ranges);
+    if (crx.tls_off >= contig) {
+        buf.* = null;
+        bytes_read.* = 0;
+        return 1;
+    }
+    const avail = contig - crx.tls_off;
+    buf.* = @ptrCast(crx.buf.items.ptr + crx.tls_off);
+    bytes_read.* = @intCast(avail);
+    return 1;
+}
+
+fn qtlsCryptoReleaseRcd(ssl: ?*oss.SSL, bytes_read: usize, arg: ?*anyopaque) callconv(.c) c_int {
+    _ = ssl;
+    const conn: *QuicConn = @ptrCast(@alignCast(arg));
+    conn.crx[conn.tls_rx_level].tls_off += bytes_read;
+    return 1;
+}
+
+fn qtlsYieldSecret(ssl: ?*oss.SSL, prot_level: u32, direction: c_int, secret: [*c]const u8, secret_len: usize, arg: ?*anyopaque) callconv(.c) c_int {
+    _ = ssl;
+    const conn: *QuicConn = @ptrCast(@alignCast(arg));
+    // prot_level: 0 none, 1 early, 2 handshake, 3 application.
+    const space: usize = switch (prot_level) {
+        2 => 1,
+        3 => 2,
+        else => return 1, // early data / none — we refuse 0-RTT
+    };
+    std.debug.print("quic: yield secret lvl={} dir={}\n", .{ prot_level, direction });
+    const ks: *QKeys = if (direction == 0) &conn.keys_rx[space] else &conn.keys_tx[space];
+    keysFromSecret(ks, secret[0..secret_len]);
+    if (direction == 1) {
+        conn.tls_tx_level = space;
+    } else {
+        conn.tls_rx_level = space;
+    }
+    return 1;
+}
+
+fn qtlsGotTransportParams(ssl: ?*oss.SSL, params: [*c]const u8, params_len: usize, arg: ?*anyopaque) callconv(.c) c_int {
+    _ = ssl;
+    const conn: *QuicConn = @ptrCast(@alignCast(arg));
+    const buf = params[0..params_len];
+    var pos: usize = 0;
+    while (pos < buf.len) {
+        const id = qvGet(buf, &pos) orelse return 0;
+        const len = qvGet(buf, &pos) orelse return 0;
+        if (pos + len > buf.len) return 0;
+        var vp = pos;
+        const v = qvGet(buf[0 .. pos + @as(usize, @intCast(len))], &vp) orelse 0;
+        switch (id) {
+            0x01 => {},
+            0x04 => conn.peer_max_data = v,
+            0x05 => conn.peer_imsd_bl = v,
+            0x06 => {},
+            0x07 => conn.peer_imsd_uni = v,
+            0x08 => {},
+            0x09 => conn.peer_imsu = v,
+            0x0a => conn.peer_ack_delay_exp = v,
+            0x0b => conn.peer_max_ack_delay = v,
+            0x0f => {
+                // initial_source_connection_id — our packets' DCID.
+                const sl = @min(len, 32);
+                @memcpy(conn.dcid[0..@intCast(sl)], buf[pos .. pos + @as(usize, @intCast(sl))]);
+                conn.dcid_len = @intCast(sl);
+            },
+            else => {},
+        }
+        pos += @intCast(len);
+    }
+    conn.peer_got_tp = true;
+    return 1;
+}
+
+fn qtlsAlert(ssl: ?*oss.SSL, alert_code: u8, arg: ?*anyopaque) callconv(.c) c_int {
+    _ = ssl;
+    const conn: *QuicConn = @ptrCast(@alignCast(arg));
+    conn.close_code = 0x100 + @as(u64, alert_code);
+    conn.close_pending = .{ .conn_close = .{ .code = conn.close_code, .app = false } };
+    conn.state = .closing;
+    return 1;
+}
+
+const QTDIS = if (HAS_OPENSSL) [_]oss.OSSL_DISPATCH{
+    .{ .function_id = 2001, .function = @ptrCast(&qtlsCryptoSend) },
+    .{ .function_id = 2002, .function = @ptrCast(&qtlsCryptoRecvRcd) },
+    .{ .function_id = 2003, .function = @ptrCast(&qtlsCryptoReleaseRcd) },
+    .{ .function_id = 2004, .function = @ptrCast(&qtlsYieldSecret) },
+    .{ .function_id = 2005, .function = @ptrCast(&qtlsGotTransportParams) },
+    .{ .function_id = 2006, .function = @ptrCast(&qtlsAlert) },
+    .{ .function_id = 0, .function = null },
+} else {};
+
+// ── transport params we announce ─────────────────────────────────────────────
+
+fn buildTransportParams(conn: *QuicConn, out: *std.ArrayListUnmanaged(u8)) void {
+    const a = conn.a();
+    // original_destination_connection_id (0x00)
+    qvPut(out, a, 0x00);
+    qvPut(out, a, conn.odcid_len);
+    out.appendSlice(a, conn.odcid[0..conn.odcid_len]) catch {};
+    const ints = [_]struct { id: u64, v: u64 }{
+        .{ .id = 0x01, .v = QUIC_IDLE_MS },
+        .{ .id = 0x03, .v = 1452 },
+        .{ .id = 0x04, .v = conn.rx_max_data },
+        .{ .id = 0x05, .v = QUIC_MAX_STREAM_DATA },
+        .{ .id = 0x06, .v = QUIC_MAX_STREAM_DATA },
+        .{ .id = 0x07, .v = QUIC_MAX_STREAM_DATA },
+        .{ .id = 0x08, .v = QUIC_MAX_STREAMS_BIDI },
+        .{ .id = 0x09, .v = QUIC_MAX_STREAMS_UNI },
+        .{ .id = 0x0a, .v = 3 },
+        .{ .id = 0x0b, .v = 25 },
+        .{ .id = 0x0e, .v = 8 },
+    };
+    for (ints) |p| {
+        qvPut(out, a, p.id);
+        qvPut(out, a, qvLen(p.v));
+        qvPut(out, a, p.v);
+    }
+    qvPut(out, a, 0x0c); // disable_active_migration
+    qvPut(out, a, 0);
+    // initial_source_connection_id (0x0f)
+    qvPut(out, a, 0x0f);
+    qvPut(out, a, QUIC_SCID_LEN);
+    out.appendSlice(a, &conn.scid) catch {};
+}
+
+// ── conn create / destroy ────────────────────────────────────────────────────
+
+fn quicConnCreate(lane: *QuicLane, peer: *const posix.sockaddr, peer_len: posix.socklen_t, odcid: []const u8, client_scid: []const u8) ?*QuicConn {
+    if (!HAS_OPENSSL) return null;
+    const ctx = quic_ssl_ctx orelse return null;
+    const a = pumpAlloc();
+    const conn = a.create(QuicConn) catch return null;
+    conn.* = .{ .lane = lane };
+    @memcpy(@as([*]u8, @ptrCast(&conn.peer))[0..peer_len], @as([*]const u8, @ptrCast(peer))[0..peer_len]);
+    conn.peer_len = peer_len;
+    std.crypto.random.bytes(&conn.scid);
+    conn.scid_key = std.mem.readInt(u64, &conn.scid, .big);
+    conn.odcid_len = @intCast(@min(odcid.len, 32));
+    @memcpy(conn.odcid[0..conn.odcid_len], odcid[0..conn.odcid_len]);
+    conn.odcid_key = dcidKey(odcid);
+    conn.dcid_len = @intCast(@min(client_scid.len, 32));
+    @memcpy(conn.dcid[0..conn.dcid_len], client_scid[0..conn.dcid_len]);
+    conn.idle_deadline_ms = std.time.milliTimestamp() + QUIC_IDLE_MS;
+    // initial keys from the client's original DCID
+    initialSecrets(odcid, &conn.init_cli, &conn.init_srv);
+    keysFromSecret(&conn.keys_rx[0], &conn.init_cli);
+    keysFromSecret(&conn.keys_tx[0], &conn.init_srv);
+    conn.have_init = true;
+    // TLS object with the QUIC record layer callbacks.
+    const ssl = oss.SSL_new(ctx);
+    if (ssl == null) {
+        a.destroy(conn);
+        return null;
+    }
+    conn.ssl = ssl;
+    if (oss.SSL_set_quic_tls_cbs(ssl, &QTDIS, conn) != 1) {
+        oss.SSL_free(ssl);
+        a.destroy(conn);
+        return null;
+    }
+    // The params buffer must outlive the SSL object — OpenSSL sends it
+    // lazily during the handshake, so it lives on the conn.
+    buildTransportParams(conn, &conn.tp_buf);
+    if (oss.SSL_set_quic_tls_transport_params(ssl, conn.tp_buf.items.ptr, conn.tp_buf.items.len) != 1) {
+        oss.SSL_free(ssl);
+        a.destroy(conn);
+        return null;
+    }
+    oss.SSL_set_accept_state(ssl);
+    lane.conns.put(a, conn.scid_key, conn) catch {};
+    lane.odcid_map.put(a, conn.odcid_key, conn) catch {};
+    return conn;
+}
+
+fn quicStreamDestroy(conn: *QuicConn, s: *QStream) void {
+    s.deinit(conn.a());
+}
+
+fn quicConnDestroy(conn: *QuicConn) void {
+    const a = conn.a();
+    if (conn.ssl) |ssl| oss.SSL_free(ssl);
+    var it = conn.streams.iterator();
+    while (it.next()) |e| e.value_ptr.*.deinit(a);
+    conn.streams.deinit(a);
+    for (0..3) |i| {
+        conn.rx_space[i].ranges.deinit(a);
+        for (conn.tx_space[i].sent.items) |*p| p.frames.deinit(a);
+        conn.tx_space[i].sent.deinit(a);
+        conn.crx[i].buf.deinit(a);
+        conn.crx[i].ranges.deinit(a);
+        conn.ctx[i].deinit(a);
+        conn.ctx_retx[i].deinit(a);
+    }
+    conn.ctrl_q.deinit(a);
+    conn.tp_buf.deinit(a);
+    conn.huff.deinit(a);
+    _ = conn.lane.conns.remove(conn.scid_key);
+    _ = conn.lane.odcid_map.remove(conn.odcid_key);
+    a.destroy(conn);
+}
+
+fn quicStreamGet(conn: *QuicConn, id: u64, create: bool) ?*QStream {
+    if (conn.streams.get(id)) |s| return s;
+    if (!create) return null;
+    // enforce client's bidi limit
+    if (id & 3 == 0) {
+        const seq = id >> 2;
+        if (seq >= conn.streams_bidi_credit) return null;
+        if (@as(i64, @intCast(seq)) > conn.streams_bidi_top) conn.streams_bidi_top = @intCast(seq);
+    }
+    const s = conn.a().create(QStream) catch return null;
+    s.* = .{ .id = id, .conn = conn };
+    s.stype = if (id & 2 != 0) -1 else -2;
+    s.flow_hi = if (id & 3 == 0) conn.peer_imsd_bl else conn.peer_imsd_uni;
+    s.rx_hi = QUIC_MAX_STREAM_DATA;
+    conn.streams.put(conn.a(), id, s) catch {
+        conn.a().destroy(s);
+        return null;
+    };
+    return s;
+}
+
+// ── packet receive ───────────────────────────────────────────────────────────
+
+const QPktKind = enum { initial, handshake, app };
+
+// Reconstruct the full packet number from its truncated wire form (RFC 9000
+// §A.3). pnl is the encoded byte count.
+fn pnExpand(wire: u64, pnl: usize, largest: i64) u64 {
+    const pn_bits = pnl * 8;
+    const pn_win = @as(u64, 1) << @intCast(pn_bits);
+    const pn_half = pn_win / 2;
+    const pn_mask = pn_win - 1;
+    const expected = @as(u64, @intCast(largest + 1));
+    const candidate = (expected & ~pn_mask) | wire;
+    if (candidate + pn_half <= expected and candidate + pn_win <= (1 << 62))
+        return candidate + pn_win;
+    if (candidate > expected + pn_half and candidate >= pn_win)
+        return candidate - pn_win;
+    return candidate;
+}
+
+fn hpMask(hp: *const [16]u8, sample: *const [16]u8) [16]u8 {
+    const ctx = AesHp.initEnc(hp.*);
+    var out: [16]u8 = undefined;
+    ctx.encrypt(&out, sample);
+    return out;
+}
+
+// Feed received CRYPTO bytes into the level's reassembly, then drive the TLS.
+fn quicCryptoFeed(conn: *QuicConn, space: usize, off: u64, data: []const u8) void {
+    const crx = &conn.crx[space];
+    const end = off + data.len;
+    if (crx.buf.items.len < end) {
+        const newlen = @as(usize, @intCast(end));
+        crx.buf.resize(conn.a(), newlen) catch return;
+    }
+    @memcpy(crx.buf.items[@intCast(off)..@intCast(end)], data);
+    rangesAdd(&crx.ranges, conn.a(), off, data.len);
+    quicDriveTls(conn);
+}
+
+fn quicDriveTls(conn: *QuicConn) void {
+    if (conn.ssl == null or conn.state == .dead or conn.state == .draining) return;
+    while (true) {
+        const ssl = conn.ssl.?;
+        const before_tx = conn.ctx[0].items.len + conn.ctx[1].items.len + conn.ctx[2].items.len;
+        _ = before_tx;
+        const ret = oss.SSL_do_handshake(ssl);
+        std.debug.print("quic: do_handshake ret={} state={s}\n", .{ ret, @tagName(conn.state) });
+        if (ret == 1) {
+            conn.state = .app;
+            // handshake complete: queue HANDSHAKE_DONE + the h3 control stream
+            if (!conn.hs_done_sent) {
+                conn.hs_done_sent = true;
+                quicCtrlQueue(conn, .handshake_done);
+            }
+            if (!conn.ctrl_opened) {
+                conn.ctrl_opened = true;
+                quicH3OpenControl(conn);
+            }
+            // Post-handshake CRYPTO (NewSessionTicket etc.) still flows.
+            _ = oss.SSL_read(ssl, null, 0);
+            break;
+        }
+        if (ret <= 0) {
+            const err = oss.SSL_get_error(ssl, ret);
+            std.debug.print("quic: ssl err={}\n", .{err});
+            // SSL_ERROR_WANT_READ = 2, WANT_WRITE = 3: wait for more wire data.
+            if (err == 2 or err == 3) break;
+            conn.close_code = 0x100;
+            conn.close_pending = .{ .conn_close = .{ .code = conn.close_code, .app = false } };
+            conn.state = .closing;
+            std.debug.print("quic: TLS fatal err={}\n", .{err});
+            break;
+        }
+        break;
+    }
+}
+
+// ACK bookkeeping + per-frame receive dispatch.
+fn quicRecordPn(conn: *QuicConn, space: usize, pn: u64) void {
+    const rs = &conn.rx_space[space];
+    if (rangesHas(&rs.ranges, pn)) return;
+    rangesAdd(&rs.ranges, conn.a(), pn, 1);
+    rs.largest = @max(rs.largest, @as(i64, @intCast(pn)));
+    if (space == 1) {
+        conn.hs_pkt_seen = true;
+        conn.addr_validated = true;
+        conn.keys_rx[0].present = false; // RFC 9001 §4.9.1 — initial keys out
+    }
+    conn.idle_deadline_ms = std.time.milliTimestamp() + QUIC_IDLE_MS;
+}
+
+fn quicCtrlQueue(conn: *QuicConn, f: QSentFrame) void {
+    // control frames ride the app space's own retry list — stash into a
+    // synthetic retx range list indexed per kind via ctx_retx? Simpler:
+    // dedicated queue.
+    conn.ctrl_q.append(conn.a(), f) catch {};
+}
+
+fn quicOnFrames(conn: *QuicConn, space: usize, pn: u64, bytes: []const u8) void {
+    _ = pn;
+    var eliciting = false;
+    var pos: usize = 0;
+    const a = conn.a();
+    while (pos < bytes.len) {
+        const ft = qvGet(bytes, &pos) orelse break;
+        std.debug.print("quic:   frame type={x} space={}\n", .{ ft, space });
+        switch (ft) {
+            0x00 => {}, // PADDING
+            0x01 => eliciting = true, // PING
+            0x02, 0x03 => { // ACK [,ECN]
+                const largest = qvGet(bytes, &pos) orelse return;
+                const delay = qvGet(bytes, &pos) orelse return;
+                _ = delay;
+                const n_ranges = qvGet(bytes, &pos) orelse return;
+                const first_range = qvGet(bytes, &pos) orelse return;
+                var lo = largest -| first_range;
+                var hi = largest;
+                quicOnAck(conn, space, lo, hi);
+                var i: u64 = 0;
+                while (i < n_ranges) : (i += 1) {
+                    const gap = qvGet(bytes, &pos) orelse return;
+                    const rlen = qvGet(bytes, &pos) orelse return;
+                    hi = lo -| (gap + 2);
+                    lo = hi -| rlen;
+                    quicOnAck(conn, space, lo, hi);
+                }
+                if (ft == 0x03) {
+                    _ = qvGet(bytes, &pos); // ect0
+                    _ = qvGet(bytes, &pos); // ect1
+                    _ = qvGet(bytes, &pos); // ce
+                }
+            },
+            0x04 => { // RESET_STREAM
+                eliciting = true;
+                const sid = qvGet(bytes, &pos) orelse return;
+                _ = qvGet(bytes, &pos);
+                _ = qvGet(bytes, &pos);
+                if (quicStreamGet(conn, sid, false)) |s| s.rx_dead = true;
+            },
+            0x05 => { // STOP_SENDING
+                eliciting = true;
+                const sid = qvGet(bytes, &pos) orelse return;
+                _ = qvGet(bytes, &pos);
+                if (quicStreamGet(conn, sid, false)) |s| s.reset = true;
+            },
+            0x06 => { // CRYPTO
+                eliciting = true;
+                const off = qvGet(bytes, &pos) orelse return;
+                const len = qvGet(bytes, &pos) orelse return;
+                if (pos + len > bytes.len) return;
+                quicCryptoFeed(conn, space, off, bytes[pos .. pos + @as(usize, @intCast(len))]);
+                pos += @intCast(len);
+            },
+            0x07 => { // NEW_TOKEN
+                eliciting = true;
+                const len = qvGet(bytes, &pos) orelse return;
+                pos += @intCast(len);
+            },
+            0x08...0x0f => { // STREAM
+                eliciting = true;
+                const has_off = ft & 0x04 != 0;
+                const has_len = ft & 0x02 != 0;
+                const has_fin = ft & 0x01 != 0;
+                const sid = qvGet(bytes, &pos) orelse return;
+                const off = if (has_off) (qvGet(bytes, &pos) orelse return) else 0;
+                var len: u64 = bytes.len - pos;
+                if (has_len) len = qvGet(bytes, &pos) orelse return;
+                if (pos + len > bytes.len) return;
+                quicOnStreamData(conn, sid, off, bytes[pos .. pos + @as(usize, @intCast(len))], has_fin);
+                pos += @intCast(len);
+            },
+            0x10 => { eliciting = true; _ = qvGet(bytes, &pos); }, // MAX_DATA
+            0x11 => { // MAX_STREAM_DATA
+                eliciting = true;
+                _ = qvGet(bytes, &pos);
+                _ = qvGet(bytes, &pos);
+            },
+            0x12, 0x13 => { eliciting = true; _ = qvGet(bytes, &pos); }, // MAX_STREAMS
+            0x14, 0x15, 0x16, 0x17 => {
+                eliciting = true;
+                _ = qvGet(bytes, &pos);
+                if (ft == 0x15) _ = qvGet(bytes, &pos);
+            },
+            0x18 => { // NEW_CONNECTION_ID: seq, retire_prior_to (varints), len u8, cid, token
+                eliciting = true;
+                _ = qvGet(bytes, &pos);
+                _ = qvGet(bytes, &pos);
+                if (pos >= bytes.len) return;
+                const clen: usize = bytes[pos];
+                pos += 1 + @as(usize, @intCast(clen)) + 16;
+            },
+            0x19 => { eliciting = true; _ = qvGet(bytes, &pos); }, // RETIRE_CONNECTION_ID
+            0x1a => { // PATH_CHALLENGE
+                eliciting = true;
+                if (pos + 8 > bytes.len) return;
+                var d: [8]u8 = undefined;
+                @memcpy(&d, bytes[pos .. pos + 8]);
+                pos += 8;
+                quicCtrlQueue(conn, .{ .path_response = d });
+            },
+            0x1b => { eliciting = true; pos += 8; }, // PATH_RESPONSE
+            0x1c, 0x1d => { // CONNECTION_CLOSE
+                const cc = qvGet(bytes, &pos) orelse return;
+                var fty: u64 = 0;
+                if (ft == 0x1c) fty = qvGet(bytes, &pos) orelse return;
+                const rlen = qvGet(bytes, &pos) orelse return;
+                pos += @intCast(rlen);
+                std.debug.print("quic: peer CONNECTION_CLOSE code={x} ft={x} app={}\n", .{ cc, fty, ft == 0x1d });
+                conn.state = .draining;
+                conn.draining_until_ms = std.time.milliTimestamp() + 3000;
+                return;
+            },
+            0x1e => { // HANDSHAKE_DONE
+                eliciting = true;
+                conn.hs_confirmed = true;
+                conn.keys_rx[1].present = false;
+                conn.keys_tx[1].present = false;
+            },
+            else => {
+                std.debug.print("quic: UNKNOWN frame {x} at pos {} of {}\n", .{ ft, pos, bytes.len });
+                for (bytes) |bb| std.debug.print("{x:0>2}", .{bb});
+                std.debug.print("\n", .{});
+                break;
+            },
+        }
+    }
+    if (eliciting) conn.rx_space[space].ack_pending = true;
+    _ = a;
+}
+
+fn quicOnAck(conn: *QuicConn, space: usize, lo: u64, hi: u64) void {
+    const sp = &conn.tx_space[space];
+    const now = std.time.microTimestamp();
+    var newly: usize = 0;
+    var i: usize = 0;
+    while (i < sp.sent.items.len) {
+        const p = &sp.sent.items[i];
+        if (p.pn >= lo and p.pn <= hi) {
+            if (p.pn > @as(u64, @intCast(@max(sp.largest_acked, 0)))) sp.largest_acked = @intCast(p.pn);
+            if (p.ack_eliciting and p.time_us > 0) {
+                conn.latest_rtt_us = now - p.time_us;
+                if (conn.smoothed_rtt_us < 0) {
+                    conn.smoothed_rtt_us = conn.latest_rtt_us;
+                    conn.rttvar_us = @divTrunc(conn.latest_rtt_us, 2);
+                } else {
+                    const diff = @abs(conn.smoothed_rtt_us - conn.latest_rtt_us);
+                    conn.rttvar_us = @divTrunc(3 * conn.rttvar_us + @as(i64, @intCast(diff)), 4);
+                    conn.smoothed_rtt_us = @divTrunc(7 * conn.smoothed_rtt_us + conn.latest_rtt_us, 8);
+                }
+                conn.pto_count = 0;
+            }
+            if (p.in_flight) {
+                conn.bytes_in_flight -|= p.size;
+                newly += p.size;
+                // NewReno: slow start grows per byte; recovery grows per cwnd.
+                if (!conn.in_recovery) {
+                    conn.cwnd += p.size;
+                } else {
+                    conn.cwnd += @max(1, QUIC_MAX_DGRAM * p.size / @max(conn.cwnd, 1));
+                }
+            }
+            for (p.frames.items) |f| {
+                switch (f) {
+                    .stream => |sf| {
+                        if (quicStreamGet(conn, sf.id, false)) |s|
+                            rangesAdd(&s.sb_acked, conn.a(), sf.off, sf.len + @intFromBool(sf.fin));
+                    },
+                    .handshake_done => {
+                        conn.hs_confirmed = true;
+                        conn.keys_rx[1].present = false;
+                        conn.keys_tx[1].present = false;
+                    },
+                    else => {},
+                }
+            }
+            p.frames.deinit(conn.a());
+            _ = sp.sent.orderedRemove(i);
+        } else i += 1;
+    }
+}
+
+fn quicOnStreamData(conn: *QuicConn, id: u64, off: u64, data: []const u8, fin: bool) void {
+    // client uni streams and client bidi streams only; our own uni stream
+    // ids (&3==2? ours are 2,6,...) can't carry client data — ignore.
+    if (id & 3 == 1 or id & 3 == 3) return; // server-initiated; client can't write
+    const s = quicStreamGet(conn, id, true) orelse return;
+    if (data.len > 0) {
+        const end = off + data.len;
+        if (s.rx.items.len < end) s.rx.resize(conn.a(), @intCast(end)) catch return;
+        @memcpy(s.rx.items[@intCast(off)..@intCast(end)], data);
+        const old_contig = rangesContig(&s.rx_ranges);
+        rangesAdd(&s.rx_ranges, conn.a(), off, data.len);
+        const new_contig = rangesContig(&s.rx_ranges);
+        const fresh = new_contig -| @min(old_contig, new_contig);
+        if (fresh > 0) {
+            conn.rx_consumed += fresh;
+            // credit: half-window replenishment
+            if (conn.rx_consumed > conn.rx_max_data / 2) {
+                conn.rx_max_data += QUIC_MAX_DATA;
+                quicCtrlQueue(conn, .{ .max_data = conn.rx_max_data });
+                conn.rx_consumed = 0;
+            }
+            if (s.rx_hi < new_contig + QUIC_MAX_STREAM_DATA / 2) {
+                s.rx_hi = new_contig + QUIC_MAX_STREAM_DATA;
+                quicCtrlQueue(conn, .{ .max_stream_data = .{ .id = id, .v = s.rx_hi } });
+            }
+        }
+    }
+    if (fin) s.rx_fin_off = off + data.len;
+    if (s.stype == -2) quicH3Parse(conn, s);
+    if (s.stype == -1) quicUniType(conn, s);
+}
+
+// Uni streams: first varint is the type; content is ignored (control/qpack).
+fn quicUniType(conn: *QuicConn, s: *QStream) void {
+    _ = conn;
+    const contig = rangesContig(&s.rx_ranges);
+    if (contig == 0) return;
+    var pos: usize = 0;
+    _ = qvGet(s.rx.items[0..@intCast(contig)], &pos) orelse return;
+    s.stype = @intCast(pos); // consumed bytes mark type length
+    s.stype = 0; // treated as drained-forever: content ignored
+}
+
+// ── HTTP/3 framing + QPACK decode ────────────────────────────────────────────
+
+fn qpackString(conn: *QuicConn, block: []const u8, pos: *usize) ?[]const u8 {
+    if (pos.* >= block.len) return null;
+    const huffman = block[pos.*] & 0x80 != 0;
+    var vpos = pos.*;
+    const len = hpackInt(block, &vpos, 7) orelse return null;
+    pos.* = vpos;
+    if (len > block.len - pos.*) return null;
+    const raw = block[pos.* .. pos.* + @as(usize, @intCast(len))];
+    pos.* += @intCast(len);
+    if (!huffman) return raw;
+    return huffDecode(&conn.huff, conn.a(), raw);
+}
+
+// Decode a QPACK field section (static table only) into `pairs`. RIC must be
+// 0 — we advertised capacity 0, so any dynamic reference is a violation.
+fn qpackDecode(conn: *QuicConn, block: []const u8, pairs: []HpackPair) ?usize {
+    var pos: usize = 0;
+    const ric = qvGet(block, &pos) orelse return null;
+    const delta_base = qvGet(block, &pos) orelse return null;
+    _ = delta_base;
+    if (ric != 0) return null;
+    var n: usize = 0;
+    while (pos < block.len) {
+        const b = block[pos];
+        if (b & 0x80 != 0) {
+            // indexed field line: T=1 → static
+            if (b & 0x40 == 0) return null;
+            const idx = hpackInt(block, &pos, 6) orelse return null;
+            if (idx >= QPACK_STATIC.len or n >= pairs.len) return null;
+            pairs[n] = QPACK_STATIC[@intCast(idx)];
+            n += 1;
+        } else if (b & 0xC0 == 0x40) {
+            // literal with name reference: T at bit 4, idx 4-bit prefix
+            if (b & 0x10 == 0) return null;
+            const idx = hpackInt(block, &pos, 4) orelse return null;
+            if (idx >= QPACK_STATIC.len or n >= pairs.len) return null;
+            const name = QPACK_STATIC[@intCast(idx)].name;
+            const value = qpackString(conn, block, &pos) orelse return null;
+            pairs[n] = .{ .name = name, .value = value };
+            n += 1;
+        } else if (b & 0xE0 == 0x20) {
+            // literal with literal name: 001 N H len(3+)
+            const nhuff = b & 0x08 != 0;
+            var vpos = pos;
+            const nlen = hpackInt(block, &vpos, 3) orelse return null;
+            pos = vpos;
+            if (nlen > block.len - pos) return null;
+            var name: []const u8 = block[pos .. pos + @as(usize, @intCast(nlen))];
+            pos += @intCast(nlen);
+            if (nhuff) name = huffDecode(&conn.huff, conn.a(), name) orelse return null;
+            const value = qpackString(conn, block, &pos) orelse return null;
+            if (n >= pairs.len) return null;
+            pairs[n] = .{ .name = name, .value = value };
+            n += 1;
+        } else {
+            return null; // dynamic/post-base — capacity 0 forbids them
+        }
+    }
+    return n;
+}
+
+// Parse h3 frames off the contiguous receive prefix. HEADERS first, then
+// DATA until FIN; unknown frame types skipped per RFC 9114 §7.1.
+fn quicH3Parse(conn: *QuicConn, s: *QStream) void {
+    std.debug.print("quic: h3 parse stream={}\n", .{s.id});
+    const a = conn.a();
+    while (true) {
+        const contig = rangesContig(&s.rx_ranges);
+        if (s.rx_fin_off) |f| {
+            if (contig < f) {
+                // still waiting for a hole to fill
+            }
+        }
+        const avail: usize = @intCast(@min(contig, s.rx.items.len));
+        if (s.h3_off >= avail) break;
+        const buf = s.rx.items[@intCast(s.h3_off)..avail];
+        var pos: usize = 0;
+        const ft = qvGet(buf, &pos) orelse break;
+        const flen = qvGet(buf, &pos) orelse break;
+        if (flen > buf.len - pos) break; // incomplete frame
+        const payload = buf[pos .. pos + @as(usize, @intCast(flen))];
+        pos += @intCast(flen);
+        switch (ft) {
+            0x01 => { // HEADERS
+                var pairs: [64]HpackPair = undefined;
+                const n = qpackDecode(conn, payload, &pairs) orelse {
+                    quicClose(conn, 0x0200, true); // QPACK_DECOMPRESSION_FAILED
+                    return;
+                };
+                if (!s.h3_headers_done) {
+                    for (pairs[0..n]) |p| {
+                        if (std.mem.eql(u8, p.name, ":method"))
+                            s.h3_method.appendSlice(a, p.value) catch {}
+                        else if (std.mem.eql(u8, p.name, ":path"))
+                            s.h3_path.appendSlice(a, p.value) catch {}
+                        else if (std.mem.eql(u8, p.name, ":authority"))
+                            s.h3_authority.appendSlice(a, p.value) catch {}
+                        else if (p.name.len > 0 and p.name[0] != ':') {
+                            s.h3_headers.appendSlice(a, p.name) catch {};
+                            s.h3_headers.appendSlice(a, ": ") catch {};
+                            s.h3_headers.appendSlice(a, p.value) catch {};
+                            s.h3_headers.appendSlice(a, "\r\n") catch {};
+                        }
+                    }
+                    s.h3_headers_done = true;
+                    for (conn.huff.retired.items) |r| a.free(r);
+                    conn.huff.retired.clearRetainingCapacity();
+                }
+            },
+            0x00 => { // DATA
+                if (!s.h3_headers_done) {
+                    quicClose(conn, 0x0105, true); // H3_FRAME_UNEXPECTED
+                    return;
+                }
+                s.h3_body.appendSlice(a, payload) catch {};
+            },
+            else => {}, // SETTINGS on request stream / unknowns: skip
+        }
+        s.h3_off += pos;
+    }
+    // Request complete when FIN arrived and we consumed everything before it.
+    if (!s.served and s.h3_headers_done) {
+        if (s.rx_fin_off) |fin| {
+            if (rangesContig(&s.rx_ranges) >= fin and s.h3_off >= fin) {
+                s.served = true;
+                quicH3Serve(conn, s);
+            }
+        }
+    }
+}
+
+// Synthesize the h1-format request — same shape h2FillRequestHead emits — and
+// queue it for the ~proc body's arrived() dispatch.
+fn quicH3Serve(conn: *QuicConn, s: *QStream) void {
+    const a = conn.a();
+    if (s.h3_method.items.len == 0 or s.h3_path.items.len == 0) {
+        quicClose(conn, 0x0107, true); // H3_MESSAGE_ERROR
+        return;
+    }
+    var rq: std.ArrayListUnmanaged(u8) = .{};
+    rq.appendSlice(a, s.h3_method.items) catch return;
+    rq.appendSlice(a, " ") catch return;
+    rq.appendSlice(a, s.h3_path.items) catch return;
+    rq.appendSlice(a, " HTTP/1.1\r\nhost: ") catch return;
+    rq.appendSlice(a, s.h3_authority.items) catch return;
+    rq.appendSlice(a, "\r\n") catch return;
+    rq.appendSlice(a, s.h3_headers.items) catch return;
+    var cl_buf: [32]u8 = undefined;
+    const cl = std.fmt.bufPrint(&cl_buf, "content-length: {}\r\n\r\n", .{s.h3_body.items.len}) catch return;
+    rq.appendSlice(a, cl) catch return;
+    rq.appendSlice(a, s.h3_body.items) catch return;
+    const raw = a.dupe(u8, rq.items) catch return;
+    rq.deinit(a);
+    const lane = conn.lane;
+    if (lane.ready_n >= lane.ready.len) {
+        a.free(raw);
+        quicClose(conn, 0x0107, true);
+        return;
+    }
+    std.debug.print("quic: h3 request ready stream={} raw={}B\n", .{ s.id, raw.len });
+    lane.ready[lane.ready_n] = .{ .stream = s, .raw = raw };
+    lane.ready_n += 1;
+    // Credit: a completed request stream earns the client another one.
+    conn.streams_bidi_done += 1;
+    const credit = QUIC_MAX_STREAMS_BIDI + conn.streams_bidi_done;
+    if (credit > conn.streams_bidi_credit) {
+        conn.streams_bidi_credit = credit;
+        quicCtrlQueue(conn, .{ .max_streams_bidi = credit });
+    }
+}
+
+fn quicH3OpenControl(conn: *QuicConn) void {
+    const s = quicStreamGet(conn, conn.next_uni_id, true) orelse return;
+    conn.next_uni_id += 4;
+    const a = conn.a();
+    s.sb.append(a, 0x00) catch {}; // control stream type
+    // SETTINGS frame: QPACK_MAX_TABLE_CAPACITY=0, QPACK_BLOCKED_STREAMS=0
+    const settings = [_]u8{ 0x01, 0x00, 0x07, 0x00 };
+    s.sb.append(a, 0x04) catch {};
+    qvPut(&s.sb, a, settings.len);
+    s.sb.appendSlice(a, &settings) catch {};
+    s.flow_hi = conn.peer_imsd_uni;
+}
+
+// ── close ────────────────────────────────────────────────────────────────────
+
+fn quicClose(conn: *QuicConn, code: u64, app: bool) void {
+    std.debug.print("quic: CLOSE code={x} app={}\n", .{ code, app });
+    if (conn.state == .closing or conn.state == .draining or conn.state == .dead) return;
+    conn.close_code = code;
+    conn.close_pending = .{ .conn_close = .{ .code = code, .app = app } };
+    conn.state = .closing;
+    conn.draining_until_ms = std.time.milliTimestamp() + 3000;
+}
+
+// ── ACK frame emit ───────────────────────────────────────────────────────────
+
+fn emitAckFrame(out: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, rs: *QRxSpace) bool {
+    const rs_list = &rs.ranges;
+    if (rs_list.items.len == 0) return false;
+    var buf: [64]u8 = undefined;
+    const last = rs_list.items[rs_list.items.len - 1];
+    const largest = last.off + last.len - 1;
+    var fo: usize = 0;
+    buf[0] = 0x02;
+    fo = 1;
+    fo += qvPutSlice(buf[fo..], largest);
+    fo += qvPutSlice(buf[fo..], 0); // ack delay
+    fo += qvPutSlice(buf[fo..], rs_list.items.len - 1); // ack range count
+    fo += qvPutSlice(buf[fo..], last.len - 1); // first ack range
+    out.appendSlice(a, buf[0..fo]) catch return false;
+    var prev_off = last.off;
+    var i = rs_list.items.len - 1;
+    while (i > 0) {
+        i -= 1;
+        const r = rs_list.items[i];
+        // gap = unacked pns between this range's top and prev range's bottom - 1
+        qvPut(out, a, prev_off - (r.off + r.len) - 1);
+        qvPut(out, a, r.len - 1);
+        prev_off = r.off;
+    }
+    rs.ack_pending = false;
+    return true;
+}
+
+// ── packet build ─────────────────────────────────────────────────────────────
+
+// Write a protected packet for `space` into out[] (at most budget bytes).
+// Returns bytes written; 0 = nothing to send at this space.
+fn quicBuildPacket(conn: *QuicConn, space: usize, out: []u8, budget: usize, pad_to_1200: bool, probe: bool) usize {
+    const ks = &conn.keys_tx[space];
+    if (!ks.present) return 0;
+    const a = conn.a();
+    const ts = &conn.tx_space[space];
+    var frames: std.ArrayListUnmanaged(u8) = .{};
+    defer frames.deinit(a);
+    var rec: QSentPacket = .{};
+    var elicit = false;
+
+    const room = budget -| 64; // header + tag slack
+    if (room < 16) return 0;
+
+    // ACK
+    const rs = &conn.rx_space[space];
+    if (rs.ack_pending and space != 0 or (space == 0 and rs.ack_pending)) {
+        if (emitAckFrame(&frames, a, rs)) {
+            rec.frames.append(a, .ack) catch {};
+            // ACK alone is not ack-eliciting — do not set elicit here.
+        }
+    }
+    std.debug.print("quic: build space={} ctx_len={} ctx_hi={} retx={} ackpend={} keys={}\n", .{ space, conn.ctx[space].items.len, conn.ctx_hi[space], conn.ctx_retx[space].items.len, conn.rx_space[space].ack_pending, ks.present });
+    // CRYPTO: retransmit ranges first, then new data.
+    while (conn.ctx_retx[space].items.len > 0 and frames.items.len < room) {
+        const r = conn.ctx_retx[space].orderedRemove(0);
+        const n = @min(r.len, room -| frames.items.len -| 16);
+        if (n == 0) break;
+        frames.append(a, 0x06) catch break;
+        qvPut(&frames, a, r.off);
+        qvPut(&frames, a, n);
+        frames.appendSlice(a, conn.ctx[space].items[@intCast(r.off)..@intCast(r.off + n)]) catch break;
+        rec.frames.append(a, .{ .crypto = .{ .off = r.off, .len = n } }) catch {};
+        elicit = true;
+        if (n < r.len) {
+            conn.ctx_retx[space].insert(a, 0, .{ .off = r.off + n, .len = r.len - n }) catch {};
+            break;
+        }
+    }
+    while (conn.ctx_hi[space] < conn.ctx[space].items.len and frames.items.len < room) {
+        const off = conn.ctx_hi[space];
+        const n = @min(conn.ctx[space].items.len - off, room -| frames.items.len -| 16);
+        if (n == 0) break;
+        frames.append(a, 0x06) catch break;
+        qvPut(&frames, a, off);
+        qvPut(&frames, a, n);
+        frames.appendSlice(a, conn.ctx[space].items[off .. off + n]) catch break;
+        conn.ctx_hi[space] += n;
+        rec.frames.append(a, .{ .crypto = .{ .off = off, .len = n } }) catch {};
+        elicit = true;
+    }
+    // control queue (app space only, plus close anywhere)
+    if (space == 2) {
+        const qi: usize = 0;
+        while (qi < conn.ctrl_q.items.len and frames.items.len < room) {
+            const f = conn.ctrl_q.items[qi];
+            const before = frames.items.len;
+            switch (f) {
+                .handshake_done => frames.append(a, 0x1e) catch {},
+                .max_data => |v| {
+                    frames.append(a, 0x10) catch {};
+                    qvPut(&frames, a, v);
+                },
+                .max_stream_data => |md| {
+                    frames.append(a, 0x11) catch {};
+                    qvPut(&frames, a, md.id);
+                    qvPut(&frames, a, md.v);
+                },
+                .max_streams_bidi => |v| {
+                    frames.append(a, 0x12) catch {};
+                    qvPut(&frames, a, v);
+                },
+                .max_streams_uni => |v| {
+                    frames.append(a, 0x13) catch {};
+                    qvPut(&frames, a, v);
+                },
+                .path_response => |d| {
+                    frames.append(a, 0x1b) catch {};
+                    frames.appendSlice(a, &d) catch {};
+                },
+                else => break,
+            }
+            if (frames.items.len > room) {
+                frames.items.len = before;
+                break;
+            }
+            rec.frames.append(a, f) catch {};
+            elicit = true;
+            _ = conn.ctrl_q.orderedRemove(qi);
+        }
+    }
+    // close always wins on any space with keys
+    if (conn.close_pending != null) {
+        if (conn.close_pending) |pf| {
+            conn.close_pending = null;
+            const before = frames.items.len;
+            switch (pf) {
+                .conn_close => |cc| {
+                    frames.append(a, if (cc.app) 0x1d else 0x1c) catch {};
+                    qvPut(&frames, a, cc.code);
+                    if (!cc.app) qvPut(&frames, a, 0); // frame type 0
+                    qvPut(&frames, a, 0); // reason len
+                },
+                else => {},
+            }
+            rec.frames.append(a, pf) catch {};
+            _ = before;
+            elicit = true;
+        }
+    }
+    // STREAM data (app space): retransmits then new bytes, peer-window-bound.
+    if (space == 2 and conn.close_pending == null and conn.state != .closing and conn.state != .draining) {
+        var it = conn.streams.iterator();
+        const now_ms = std.time.milliTimestamp();
+        while (it.next()) |e| {
+            const s = e.value_ptr.*;
+            if (s.park_until > now_ms or s.reset) continue;
+            // retransmit ranges
+            while (s.sb_retx.items.len > 0 and frames.items.len < room) {
+                const r = s.sb_retx.orderedRemove(0);
+                var n = @min(r.len, room -| frames.items.len -| 24);
+                const fc_room = s.flow_hi -| @min(s.flow_hi, s.sb_hi);
+                _ = fc_room;
+                if (n == 0) break;
+                n = @min(n, s.sb.items.len - r.off);
+                const fin = s.sb_fin and r.off + n >= s.sb.items.len;
+                quicEmitStreamFrame(&frames, a, s.id, r.off, n, fin, s.sb.items[@intCast(r.off)..@intCast(r.off + n)]);
+                rec.frames.append(a, .{ .stream = .{ .id = s.id, .off = r.off, .len = n, .fin = fin } }) catch {};
+                elicit = true;
+                if (n < r.len) {
+                    s.sb_retx.insert(a, 0, .{ .off = r.off + n, .len = r.len - n }) catch {};
+                }
+            }
+            // new data within the peer's stream window + conn max_data
+            while (s.sb_hi < s.sb.items.len and frames.items.len < room and conn.tx_data_sent < conn.peer_max_data and s.sb_hi < s.flow_hi) {
+                var n = @min(s.sb.items.len - s.sb_hi, room -| frames.items.len -| 24);
+                n = @min(n, s.flow_hi - s.sb_hi);
+                n = @min(n, conn.peer_max_data - conn.tx_data_sent);
+                if (n == 0) break;
+                const off = s.sb_hi;
+                const fin = s.sb_fin and off + n >= s.sb.items.len;
+                quicEmitStreamFrame(&frames, a, s.id, off, n, fin, s.sb.items[@intCast(off)..@intCast(off + n)]);
+                rec.frames.append(a, .{ .stream = .{ .id = s.id, .off = off, .len = n, .fin = fin } }) catch {};
+                s.sb_hi += n;
+                conn.tx_data_sent += n;
+                elicit = true;
+                if (fin) s.tx_done = false; // becomes done when acked
+            }
+            if (frames.items.len >= room) break;
+        }
+    }
+    // PTO probe: nothing to say but must elicit — PING.
+    if (!elicit and probe) {
+        frames.append(a, 0x01) catch {};
+        rec.frames.append(a, .ping) catch {};
+        elicit = true;
+    }
+    if (frames.items.len == 0) return 0;
+
+    // Pad: a datagram carrying an Initial ack-eliciting packet must be 1200
+    // bytes. frames += PADDING (0x00) so this packet fills `budget`.
+    if (pad_to_1200) {
+        const hdr_est = 1 + 4 + 1 + conn.dcid_len + 1 + QUIC_SCID_LEN + 1 + 4 + 4; // initial hdr + len vi + pn
+        const want = budget -| (hdr_est + 16);
+        if (frames.items.len < want) {
+            const pad_n = want - frames.items.len;
+            frames.appendNTimes(a, 0, pad_n) catch {};
+        }
+    }
+    const pnl: usize = 4;
+    const pn = ts.next_pn;
+    var hdr: std.ArrayListUnmanaged(u8) = .{};
+    defer hdr.deinit(a);
+    if (space == 2) {
+        hdr.append(a, 0x40 | @as(u8, @intCast(pnl - 1))) catch return 0;
+        hdr.appendSlice(a, conn.dcid[0..conn.dcid_len]) catch return 0;
+    } else {
+        hdr.append(a, (if (space == 0) @as(u8, 0xc0) else 0xe0) | @as(u8, @intCast(pnl - 1))) catch return 0;
+        var b4: [4]u8 = undefined;
+        std.mem.writeInt(u32, &b4, QUIC_VERSION_1, .big);
+        hdr.appendSlice(a, &b4) catch return 0;
+        hdr.append(a, conn.dcid_len) catch return 0;
+        hdr.appendSlice(a, conn.dcid[0..conn.dcid_len]) catch return 0;
+        hdr.append(a, QUIC_SCID_LEN) catch return 0;
+        hdr.appendSlice(a, &conn.scid) catch return 0;
+        if (space == 0) {
+            hdr.append(a, 0) catch return 0; // token len 0
+        }
+        // length placeholder — fill after payload size known
+        const plen = pnl + frames.items.len + 16;
+        qvPut(&hdr, a, plen);
+    }
+    const pn_off = hdr.items.len;
+    var pnb: [4]u8 = undefined;
+    std.mem.writeInt(u32, &pnb, @intCast(pn & 0xffffffff), .big);
+    hdr.appendSlice(a, pnb[4 - pnl ..]) catch return 0;
+
+    // serialize + encrypt
+    var payload: std.ArrayListUnmanaged(u8) = .{};
+    defer payload.deinit(a);
+    payload.appendSlice(a, frames.items) catch return 0;
+    const total = hdr.items.len + payload.items.len + 16;
+    if (total > out.len or total > budget + 64) {
+        // over budget — put everything back so nothing is lost.
+        for (rec.frames.items) |f| quicRequeueFrame(conn, space, f);
+        rec.frames.deinit(a);
+        return 0;
+    }
+    @memcpy(out[0..hdr.items.len], hdr.items);
+    var tag: [16]u8 = undefined;
+    const nonce = pnNonce(&ks.iv, pn);
+    AesGcm.encrypt(out[hdr.items.len .. hdr.items.len + payload.items.len], &tag, payload.items, out[0..hdr.items.len], nonce, ks.key);
+    @memcpy(out[hdr.items.len + payload.items.len ..][0..16], &tag);
+    // header protection: sample 16 bytes starting pn_off+4
+    if (pn_off + 4 + 16 <= total) {
+        var sample: [16]u8 = undefined;
+        @memcpy(&sample, out[pn_off + 4 .. pn_off + 20]);
+        const mask = hpMask(&ks.hp, &sample);
+        out[0] ^= mask[0] & (if (space == 2) @as(u8, 0x1f) else 0x0f);
+        for (0..pnl) |i| out[pn_off + i] ^= mask[1 + i];
+    }
+    std.debug.print("quic: SEND space={} pn={} bytes={} crypto_tx={} retx={}\n", .{ space, pn, total, conn.ctx[space].items.len, conn.ctx_retx[space].items.len });
+    for (rec.frames.items) |rf| std.debug.print("quic:   sent frame {s}\n", .{@tagName(rf)});
+    ts.next_pn += 1;
+    rec.pn = pn;
+    rec.time_us = std.time.microTimestamp();
+    rec.size = total;
+    rec.ack_eliciting = elicit;
+    rec.in_flight = elicit;
+    if (elicit) conn.bytes_in_flight += total;
+    // Only ack-eliciting packets enter loss tracking — a pure-ACK packet is
+    // never acked, so tracking it would loop retransmit forever.
+    if (elicit) {
+        ts.sent.append(a, rec) catch {
+            rec.frames.deinit(a);
+        };
+    } else {
+        rec.frames.deinit(a);
+    }
+    return total;
+}
+
+fn quicEmitStreamFrame(out: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, id: u64, off: u64, n: u64, fin: bool, data: []const u8) void {
+    var ft: u8 = 0x08;
+    if (off != 0) ft |= 0x04;
+    ft |= 0x02; // LEN always present
+    if (fin) ft |= 0x01;
+    out.append(a, ft) catch return;
+    qvPut(out, a, id);
+    if (off != 0) qvPut(out, a, off);
+    qvPut(out, a, n);
+    out.appendSlice(a, data) catch {};
+}
+
+// ── datagram assembly + flush ────────────────────────────────────────────────
+
+fn quicFlush(lane: *QuicLane) void {
+    var it = lane.conns.iterator();
+    var dbuf: [1600]u8 = undefined;
+    const now_ms = std.time.milliTimestamp();
+    while (it.next()) |e| {
+        const conn = e.value_ptr.*;
+        if (conn.state == .dead) continue;
+        if (conn.state == .draining) {
+            if (now_ms >= conn.draining_until_ms) conn.state = .dead;
+            continue;
+        }
+        var guard: usize = 0;
+        while (guard < 64) : (guard += 1) {
+            var total: usize = 0;
+            const budget: usize = QUIC_MAX_DGRAM;
+            // anti-amplification: 3x received until the address validates
+            if (!conn.addr_validated and conn.tx_bytes_limited + budget > 3 * conn.rx_bytes_total) break;
+            for (0..3) |sp| {
+                const pad = sp == 0 and !conn.addr_validated;
+                const n = quicBuildPacket(conn, sp, dbuf[total .. total + budget - total], budget - total, pad, false);
+                if (n > 0) total += n;
+            }
+            // PTO probe: nothing else to send but a probe is owed
+            if (total == 0 and conn.probe_pending) {
+                const n = quicBuildPacket(conn, if (conn.keys_tx[2].present) 2 else if (conn.keys_tx[1].present) 1 else 0, dbuf[0..budget], budget, false, true);
+                if (n > 0) total = n;
+            }
+            if (total == 0) break;
+            conn.probe_pending = false;
+            quicSendDgram(conn, dbuf[0..total]);
+            if (total < QUIC_MAX_DGRAM) break; // a short datagram drains the queue
+        }
+    }
+    quicSweepDead(lane);
+}
+
+fn quicSendDgram(conn: *QuicConn, bytes: []u8) void {
+    _ = posix.sendto(conn.lane.fd, bytes, 0, @ptrCast(&conn.peer), conn.peer_len) catch {};
+    conn.tx_bytes_limited += bytes.len;
+}
+
+fn quicSweepDead(lane: *QuicLane) void {
+    var dead: std.ArrayListUnmanaged(*QuicConn) = .{};
+    defer dead.deinit(pumpAlloc());
+    var it = lane.conns.iterator();
+    while (it.next()) |e| {
+        if (e.value_ptr.*.state == .dead) dead.append(pumpAlloc(), e.value_ptr.*) catch {};
+    }
+    for (dead.items) |conn| quicConnDestroy(conn);
+}
+
+// ── datagram ingress ─────────────────────────────────────────────────────────
+
+fn quicOnDgram(lane: *QuicLane, dgram: []u8, src: *const posix.sockaddr, src_len: posix.socklen_t) void {
+    if (dgram.len < 6) return;
+    if (dgram[0] & 0x80 == 0) {
+        // short header: DCID = our scid (8 bytes)
+        if (dgram.len < 1 + QUIC_SCID_LEN) return;
+        const key = std.mem.readInt(u64, dgram[1..9], .big);
+        const conn = lane.conns.get(key) orelse return;
+        conn.rx_bytes_total += dgram.len;
+        quicOnShort(conn, dgram);
+        return;
+    }
+    const version = std.mem.readInt(u32, dgram[1..5], .big);
+    var pos: usize = 5;
+    if (pos >= dgram.len) return;
+    const dcil: usize = dgram[pos];
+    pos += 1;
+    if (pos + dcil > dgram.len or pos + 1 > dgram.len) return;
+    const dcid = dgram[pos .. pos + dcil];
+    pos += dcil;
+    const scil: usize = dgram[pos];
+    pos += 1;
+    if (pos + scil > dgram.len) return;
+    const scid = dgram[pos .. pos + scil];
+    pos += scil;
+    if (version != QUIC_VERSION_1) {
+        // Version negotiation: only for long headers ≥1200 bytes
+        if (dgram.len >= 1200) {
+            var vn: [64]u8 = undefined;
+            vn[0] = 0xc0 | 0x7f;
+            @memset(vn[1..5], 0);
+            vn[5] = @intCast(scil);
+            @memcpy(vn[6 .. 6 + scil], scid);
+            vn[6 + scil] = @intCast(dcil);
+            @memcpy(vn[7 + scil .. 7 + scil + dcil], dcid);
+            std.mem.writeInt(u32, vn[7 + scil + dcil ..][0..4], QUIC_VERSION_1, .big);
+            _ = posix.sendto(lane.fd, vn[0 .. 11 + scil + dcil], 0, src, src_len) catch {};
+        }
+        return;
+    }
+    const ptype = (dgram[0] >> 4) & 3;
+    // conn lookup: DCID is either our scid or the client's original dcid
+    var conn: ?*QuicConn = null;
+    if (dcil == QUIC_SCID_LEN) conn = lane.conns.get(std.mem.readInt(u64, dcid[0..8], .big));
+    if (conn == null) conn = lane.odcid_map.get(dcidKey(dcid));
+    if (ptype == 0 and conn == null) {
+        // Initial → new connection
+        conn = quicConnCreate(lane, src, src_len, dcid, scid);
+        if (conn == null) return;
+    }
+    const qc = conn orelse return;
+    qc.rx_bytes_total += dgram.len;
+    // coalesced packet walk
+    var p: usize = 0;
+    while (p < dgram.len) {
+        const consumed = quicOnLongPacket(qc, dgram[p..]) orelse break;
+        p += consumed;
+    }
+}
+
+// Parse+decrypt one long-header packet (or short, same fn shape split below).
+fn quicOnLongPacket(conn: *QuicConn, buf: []u8) ?usize {
+    if (buf.len < 6 or buf[0] & 0x80 == 0) return null;
+    const version = std.mem.readInt(u32, buf[1..5], .big);
+    if (version != QUIC_VERSION_1) return null;
+    const ptype = (buf[0] >> 4) & 3;
+    if (ptype == 1 or ptype == 3) return null; // 0-RTT, Retry
+    const space: usize = if (ptype == 0) 0 else 1; // ptype 2 = handshake
+    var pos: usize = 5;
+    const dcil: usize = buf[pos];
+    pos += 1;
+    if (pos + dcil + 1 > buf.len) return null;
+    pos += dcil;
+    const scil: usize = buf[pos];
+    pos += 1;
+    if (pos + scil > buf.len) return null;
+    pos += scil;
+    if (space == 0) {
+        const tlen = qvGet(buf, &pos) orelse return null;
+        if (pos + tlen > buf.len) return null;
+        pos += @intCast(tlen);
+    }
+    const pay_len = qvGet(buf, &pos) orelse return null;
+    const pn_off = pos;
+    const total = pos + @as(usize, @intCast(pay_len));
+    if (total > buf.len) return null;
+    // No keys for this space (e.g. a stray Initial after we dropped initial
+    // keys): skip it but let coalesced siblings through.
+    const ks = &conn.keys_rx[space];
+    if (!ks.present) return total;
+    // header protection
+    if (pn_off + 4 + 16 > total) return null;
+    var sample: [16]u8 = undefined;
+    @memcpy(&sample, buf[pn_off + 4 .. pn_off + 20]);
+    const mask = hpMask(&ks.hp, &sample);
+    buf[0] ^= mask[0] & 0x0f;
+    const pnl: usize = @intCast((buf[0] & 3) + 1);
+    if (pn_off + pnl > total) return null;
+    for (0..pnl) |i| buf[pn_off + i] ^= mask[1 + i];
+    var wire: u64 = 0;
+    for (0..pnl) |i| wire = (wire << 8) | buf[pn_off + i];
+    const pn = pnExpand(wire, pnl, conn.rx_space[space].largest);
+    const hdr_len = pn_off + pnl;
+    const ct = buf[hdr_len..total];
+    if (ct.len < 16) return null;
+    var pt_buf: [1500]u8 = undefined;
+    const tag: *const [16]u8 = @ptrCast(ct[ct.len - 16 ..]);
+    const nonce = pnNonce(&ks.iv, pn);
+    AesGcm.decrypt(pt_buf[0 .. ct.len - 16], ct[0 .. ct.len - 16], tag.*, buf[0..hdr_len], nonce, ks.key) catch {
+        std.debug.print("quic: decrypt FAIL space={} pn={}\n", .{ space, pn });
+        return null;
+    };
+    quicRecordPn(conn, space, pn);
+    std.debug.print("quic: long pkt space={} pn={} len={}\n", .{ space, pn, ct.len });
+    quicOnFrames(conn, space, pn, pt_buf[0 .. ct.len - 16]);
+    return total;
+}
+
+fn quicOnShort(conn: *QuicConn, buf: []u8) void {
+    const space: usize = 2;
+    const ks = &conn.keys_rx[space];
+    if (!ks.present) return;
+    const pn_off = 1 + conn.scid.len;
+    if (buf.len < pn_off + 4 + 16) return;
+    var sample: [16]u8 = undefined;
+    @memcpy(&sample, buf[pn_off + 4 .. pn_off + 20]);
+    const mask = hpMask(&ks.hp, &sample);
+    buf[0] ^= mask[0] & 0x1f;
+    const kbit = buf[0] & 0x04;
+    const pnl: usize = @intCast((buf[0] & 3) + 1);
+    for (0..pnl) |i| buf[pn_off + i] ^= mask[1 + i];
+    var wire: u64 = 0;
+    for (0..pnl) |i| wire = (wire << 8) | buf[pn_off + i];
+    const pn = pnExpand(wire, pnl, conn.rx_space[space].largest);
+    const hdr_len = pn_off + pnl;
+    const ct = buf[hdr_len..];
+    if (ct.len < 16) return;
+    var pt_buf: [1500]u8 = undefined;
+    const tag: *const [16]u8 = @ptrCast(ct[ct.len - 16 ..]);
+    const nonce = pnNonce(&ks.iv, pn);
+    AesGcm.decrypt(pt_buf[0 .. ct.len - 16], ct[0 .. ct.len - 16], tag.*, buf[0..hdr_len], nonce, ks.key) catch {
+        std.debug.print("quic: 1rtt decrypt FAIL pn={}\n", .{pn});
+        return;
+    };
+    std.debug.print("quic: 1rtt pkt pn={} len={}\n", .{ pn, ct.len });
+    // Key-phase flip by the peer — we never initiate key updates, so a new
+    // phase is a protocol violation: close loudly.
+    if (kbit != conn.peer_kbit) {
+        quicClose(conn, 0x0e, false); // KEY_UPDATE_ERROR
+        return;
+    }
+    quicRecordPn(conn, space, pn);
+    quicOnFrames(conn, space, pn, pt_buf[0 .. ct.len - 16]);
+}
+
+// ── timers: PTO / loss detection / idle ─────────────────────────────────────
+
+fn quicPtoUs(conn: *QuicConn) i64 {
+    const srtt = if (conn.smoothed_rtt_us < 0) 333_000 else conn.smoothed_rtt_us;
+    const var4 = @max(4 * conn.rttvar_us, QUIC_K_GRANULARITY_US);
+    return srtt + var4 + @as(i64, @intCast(conn.peer_max_ack_delay)) * 1000;
+}
+
+fn quicMsUntilDue(lane: *QuicLane) i64 {
+    const now_ms = std.time.milliTimestamp();
+    const now_us = std.time.microTimestamp();
+    var best: i64 = std.math.maxInt(i64);
+    var it = lane.conns.iterator();
+    while (it.next()) |e| {
+        const conn = e.value_ptr.*;
+        var d: i64 = conn.idle_deadline_ms;
+        if (conn.state == .draining) d = @min(d, conn.draining_until_ms);
+        if (conn.loss_deadline_us > 0) d = @min(d, @divTrunc(conn.loss_deadline_us, 1000));
+        if (conn.pto_base_us > 0) {
+            const pto_us = conn.pto_base_us + (quicPtoUs(conn) << @intCast(@min(conn.pto_count, 20)));
+            d = @min(d, @divTrunc(pto_us, 1000));
+        }
+        var si = conn.streams.iterator();
+        while (si.next()) |se| {
+            const s = se.value_ptr.*;
+            if (s.park_until > 0) d = @min(d, s.park_until);
+        }
+        // any space with pending ack → wake soon (10ms)
+        for (0..3) |sp| {
+            if (conn.rx_space[sp].ack_pending) d = @min(d, now_ms + 5);
+        }
+        _ = now_us;
+        if (d < best) best = d;
+    }
+    if (best == std.math.maxInt(i64)) return best;
+    return @max(0, best - now_ms);
+}
+
+fn quicTick(lane: *QuicLane) void {
+    const now_us = std.time.microTimestamp();
+    const now_ms = std.time.milliTimestamp();
+    var it = lane.conns.iterator();
+    while (it.next()) |e| {
+        const conn = e.value_ptr.*;
+        if (conn.state == .dead) continue;
+        if (now_ms >= conn.idle_deadline_ms) {
+            conn.state = .dead;
+            continue;
+        }
+        // loss detection per space
+        for (0..3) |sp| {
+            quicDetectLoss(conn, sp, now_us);
+        }
+        // PTO: if unacked ack-eliciting exists and pto expired → probe
+        var any_eliciting = false;
+        for (0..3) |sp_chk| {
+            for (conn.tx_space[sp_chk].sent.items) |pkt| {
+                if (pkt.ack_eliciting) any_eliciting = true;
+            }
+        }
+        if (!any_eliciting) conn.pto_base_us = 0;
+        if (conn.pto_base_us > 0) {
+            const due = conn.pto_base_us + (quicPtoUs(conn) << @intCast(@min(conn.pto_count, 20)));
+            if (now_us >= due) {
+                conn.pto_count += 1;
+                conn.pto_base_us = now_us;
+                // probe: force retransmit of oldest unacked in the lowest space with any
+                for (0..3) |sp| {
+                    if (conn.tx_space[sp].sent.items.len > 0) {
+                        quicRequeueOldest(conn, sp);
+                        break;
+                    }
+                }
+                // ensure a packet goes out even if queues were empty
+                if (!conn.probe_pending) conn.probe_pending = true;
+            }
+        }
+    }
+    quicFlush(lane);
+}
+
+fn quicRequeueOldest(conn: *QuicConn, space: usize) void {
+    const sp = &conn.tx_space[space];
+    if (sp.sent.items.len == 0) return;
+    const p = &sp.sent.items[0];
+    for (p.frames.items) |f| quicRequeueFrame(conn, space, f);
+    p.time_us = 0;
+    conn.bytes_in_flight -|= p.size;
+    p.frames.deinit(conn.a());
+    _ = sp.sent.orderedRemove(0);
+}
+
+fn quicRequeueFrame(conn: *QuicConn, space: usize, f: QSentFrame) void {
+    const a = conn.a();
+    switch (f) {
+        .ack => conn.rx_space[space].ack_pending = true,
+        .crypto => |r| rangesAdd(&conn.ctx_retx[space], a, r.off, r.len),
+        .stream => |sf| {
+            if (quicStreamGet(conn, sf.id, false)) |s|
+                rangesAdd(&s.sb_retx, a, sf.off, sf.len + @intFromBool(sf.fin));
+        },
+        .handshake_done, .max_data, .max_stream_data, .max_streams_bidi, .max_streams_uni, .path_response, .reset_stream => quicCtrlQueue(conn, f),
+        .conn_close => |cc| conn.close_pending = .{ .conn_close = cc },
+        .ping => conn.probe_pending = true,
+    }
+}
+
+fn quicDetectLoss(conn: *QuicConn, space: usize, now_us: i64) void {
+    const sp = &conn.tx_space[space];
+    if (sp.sent.items.len == 0) return;
+    const srtt = if (conn.smoothed_rtt_us < 0) 333_000 else conn.smoothed_rtt_us;
+    const thresh_us = @divTrunc(9 * @max(conn.latest_rtt_us, srtt), 8) + QUIC_K_GRANULARITY_US;
+    const largest_acked = sp.largest_acked;
+    var i: usize = 0;
+    var lost_any = false;
+    while (i < sp.sent.items.len) {
+        const p = &sp.sent.items[i];
+        const pkt_lost = (largest_acked >= 0 and p.pn + QUIC_PKT_THRESH <= @as(u64, @intCast(largest_acked))) or
+            (p.time_us > 0 and p.time_us + thresh_us <= now_us);
+        if (pkt_lost) {
+            lost_any = true;
+            for (p.frames.items) |f| quicRequeueFrame(conn, space, f);
+            conn.bytes_in_flight -|= p.size;
+            p.frames.deinit(conn.a());
+            _ = sp.sent.orderedRemove(i);
+        } else i += 1;
+    }
+    if (lost_any) {
+        // congestion: enter recovery once per round trip
+        if (conn.recovery_start_us < now_us -| conn.smoothed_rtt_us or !conn.in_recovery) {
+            conn.in_recovery = true;
+            conn.recovery_start_us = now_us;
+            conn.ssthresh = @max(conn.cwnd / 2, 2 * QUIC_MAX_DGRAM);
+            conn.cwnd = conn.ssthresh;
+        }
+    }
+    // recompute deadlines — only ack-eliciting packets arm the PTO.
+    conn.pto_base_us = 0;
+    var earliest: i64 = 0;
+    for (0..3) |s| {
+        const tsp = &conn.tx_space[s];
+        for (tsp.sent.items) |pkt| {
+            if (pkt.ack_eliciting and pkt.time_us > 0) {
+                if (earliest == 0 or pkt.time_us < earliest) earliest = pkt.time_us;
+                break;
+            }
+        }
+    }
+    conn.pto_base_us = earliest;
+    conn.loss_deadline_us = if (earliest > 0) earliest + quicPtoUs(conn) else 0;
+}
+
+// ── response path: h3Reply mirrors h2Reply ──────────────────────────────────
+
+// QPACK-encode one field line: indexed static where an exact pair match
+// exists, else literal-with-name-reference against any static entry sharing
+// the name, else literal-with-literal-name.
+fn qpackEncodePair(out: []u8, name: []const u8, value: []const u8) usize {
+    var n: usize = 0;
+    // exact pair match → indexed static (T=1)
+    for (QPACK_STATIC, 0..) |e, i| {
+        if (std.mem.eql(u8, e.name, name) and std.mem.eql(u8, e.value, value)) {
+            if (i < 64) {
+                out[0] = 0x80 | 0x40 | @as(u8, @intCast(i));
+                return 1;
+            }
+            n += qvPutSlice(out, @as(u64, i));
+            out[0] |= 0xC0;
+            return n;
+        }
+    }
+    // name match → literal with name ref (01 N=0 T=1 idx(4+))
+    for (QPACK_STATIC, 0..) |e, i| {
+        if (std.mem.eql(u8, e.name, name)) {
+            if (i < 16) {
+                out[0] = 0x40 | 0x10 | @as(u8, @intCast(i));
+                n = 1;
+            } else {
+                n = qvPutSlice(out, @as(u64, i));
+                // rebuild: 4-bit prefix int with 0101xxxx first byte
+                out[0] = 0x50 | 0x0f;
+                var rest: [8]u8 = undefined;
+                const m = i - 15;
+                var v: u64 = m;
+                var k: usize = 0;
+                while (v >= 128) { rest[k] = @intCast((v & 0x7f) | 0x80); k += 1; v >>= 7; }
+                rest[k] = @intCast(v);
+                @memcpy(out[1 .. 1 + k + 1], rest[0 .. k + 1]);
+                n = 1 + k + 1;
+            }
+            n += h2EncodeStr(out[n..], value, false);
+            return n;
+        }
+    }
+    // literal name: 001 N=0 H=0 len(3+) name, H len(7+) value
+    if (name.len < 8) {
+        out[0] = 0x20 | @as(u8, @intCast(name.len));
+        n = 1;
+        @memcpy(out[1 .. 1 + name.len], name);
+        n += name.len;
+    } else {
+        var rest: [8]u8 = undefined;
+        var v = name.len - 7;
+        var k: usize = 0;
+        out[0] = 0x27;
+        while (v >= 128) { rest[k] = @intCast((v & 0x7f) | 0x80); k += 1; v >>= 7; }
+        rest[k] = @intCast(v);
+        @memcpy(out[1 .. 1 + k + 1], rest[0 .. k + 1]);
+        n = 1 + k + 1;
+        @memcpy(out[n .. n + name.len], name);
+        n += name.len;
+    }
+    n += h2EncodeStr(out[n..], value, false);
+    return n;
+}
+
+fn h3Reply(s: *QStream, x: *Exchange, head: []const u8, body: []const u8, delay_ms: i64) bool {
+    _ = x;
+    std.debug.print("quic: h3Reply stream={} body={}B\n", .{ s.id, body.len });
+    const conn = s.conn;
+    if (conn.state == .dead or conn.state == .draining) return false;
+    const a = conn.a();
+    s.sb.clearRetainingCapacity();
+    s.sb_hi = 0;
+    s.sb_retx.clearRetainingCapacity();
+    s.sb_acked.clearRetainingCapacity();
+    s.sb_fin = true;
+    // field section: RIC=0, base=0
+    var fs: std.ArrayListUnmanaged(u8) = .{};
+    defer fs.deinit(a);
+    fs.appendSlice(a, &[2]u8{ 0, 0 }) catch return false;
+    const status = if (head.len >= 12) head[9..12] else "200";
+    var ebuf: [256]u8 = undefined;
+    var en = qpackEncodePair(&ebuf, ":status", status);
+    fs.appendSlice(a, ebuf[0..en]) catch return false;
+    var cl_buf: [24]u8 = undefined;
+    const cl = std.fmt.bufPrint(&cl_buf, "{}", .{body.len}) catch "0";
+    en = qpackEncodePair(&ebuf, "content-length", cl);
+    fs.appendSlice(a, ebuf[0..en]) catch return false;
+    var ctype: []const u8 = "text/plain";
+    if (std.mem.indexOf(u8, head, "Content-Type: ")) |at| {
+        const vs = at + 14;
+        const ve = std.mem.indexOfScalarPos(u8, head, vs, '\r') orelse head.len;
+        ctype = head[vs..ve];
+    }
+    en = qpackEncodePair(&ebuf, "content-type", ctype);
+    fs.appendSlice(a, ebuf[0..en]) catch return false;
+    // HEADERS frame
+    s.sb.append(a, 0x01) catch return false;
+    qvPut(&s.sb, a, fs.items.len);
+    s.sb.appendSlice(a, fs.items) catch return false;
+    // one DATA frame header; payload follows contiguously
+    s.sb.append(a, 0x00) catch return false;
+    qvPut(&s.sb, a, body.len);
+    s.sb.appendSlice(a, body) catch return false;
+    if (delay_ms > 0) s.park_until = std.time.milliTimestamp() + delay_ms;
+    quicFlush(conn.lane);
+    return true;
+}
+
+// db-obligation fallback on h3: the park machinery is TCP-only — answer 503
+// exactly like the h1 dispatch does on a failed park.
+fn h3Reply503(s: *QStream) void {
+    const head = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
+    var x = Exchange{ .fd = 0, .raw = head };
+    _ = h3Reply(s, &x, head, "", 0);
+}
