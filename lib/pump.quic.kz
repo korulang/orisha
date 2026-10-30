@@ -840,8 +840,9 @@ fn quicStreamMaybeFree(conn: *QuicConn, s: *QStream) void {
     if (!(tx_done and rx_done)) return;
     if (conn.streams.remove(s.id)) {
         // reopening lower ids stays legal (RFC 9000 §3.2) — only explicitly
-        // freed seqs are barred, so record this one for the dup guard.
-        rangesAdd(&conn.bidi_closed, conn.a(), s.id >> 2, 1) catch {};
+        // freed seqs are barred, so record this one for the dup guard. An
+        // OOM here would silently disarm the guard — close instead.
+        rangesAdd(&conn.bidi_closed, conn.a(), s.id >> 2, 1) catch { quicClose(conn, 0x01, false); };
         quicStreamDestroy(conn, s);
     }
 }
@@ -1196,8 +1197,8 @@ fn quicOnStreamData(conn: *QuicConn, id: u64, off: u64, data: []const u8, fin: b
     // ids (&3==2? ours are 2,6,...) can't carry client data — ignore.
     if (id & 3 == 1 or id & 3 == 3) return; // server-initiated; client can't write
     // a retransmitted/duplicated frame for an already-freed bidi stream must
-    // not resurrect it — client ids are monotonic, so a missing entry with
-    // seq <= top means it was closed.
+    // not resurrect it — freed seqs are recorded in conn.bidi_closed, and a
+    // missing map entry on that list means it was closed.
     if (id & 3 == 0 and conn.streams.get(id) == null and
         rangesHas(&conn.bidi_closed, id >> 2)) {
         return;
@@ -2205,9 +2206,11 @@ fn h3Reply(s: *QStream, x: *Exchange, head: []const u8, body: []const u8, delay_
     _ = x;
     const conn = s.conn;
     if (conn.state == .dead or conn.state == .draining) return false;
-    // stream already reset by the peer (STOP_SENDING) or by us (R11),
-    // or gone from the map — replying would touch a closing/freed stream.
+    // stream already reset by the peer (STOP_SENDING) or by us (R11) —
+    // replying would touch a closing stream.
     if (s.reset or s.rst_acked) return false;
+    // consistency assert for an invariant (a stream in ready can't be
+    // freed): if this fires the invariant is broken, not just this reply.
     if (conn.streams.get(s.id) != s) return false;
     const a = conn.a();
     s.sb.clearRetainingCapacity();
