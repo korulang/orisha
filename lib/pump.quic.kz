@@ -1785,6 +1785,7 @@ fn quicEmitStreamFrame(out: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, i
 // ── datagram assembly + flush ────────────────────────────────────────────────
 
 fn quicFlush(lane: *QuicLane) void {
+    lane.flush_again = false;
     var it = lane.conns.iterator();
     const dbuf = &lane.dbuf;
     const now_ms = std.time.milliTimestamp();
@@ -1831,7 +1832,7 @@ fn quicFlush(lane: *QuicLane) void {
             // keep looping while the round produces packets — a sub-1200
             // datagram is normal (room reserves header slack), not a drain.
         }
-        lane.flush_again = guard >= 64;
+        lane.flush_again = lane.flush_again or guard >= 64;
     }
     quicSweepDead(lane);
 }
