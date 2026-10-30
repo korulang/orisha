@@ -396,6 +396,8 @@ const QRxSpace = struct {
     ranges: std.ArrayListUnmanaged(QRange) = .{}, // received pns, ascending
     largest: i64 = -1,
     ack_pending: bool = false,
+    newest_rx_us: i64 = 0, // when the largest-acked pn was received (ack_delay)
+    unacked_eliciting: u64 = 0, // ack-eliciting pkts since last ack sent
 };
 
 const QSentFrame = union(enum) {
@@ -531,6 +533,7 @@ const QuicConn = struct {
     peer_imsd_bl: u64 = 0, // our send limit on client's bidi (request) streams
     peer_imsd_uni: u64 = 0,
     peer_imsu: u64 = 0,
+    ack_due_now: bool = false,
     peer_max_ack_delay: u64 = 25,
     peer_ack_delay_exp: u64 = 3,
     peer_got_tp: bool = false,
@@ -977,7 +980,10 @@ fn quicRecordPn(conn: *QuicConn, space: usize, pn: u64) void {
     const rs = &conn.rx_space[space];
     if (rangesHas(&rs.ranges, pn)) return;
     rangesAdd(&rs.ranges, conn.a(), pn, 1) catch { quicClose(conn, 0x01, false); return; };
-    rs.largest = @max(rs.largest, @as(i64, @intCast(pn)));
+    if (pn > rs.largest) {
+        rs.largest = @intCast(pn);
+        rs.newest_rx_us = std.time.microTimestamp();
+    }
     if (space == 1) {
         conn.hs_pkt_seen = true;
         conn.addr_validated = true;
@@ -1123,7 +1129,14 @@ fn quicOnFrames(conn: *QuicConn, space: usize, pn: u64, bytes: []const u8) void 
             },
         }
     }
-    if (eliciting) conn.rx_space[space].ack_pending = true;
+    if (eliciting) {
+        const rs = &conn.rx_space[space];
+        rs.ack_pending = true;
+        // RFC 9000 §13.2.2: ack at least every 2nd ack-eliciting packet —
+        // the second marks the ack due NOW rather than the timer.
+        rs.unacked_eliciting += 1;
+        if (rs.unacked_eliciting >= 2) conn.ack_due_now = true;
+    }
     _ = a;
 }
 
@@ -1469,7 +1482,9 @@ fn emitAckFrame(out: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, rs: *QRx
     buf[0] = 0x02;
     fo = 1;
     fo += qvPutSlice(buf[fo..], largest);
-    fo += qvPutSlice(buf[fo..], 0); // ack delay
+    // real ack_delay, encoded with our advertised exponent 3
+    const delay_us = @max(0, std.time.microTimestamp() - rs.newest_rx_us);
+    fo += qvPutSlice(buf[fo..], @intCast(delay_us >> 3));
     fo += qvPutSlice(buf[fo..], emit_n - 1); // ack range count
     fo += qvPutSlice(buf[fo..], last.len - 1); // first ack range
     out.appendSlice(a, buf[0..fo]) catch return false;
@@ -1486,6 +1501,7 @@ fn emitAckFrame(out: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, rs: *QRx
         prev_off = r.off;
     }
     rs.ack_pending = false;
+    rs.unacked_eliciting = 0;
     return true;
 }
 
@@ -1767,6 +1783,7 @@ fn quicFlush(lane: *QuicLane) void {
             const budget: usize = @min(QUIC_MAX_DGRAM, conn.cwnd -| conn.bytes_in_flight);
             // anti-amplification: 3x received until the address validates
             if (!conn.addr_validated and conn.tx_bytes_limited + budget > 3 * conn.rx_bytes_total) break;
+            conn.ack_due_now = false;
             if (budget > 0) {
                 for (0..3) |sp| {
                     const pad = sp == 0 and !conn.addr_validated;
