@@ -16,6 +16,7 @@ const oss = if (HAS_OPENSSL) @import("root").koru_koru.koru_openssl.c else struc
 const QUIC_VERSION_1: u32 = 0x00000001;
 const QUIC_INITIAL_SALT = [20]u8{ 0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a };
 const QUIC_MAX_DGRAM: usize = 1200;
+const QUIC_PMTU_LADDER = [_]usize{ 1452, 9000, 16384, 32768, 65527 };
 const QUIC_IDLE_MS: i64 = 30_000;
 const QUIC_SCID_LEN: usize = 8;
 const QUIC_MAX_STREAMS_BIDI: u64 = 1024;
@@ -421,6 +422,7 @@ const QSentPacket = struct {
     size: usize = 0,
     ack_eliciting: bool = false,
     in_flight: bool = false,
+    pmtu_probe: bool = false,
     frames: std.ArrayListUnmanaged(QSentFrame) = .{},
 };
 
@@ -551,6 +553,12 @@ const QuicConn = struct {
     cwnd: usize = QUIC_CWND_INIT,
     ssthresh: usize = std.math.maxInt(usize),
     recovery_start_us: i64 = 0,
+    pmtu: usize = QUIC_MAX_DGRAM,
+    pmtu_idx: u8 = 0,
+    pmtu_probe_pn: i64 = -1,
+    pmtu_probe_size: usize = 0,
+    pmtu_probe_deadline_us: i64 = 0,
+    peer_max_udp: u64 = 65527,
     in_recovery: bool = false,
     bytes_in_flight: usize = 0,
     loss_deadline_us: i64 = 0,
@@ -586,6 +594,8 @@ pub const QuicLane = struct {
     ready: std.ArrayListUnmanaged(H3Ready) = .{},
     ready_head: usize = 0,
     rxbuf: [65536]u8 = undefined,
+    dbuf: [65536]u8 = undefined,
+    pt_buf: [65536]u8 = undefined,
     flush_again: bool = false,
 };
 
@@ -676,6 +686,7 @@ fn qtlsGotTransportParams(ssl: ?*oss.SSL, params: [*c]const u8, params_len: usiz
         const v = qvGet(buf[0 .. pos + @as(usize, @intCast(len))], &vp) orelse 0;
         switch (id) {
             0x01 => {},
+            0x03 => conn.peer_max_udp = v,
             0x04 => conn.peer_max_data = v,
             0x05 => conn.peer_imsd_bl = v,
             0x06 => {},
@@ -727,7 +738,7 @@ fn buildTransportParams(conn: *QuicConn, out: *std.ArrayListUnmanaged(u8)) error
     try out.appendSlice(a, conn.odcid[0..conn.odcid_len]);
     const ints = [_]struct { id: u64, v: u64 }{
         .{ .id = 0x01, .v = QUIC_IDLE_MS },
-        .{ .id = 0x03, .v = 1452 },
+        .{ .id = 0x03, .v = 65527 },
         .{ .id = 0x04, .v = conn.rx_max_data },
         .{ .id = 0x05, .v = QUIC_MAX_STREAM_DATA },
         .{ .id = 0x06, .v = QUIC_MAX_STREAM_DATA },
@@ -1163,6 +1174,11 @@ fn quicOnAck(conn: *QuicConn, space: usize, lo: u64, hi: u64) void {
                 conn.pto_count = 0;
             }
             if (p.in_flight) {
+                if (p.pmtu_probe) {
+                    conn.pmtu = @max(conn.pmtu, conn.pmtu_probe_size);
+                    conn.pmtu_idx +|= 1;
+                    conn.pmtu_probe_pn = -1;
+                }
                 conn.bytes_in_flight -|= p.size;
                 newly += p.size;
                 // RFC 9002 §7.4: recovery ends when a packet sent after
@@ -1768,7 +1784,7 @@ fn quicEmitStreamFrame(out: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, i
 
 fn quicFlush(lane: *QuicLane) void {
     var it = lane.conns.iterator();
-    var dbuf: [1600]u8 = undefined;
+    const dbuf = &lane.dbuf;
     const now_ms = std.time.milliTimestamp();
     while (it.next()) |e| {
         const conn = e.value_ptr.*;
@@ -1781,7 +1797,7 @@ fn quicFlush(lane: *QuicLane) void {
         while (guard < 64) : (guard += 1) {
             var total: usize = 0;
             // RFC 9002 §7.2: ack-eliciting sends gated on cwnd (probes exempt).
-            const budget: usize = @min(QUIC_MAX_DGRAM, conn.cwnd -| conn.bytes_in_flight);
+            const budget: usize = @min(conn.pmtu, conn.cwnd -| conn.bytes_in_flight);
             // anti-amplification: 3x received until the address validates
             if (!conn.addr_validated and conn.tx_bytes_limited + budget > 3 * conn.rx_bytes_total) break;
             conn.ack_due_now = false;
@@ -1796,7 +1812,7 @@ fn quicFlush(lane: *QuicLane) void {
             if (total == 0) {
                 for (0..3) |sp| {
                     if (conn.rx_space[sp].ack_pending) {
-                        const n = quicBuildPacket(conn, sp, dbuf[total..QUIC_MAX_DGRAM], QUIC_MAX_DGRAM - total, false, false, true);
+                        const n = quicBuildPacket(conn, sp, dbuf[total..conn.pmtu], conn.pmtu - total, false, false, true);
                         if (n > 0) total += n;
                         break;
                     }
@@ -1821,6 +1837,11 @@ fn quicFlush(lane: *QuicLane) void {
 fn quicSendDgram(conn: *QuicConn, bytes: []u8) bool {
     const n = posix.sendto(conn.lane.fd, bytes, 0, @ptrCast(&conn.peer), conn.peer_len) catch |e| switch (e) {
         error.WouldBlock => return false, // socket full — stop this flush round
+        error.MessageTooBig => {
+            // PMTU probe overshot the path — stop the climb, drop the probe.
+            if (conn.pmtu_probe_pn >= 0) { conn.pmtu_idx = 255; conn.pmtu_probe_pn = -1; }
+            return false;
+        },
         else => {
             std.debug.print("Pump: quic sendto failed: {s}\n", .{@errorName(e)});
             return false;
@@ -1947,7 +1968,7 @@ fn quicOnLongPacket(conn: *QuicConn, buf: []u8) ?usize {
     const hdr_len = pn_off + pnl;
     const ct = buf[hdr_len..total];
     if (ct.len < 16) return null;
-    var pt_buf: [1500]u8 = undefined;
+    const pt_buf = &conn.lane.pt_buf;
     if (ct.len - 16 > pt_buf.len) return null;
     const tag: *const [16]u8 = @ptrCast(ct[ct.len - 16 ..]);
     const nonce = pnNonce(&ks.iv, pn);
@@ -1978,7 +1999,7 @@ fn quicOnShort(conn: *QuicConn, buf: []u8) void {
     const hdr_len = pn_off + pnl;
     const ct = buf[hdr_len..];
     if (ct.len < 16) return;
-    var pt_buf: [1500]u8 = undefined;
+    const pt_buf = &conn.lane.pt_buf;
     if (ct.len - 16 > pt_buf.len) return;
     const tag: *const [16]u8 = @ptrCast(ct[ct.len - 16 ..]);
     const nonce = pnNonce(&ks.iv, pn);
@@ -2050,6 +2071,28 @@ fn quicTick(lane: *QuicLane) void {
         for (0..3) |sp| {
             quicDetectLoss(conn, sp, now_us);
         }
+        // DPLPMTUD (RFC 8899): one padded PING probe in flight, climbing
+        // toward the peer's max_udp_payload_size. Lost → stop, never cwnd.
+        if (conn.state == .app and conn.pmtu_idx < QUIC_PMTU_LADDER.len) {
+            if (conn.pmtu_probe_pn >= 0) {
+                if (now_us >= conn.pmtu_probe_deadline_us) {
+                    conn.pmtu_idx = 255;
+                    conn.pmtu_probe_pn = -1;
+                }
+            } else {
+                const want: usize = @min(QUIC_PMTU_LADDER[conn.pmtu_idx], @as(usize, @intCast(@min(conn.peer_max_udp, 65527))));
+                if (want <= conn.pmtu) conn.pmtu_idx = 255 else {
+                    const n = quicBuildPacket(conn, 2, lane.dbuf[0..want], want, true, true, false);
+                    if (n > 0 and quicSendDgram(conn, lane.dbuf[0..n])) {
+                        const rec = &conn.tx_space[2].sent.items[conn.tx_space[2].sent.items.len - 1];
+                        rec.pmtu_probe = true;
+                        conn.pmtu_probe_pn = @intCast(rec.pn);
+                        conn.pmtu_probe_size = n;
+                        conn.pmtu_probe_deadline_us = now_us + quicPtoUs(conn) + 1_000_000;
+                    }
+                }
+            }
+        }
         // PTO: if unacked ack-eliciting exists and pto expired → probe
         var any_eliciting = false;
         for (0..3) |sp_chk| {
@@ -2119,7 +2162,14 @@ fn quicDetectLoss(conn: *QuicConn, space: usize, now_us: i64) void {
         const older = largest_acked >= 0 and p.pn < @as(u64, @intCast(largest_acked));
         const pkt_lost = (largest_acked >= 0 and p.pn + QUIC_PKT_THRESH <= @as(u64, @intCast(largest_acked))) or
             (older and p.time_us > 0 and p.time_us + thresh_us <= now_us);
-        if (pkt_lost) {
+        if (pkt_lost and p.pmtu_probe) {
+            conn.pmtu_idx = 255;
+            conn.pmtu_probe_pn = -1;
+            conn.bytes_in_flight -|= p.size;
+            for (p.frames.items) |f| quicRequeueFrame(conn, space, f);
+            p.frames.deinit(conn.a());
+            _ = sp.sent.orderedRemove(i);
+        } else if (pkt_lost) {
             lost_any = true;
             for (p.frames.items) |f| quicRequeueFrame(conn, space, f);
             conn.bytes_in_flight -|= p.size;
