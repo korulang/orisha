@@ -5003,7 +5003,7 @@ fn workerCount() usize {
 
             while (true) {
                 var wait_ts: std.c.timespec = undefined;
-                var park_ms = $mod.parkMsUntilDue();
+                const park_ms = $mod.parkMsUntilDue();
                 const ts: ?*std.c.timespec = if (park_ms == std.math.maxInt(i64)) null else blk: {
                     wait_ts = .{ .sec = @intCast(@divTrunc(park_ms, 1000)), .nsec = @intCast(@mod(park_ms, 1000) * 1000000) };
                     break :blk &wait_ts;
@@ -5400,7 +5400,6 @@ fn workerCount() usize {
                 // Same rule as the kqueue wait: a parked conn's deadline
                 // is the latest this wait may sleep.
                 const park_ms = $mod.parkMsUntilDue();
-
                 const wait_ms: i32 = if (park_ms == std.math.maxInt(i64)) -1 else @intCast(@min(park_ms, std.math.maxInt(i32) - 1));
                 const n_rc = linux.epoll_wait(epfd, &events, $mod.MAX_EVENTS, wait_ms);
                 while ($mod.parkDue()) |pst| {
