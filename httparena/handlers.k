@@ -21,6 +21,7 @@ pub tor echo { req: *orisha:Request } -> orisha:Response
 pub tor grpc-sum { req: *orisha:Request } -> orisha:Response
 pub tor delay { req: *orisha:Request, ms: string } -> orisha:Response
 pub tor static-file { req: *orisha:Request, file: string } -> orisha:Response
+pub tor async-db { req: *orisha:Request } -> orisha:Response
 
 // The dataset's process-lifetime home. Each row is one item's wire view —
 // every byte the response carries except the request-scoped `total` — held
@@ -75,6 +76,10 @@ respond-gz -> { status: 200, body, content_type: "application/json", content_enc
 
 tor respond-error {} -> orisha:Response
 respond-error -> { status: 500, body: "internal error", content_type: "text/plain" }
+
+// pending_kind 5 — the items range query. min/max/limit are parsed off the
+// target at discharge; the handler owes the rows, it does not fake them.
+async-db -> { status: 200, body: "", content_type: "application/json", pending_kind: 5 }
 
 // a + b from the query string, plus a bare integer body when the request
 // carries one — GET sends no body, so `body` reads null and contributes 0.

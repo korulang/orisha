@@ -245,8 +245,15 @@ pub const ContentType = []const u8;
 // chained from a router branch (`-> my-handler(req)`) returns the SAME Zig type
 // as the abstract handler — anonymous struct outputs are nominally distinct in
 // Zig and a `return` would fail to unify despite identical fields.
+// An obligation a handler mints instead of a rendered response: "this
+// reply owes a database answer." `answer` surfaces it untouched onto the
+// Exchange; the pump's discharger (pgPark) settles it. The Koru async shape —
+// a branch carrying an obligation the runtime must discharge — spelled as
+// data: pending_kind 0 means no obligation, 1 one world row, 2 n world rows,
+// 3 n select+update pairs, 4 the fortune stream.
 pub const Response = struct {
     status: u16,
+    pending_kind: u8 = 0,
     body: []const u8,
     content_type: ?ContentType,
     content_encoding: ?ContentType = null,
@@ -424,6 +431,13 @@ fn pathKeyDecoded(allocator: std.mem.Allocator, without_query: []const u8) []con
 fn headValueParsed(head: ?*const koru_pump.Head, base: []const u8, name: []const u8) ?[]const u8 {
     const h = head orelse return headerValue(base, name);
     if (h.head_len == 0 or h.head_len > base.len) return headerValue(base, name);
+    // Field-captured headers answer without the pairs walk — nonzero off is
+    // the seen marker (offset 0 is the request line, never a header), so an
+    // empty value still returns empty rather than absent.
+    if (h.accept_encoding_off != 0 and std.ascii.eqlIgnoreCase(name, "accept-encoding"))
+        return base[h.accept_encoding_off..][0..h.accept_encoding_len];
+    if (h.if_none_match_off != 0 and std.ascii.eqlIgnoreCase(name, "if-none-match"))
+        return base[h.if_none_match_off..][0..h.if_none_match_len];
     for (h.pairs[0..h.pair_count]) |p| {
         if (std.ascii.eqlIgnoreCase(base[p.name_off..][0..p.name_len], name)) {
             return base[p.value_off..][0..p.value_len];
@@ -875,6 +889,12 @@ fn pageCachePut(key: u128, status: u16, content_type: ?[]const u8, content_encod
     // it back verbatim; it goes out as the head with no separate body. The
     // `wire` voucher says so up front and carries the splice offset, so a
     // compiler-rendered response skips the probe and the hole search alike.
+    // Pending obligation: the handler minted a debt instead of a response —
+    // surface it on the Exchange untouched; reply sees it and stages nothing.
+    if (res.pending_kind != 0) {
+        x.pending_kind = res.pending_kind;
+        return .{ .head = "", .body = "", .body_allocated = false, .date_hole = 0, .close = false, .head_static = false, .body_static = false, .delay_ms = 0 };
+    }
     if (res.wire) {
         return .{ .head = res.body, .body = "", .body_allocated = false, .date_hole = res.wire_date_hole, .close = res.close, .head_static = res.body_static, .body_static = false, .delay_ms = res.delay_ms };
     }

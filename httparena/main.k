@@ -21,6 +21,7 @@ orisha:handler = orisha:router(req)
 ! [POST /benchmark.BenchmarkService/GetSum] |> httparena/handlers:grpc-sum(req)
 ! [GET /delay/:ms] p |> httparena/handlers:delay(req, p.ms)
 ! [GET /static/:file] p |> httparena/handlers:static-file(req, p.file)
+! [GET /async-db] |> httparena/handlers:async-db(req)
 ! [*] -> { status: 404, body: "not found", content_type: "text/plain" }
 
 // echo-ws: every complete message the pump reassembles goes straight back,
