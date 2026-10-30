@@ -523,6 +523,7 @@ const QuicConn = struct {
     streams: std.AutoHashMapUnmanaged(u64, *QStream) = .{},
     next_uni_id: u64 = 3, // server-initiated uni stream ids: 3,7,11,... (initiator bit + uni bit)
     streams_bidi_top: i64 = -1, // highest client bidi id opened
+    bidi_closed: std.ArrayListUnmanaged(QRange) = .{}, // freed bidi seqs — late dups must not resurrect
     streams_bidi_credit: u64 = QUIC_MAX_STREAMS_BIDI,
     streams_bidi_done: u64 = 0,
     // peer limits (their transport params)
@@ -832,11 +833,17 @@ fn quicPurgeReady(lane: *QuicLane, conn: *QuicConn) void {
 // A request stream's resources are reclaimable once the send side is fully
 // acked (data + FIN) and the receive side is done (FIN seen or reset).
 fn quicStreamMaybeFree(conn: *QuicConn, s: *QStream) void {
-    if (s.stype != -2 or !s.sb_fin) return;
+    if (s.stype != -2) return;
+    if (!s.sb_fin and !s.rst_acked) return;
     const tx_done = s.rst_acked or rangesContig(&s.sb_acked) >= s.sb.items.len + 1;
     const rx_done = s.rx_fin_off != null or s.rx_dead or s.reset;
     if (!(tx_done and rx_done)) return;
-    if (conn.streams.remove(s.id)) quicStreamDestroy(conn, s);
+    if (conn.streams.remove(s.id)) {
+        // reopening lower ids stays legal (RFC 9000 §3.2) — only explicitly
+        // freed seqs are barred, so record this one for the dup guard.
+        rangesAdd(&conn.bidi_closed, conn.a(), s.id >> 2, 1) catch {};
+        quicStreamDestroy(conn, s);
+    }
 }
 
 fn quicConnDestroy(conn: *QuicConn) void {
@@ -856,6 +863,7 @@ fn quicConnDestroy(conn: *QuicConn) void {
         conn.ctx_retx[i].deinit(a);
     }
     conn.ctrl_q.deinit(a);
+    conn.bidi_closed.deinit(a);
     conn.tp_buf.deinit(a);
     conn.huff.deinit(a);
     _ = conn.lane.conns.remove(conn.scid_key);
@@ -1191,7 +1199,7 @@ fn quicOnStreamData(conn: *QuicConn, id: u64, off: u64, data: []const u8, fin: b
     // not resurrect it — client ids are monotonic, so a missing entry with
     // seq <= top means it was closed.
     if (id & 3 == 0 and conn.streams.get(id) == null and
-        @as(i64, @intCast(id >> 2)) <= conn.streams_bidi_top) {
+        rangesHas(&conn.bidi_closed, id >> 2)) {
         return;
     }
     const s = quicStreamGet(conn, id, true) orelse return;
@@ -2197,6 +2205,10 @@ fn h3Reply(s: *QStream, x: *Exchange, head: []const u8, body: []const u8, delay_
     _ = x;
     const conn = s.conn;
     if (conn.state == .dead or conn.state == .draining) return false;
+    // stream already reset by the peer (STOP_SENDING) or by us (R11),
+    // or gone from the map — replying would touch a closing/freed stream.
+    if (s.reset or s.rst_acked) return false;
+    if (conn.streams.get(s.id) != s) return false;
     const a = conn.a();
     s.sb.clearRetainingCapacity();
     s.sb_hi = 0;
