@@ -914,7 +914,10 @@ const PgConn = struct {
         while (true) {
             readMsg(fd, &hdr, &mbuf, &mlen) catch return pg;
             if (hdr[0] == 'Z') break;
-            if (hdr[0] == 'E') return pg; // auth/config error — dead conn
+            if (hdr[0] == 'E') {
+                $mod.posix.close(fd);
+                return null;
+            }
             if (hdr[0] == 'R' and !authed) {
                 const at = std.mem.readInt(u32, mbuf[0..4], .big);
                 if (at == 10) {
@@ -932,60 +935,45 @@ const PgConn = struct {
                 }
             }
         }
-        // prepare s1 — no Describe, the row shape is compile-time known
-        const stmt = "s1";
-        const sql = "SELECT id, randomNumber FROM world WHERE id = $1";
-        const stmt2 = "s2";
-        const sql2 = "UPDATE world SET randomNumber = $2 WHERE id = $1 RETURNING id, randomNumber";
-        const stmt3 = "s3";
-        const sql3 = "SELECT id, message FROM fortune";
+        // Prepare the four statements one Parse+Sync each — extended protocol
+        // skips everything up to Sync on error, so a batch makes one missing
+        // relation starve every later stmt. Isolated, each gets its own 'Z'.
+        // 'E' during the drain is logged, never fatal — an entry simply
+        // doesn't bind a stmt its schema lacks.
+        const stmts = .{
+            .{ "s1", "SELECT id, randomNumber FROM world WHERE id = $1" },
+            .{ "s2", "UPDATE world SET randomNumber = $2 WHERE id = $1 RETURNING id, randomNumber" },
+            .{ "s3", "SELECT id, message FROM fortune" },
+            // s4 — the arena's async-db contract: items range query, three
+            // int params, wide row (9 cols, JSONB + bool included).
+            .{ "s4", "SELECT id, name, category, price, quantity, active, tags, rating_score, rating_count FROM items WHERE price BETWEEN $1 AND $2 LIMIT $3" },
+        };
         var pp: std.ArrayListUnmanaged(u8) = .{};
         defer pp.deinit(a);
-        pp.appendSlice(a, stmt) catch return pg;
-        pp.append(a, 0) catch return pg;
-        pp.appendSlice(a, sql) catch return pg;
-        pp.append(a, 0) catch return pg;
-        put16(&pp, a, 0) catch return pg;
-        frame(&pg.tx, a, 'P', pp.items) catch return pg;
-        pp.clearRetainingCapacity();
-        pp.appendSlice(a, stmt2) catch return pg;
-        pp.append(a, 0) catch return pg;
-        pp.appendSlice(a, sql2) catch return pg;
-        pp.append(a, 0) catch return pg;
-        put16(&pp, a, 0) catch return pg;
-        frame(&pg.tx, a, 'P', pp.items) catch return pg;
-        pp.clearRetainingCapacity();
-        pp.appendSlice(a, stmt3) catch return pg;
-        pp.append(a, 0) catch return pg;
-        pp.appendSlice(a, sql3) catch return pg;
-        pp.append(a, 0) catch return pg;
-        put16(&pp, a, 0) catch return pg;
-        frame(&pg.tx, a, 'P', pp.items) catch return pg;
-        pp.clearRetainingCapacity();
-        // s4 — the arena's async-db contract: items range query, three int
-        // params, wide row (9 cols, JSONB + bool included).
-        const stmt4 = "s4";
-        const sql4 = "SELECT id, name, category, price, quantity, active, tags, rating_score, rating_count FROM items WHERE price BETWEEN $1 AND $2 LIMIT $3";
-        pp.appendSlice(a, stmt4) catch return pg;
-        pp.append(a, 0) catch return pg;
-        pp.appendSlice(a, sql4) catch return pg;
-        pp.append(a, 0) catch return pg;
-        put16(&pp, a, 0) catch return pg;
-        frame(&pg.tx, a, 'P', pp.items) catch return pg;
-        frame(&pg.tx, a, 'S', "") catch return pg;
-        sendAll(fd, pg.tx.items) catch return pg;
-        pg.tx.clearRetainingCapacity();
-        while (true) {
-            readFull(fd, &hdr) catch return pg;
-            const len = std.mem.readInt(u32, hdr[1..5], .big) - 4;
-            var buf: [1024]u8 = undefined;
-            readFull(fd, buf[0..@min(len, 1024)]) catch return pg;
-            var skip: usize = @min(len, 1024);
-            while (skip < len) : (skip += 1024) {
-                readFull(fd, buf[0..@min(len - skip, 1024)]) catch return pg;
+        inline for (stmts) |s| {
+            pp.appendSlice(a, s[0]) catch return pg;
+            pp.append(a, 0) catch return pg;
+            pp.appendSlice(a, s[1]) catch return pg;
+            pp.append(a, 0) catch return pg;
+            put16(&pp, a, 0) catch return pg;
+            frame(&pg.tx, a, 'P', pp.items) catch return pg;
+            pp.clearRetainingCapacity();
+            frame(&pg.tx, a, 'S', "") catch return pg;
+            sendAll(fd, pg.tx.items) catch return pg;
+            pg.tx.clearRetainingCapacity();
+            while (true) {
+                readFull(fd, &hdr) catch return pg;
+                const len = std.mem.readInt(u32, hdr[1..5], .big) - 4;
+                var buf: [1024]u8 = undefined;
+                readFull(fd, buf[0..@min(len, 1024)]) catch return pg;
+                var skip: usize = @min(len, 1024);
+                while (skip < len) : (skip += 1024) {
+                    readFull(fd, buf[0..@min(len - skip, 1024)]) catch return pg;
+                }
+                if (hdr[0] == 'Z') break;
+                if (hdr[0] == 'E')
+                    std.debug.print("Pump: pg prepare {s} rejected by server\n", .{s[0]});
             }
-            if (hdr[0] == 'Z') break;
-            if (hdr[0] == 'E') return pg;
         }
         // nonblocking from here on — the ring polls readability; reads
         // must not block a worker.
@@ -6037,6 +6025,10 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
 
         fn handleCqe(w: *@This(), cqe: linux.io_uring_cqe) void {
             const ud = cqe.user_data;
+            if (ud <= $mod.URING_PG and ud > $mod.URING_PG - $mod.PG_POOL) {
+                w.pgReadCqe(cqe);
+                return;
+            }
             if (ud == $mod.URING_ACCEPT or ud == $mod.URING_ACCEPT_TLS or ud == $mod.URING_ACCEPT_H2C or ud == $mod.URING_ACCEPT_H2TLS) {
                 const is_tls = ud == $mod.URING_ACCEPT_TLS;
                 const is_h2c = ud == $mod.URING_ACCEPT_H2C;
@@ -6473,7 +6465,6 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
         // ConnState.buf borrows carry today. Returns bytes consumed; a dying
         // conn sets st.ring_dead rather than reporting it out of band.
         fn dispatchHttpSlice(w: *@This(), st: *$mod.ConnState, bytes: []const u8) usize {
-            _ = w;
             if (!st.preface_checked) {
                 switch ($mod.h2cSniffPreface(bytes)) {
                     .h2c => { st.mode = .h2c; st.preface_checked = true; },
@@ -6505,12 +6496,52 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
             var alive = true;
             var head_pairs: [$mod.HEAD_PAIRS_MAX]$mod.HeadPair = undefined;
             while (consumed < bytes.len) {
+                // A parked db obligation holds FIFO order — the scan stops
+                // while an earlier request waits on the pool.
+                if (st.pg_pending > 0) break;
                 var head: $mod.Head = .{ .pairs = &head_pairs };
                 const take = $mod.scanRequest(bytes[consumed..], &head) orelse break;
                 var exchange = $mod.Exchange{ .fd = st.fd, .st = st, .raw = bytes[consumed .. consumed + take], .head = &head };
                 if (head.wants_close) exchange.keep_alive = false;
                 arrived(&exchange);
                 consumed += take;
+                // Discharge: the handler answered with an obligation, not a
+                // response — the pg pool settles it now. A failed park stages
+                // an honest 503, never a drop.
+                if (exchange.pending_kind != 0) {
+                    const t_off = head.target_off;
+                    const target = exchange.raw[t_off .. t_off + head.target_len];
+                    var n: u32 = 1;
+                    if (std.mem.indexOf(u8, target, "queries=")) |qi| {
+                        var e = qi + 8;
+                        var v: u32 = 0;
+                        var any = false;
+                        while (e < target.len and target[e] >= '0' and target[e] <= '9') : (e += 1) {
+                            v = v * 10 + (target[e] - '0');
+                            any = true;
+                        }
+                        if (any) n = @min(@max(v, 1), 500);
+                    }
+                    const mn = $mod.qparamU32(target, "min=") orelse 10;
+                    const mx = $mod.qparamU32(target, "max=") orelse 50;
+                    const lim = @min(@max($mod.qparamU32(target, "limit=") orelse 50, 1), 50);
+                    const parked = switch (exchange.pending_kind) {
+                        1 => w.pgPark(st, 1, false, false),
+                        2 => w.pgPark(st, n, true, false),
+                        3 => w.pgPark(st, n, true, true),
+                        4 => w.pgParkFortunes(st),
+                        5 => w.pgParkItems(st, mn, mx, lim),
+                        else => false,
+                    };
+                    exchange.pending_kind = 0;
+                    if (!parked) {
+                        const unavailable = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
+                        st.pending.appendSlice($mod.pumpAlloc(), unavailable) catch {};
+                        w.advance(st);
+                    }
+                    if (!exchange.keep_alive) alive = false;
+                    break;
+                }
                 if (!exchange.keep_alive) {
                     alive = false;
                     break;
@@ -6519,6 +6550,332 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
             st.batching = false;
             if (!alive) st.ring_dead = true;
             return consumed;
+        }
+
+
+        // The conn's next response is a db row — the exchange parks here:
+        // its bind joins the worker's batched tx and the conn waits for
+        // PG_READ. id is a fresh world row per request.
+        fn pgPick(w: *@This()) ?*$mod.PgConn {
+            var k: usize = 0;
+            while (k < $mod.PG_POOL) : (k += 1) {
+                w.pg_rr = (w.pg_rr + 1) % $mod.PG_POOL;
+                if (w.pg[w.pg_rr]) |pg| return pg;
+            }
+            return null;
+        }
+
+        // false = no conn / no room — the caller falls through to arrived()
+        // so the request gets a real response rather than a silent park.
+        fn pgPark(w: *@This(), st: *$mod.ConnState, n: u32, wrap_array: bool, update: bool) bool {
+            const pg = w.pgPick() orelse return false;
+            const a = $mod.pumpAlloc();
+            var wt: $mod.PgWaiter = .{ .st = st, .expected = n, .kind = if (wrap_array) 1 else 0 };
+            if (wrap_array) wt.buf.append(a, '[') catch return false;
+            if (update) { wt.kind = 3; wt.expected = 2 * n; }
+            // waiter lands BEFORE the binds — a bind never outlives its
+            // response path.
+            pg.waiters.append(a, wt) catch return false;
+            st.pg_pending += wt.expected;
+            var i: u32 = 0;
+            while (i < n) : (i += 1) {
+                const id = std.crypto.random.intRangeAtMost(u32, 1, 10000);
+                if (update) {
+                    // TFB counts statements: a real read AND a real write
+                    // per row — SELECT then UPDATE...RETURNING.
+                    const rn = std.crypto.random.intRangeAtMost(u32, 1, 10000);
+                    pg.bindExec(id);
+                    pg.bindExecUpdate(id, rn);
+                } else {
+                    pg.bindExec(id);
+                }
+            }
+            return true;
+        }
+
+        // /fortunes parks unbounded — the whole table streams until 'C'.
+        fn pgParkFortunes(w: *@This(), st: *$mod.ConnState) bool {
+            const pg = w.pgPick() orelse return false;
+            const wt: $mod.PgWaiter = .{ .st = st, .expected = 0, .kind = 2 };
+            pg.waiters.append($mod.pumpAlloc(), wt) catch return false;
+            st.pg_pending = 1;
+            pg.bindExecFortune();
+            return true;
+        }
+
+        // /async-db parks the same way — one range query, unknown row count,
+        // settles on CommandComplete so an empty range answers count 0.
+        fn pgParkItems(w: *@This(), st: *$mod.ConnState, mn: u32, mx: u32, lim: u32) bool {
+            const pg = w.pgPick() orelse return false;
+            const wt: $mod.PgWaiter = .{ .st = st, .expected = 0, .kind = 5 };
+            pg.waiters.append($mod.pumpAlloc(), wt) catch return false;
+            st.pg_pending = 1;
+            pg.bindExecItems(mn, mx, lim);
+            return true;
+        }
+
+        // fortunes: buf holds id\x01msg\x02 records — parse, append the
+        // extra fortune, sort by message, render the TFB table.
+        fn renderFortunes(w: *@This(), recs: []const u8) []const u8 {
+            const a = $mod.pumpAlloc();
+            const P = struct { id: []const u8, msg: []const u8 };
+            var rows: [64]P = undefined;
+            var n: usize = 0;
+            var i: usize = 0;
+            while (i < recs.len and n < 64) {
+                const s1 = std.mem.indexOfScalarPos(u8, recs, i, 1) orelse break;
+                const s2 = std.mem.indexOfScalarPos(u8, recs, s1 + 1, 2) orelse break;
+                rows[n] = .{ .id = recs[i..s1], .msg = recs[s1 + 1 .. s2] };
+                n += 1;
+                i = s2 + 1;
+            }
+            rows[n] = .{ .id = "0", .msg = "Additional fortune added at request time." };
+            n += 1;
+            std.mem.sort(P, rows[0..n], {}, struct {
+                fn lt(_: void, x: P, y: P) bool {
+                    return std.mem.order(u8, x.msg, y.msg) == .lt;
+                }
+            }.lt);
+            var out: std.ArrayListUnmanaged(u8) = .{};
+            out.appendSlice(a, "<!DOCTYPE html><html><head><title>Fortunes</title></head><body><table><tr><th>id</th><th>message</th></tr>") catch return "";
+            for (rows[0..n]) |r| {
+                out.appendSlice(a, "<tr><td>") catch {};
+                out.appendSlice(a, r.id) catch {};
+                out.appendSlice(a, "</td><td>") catch {};
+                for (r.msg) |ch| {
+                    switch (ch) {
+                        '&' => out.appendSlice(a, "&amp;") catch {},
+                        '<' => out.appendSlice(a, "&lt;") catch {},
+                        '>' => out.appendSlice(a, "&gt;") catch {},
+                        '"' => out.appendSlice(a, "&quot;") catch {},
+                        '\'' => out.appendSlice(a, "&#39;") catch {},
+                        else => out.append(a, ch) catch {},
+                    }
+                }
+                out.appendSlice(a, "</td></tr>") catch {};
+            }
+            out.appendSlice(a, "</table></body></html>") catch {};
+            _ = w;
+            return out.items;
+        }
+
+        fn pgRespondHtml(w: *@This(), st: *$mod.ConnState, body: []const u8) void {
+            var hb: [256]u8 = undefined;
+            const dl = @import("root").koru_orisha.httpDateLine();
+            const a = $mod.pumpAlloc();
+            const hdrs = std.fmt.bufPrint(&hb,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html; charset=utf-8\r\nServer: koru-orisha\r\n{s}\r\n",
+                .{ body.len, dl[0..] }) catch return;
+            st.pending.appendSlice(a, hdrs) catch {
+                w.teardown(st);
+                return;
+            };
+            st.pending.appendSlice(a, body) catch {
+                w.teardown(st);
+                return;
+            };
+            w.advance(st);
+            if (st.pg_pending == 0 and st.len > 0 and !st.ring_dead) {
+                w.dispatchReadable(st);
+            }
+            w.advance(st);
+        }
+
+        // PG_READ: drain response frames; each DataRow completes the front
+        // waiter's exchange — stage its response, resume its tail scan.
+        fn pgReadCqe(w: *@This(), cqe: linux.io_uring_cqe) void {
+            const pg = w.pg[@intCast($mod.URING_PG - cqe.user_data)] orelse return;
+            if (cqe.res <= 0) {
+                // Lost the db conn — every parked exchange fails out.
+                while (pg.waiters.items.len > 0) {
+                    var rm = pg.waiters.orderedRemove(0);
+                    rm.st.pg_pending = 0;
+                    rm.buf.deinit($mod.pumpAlloc());
+                    w.teardown(rm.st);
+                }
+                pg.pending_binds = 0;
+                _ = w.ring.poll_add(cqe.user_data, pg.fd, linux.POLL.IN) catch {};
+                return;
+            }
+            // poll says readable — drain to EAGAIN
+            while (true) {
+                const n = $mod.posix.read(pg.fd, pg.rx[pg.rx_len..]) catch |e| switch (e) {
+                    error.WouldBlock => 0,
+                    else => 0,
+                };
+                if (n == 0) break;
+                pg.rx_len += n;
+            }
+            while (true) {
+                if (pg.msg_rem > 0) {
+                    if (pg.rx_pos + pg.msg_rem <= pg.rx_len) {
+                        pg.rx_pos += pg.msg_rem; pg.msg_rem = 0;
+                    } else {
+                        const avail = pg.rx_len - pg.rx_pos;
+                        pg.rx_pos += avail; pg.msg_rem -= @intCast(avail);
+                        break;
+                    }
+                }
+                if (pg.rx_len - pg.rx_pos < 5) break;
+                const t = pg.rx[pg.rx_pos];
+                const mlen = std.mem.readInt(u32, pg.rx[pg.rx_pos + 1 ..][0..4], .big) - 4;
+                if (pg.rx_len - (pg.rx_pos + 5) < mlen) break;
+                pg.rx_pos += 5;
+                if (t == 'D') {
+                    // cols captured positionally — text protocol, raw slices.
+                    // items rows are 9 wide; world/fortune rows use cols 0..2.
+                    const ncols = std.mem.readInt(u16, pg.rx[pg.rx_pos..][0..2], .big);
+                    var o = pg.rx_pos + 2;
+                    var cols: [9][]const u8 = .{ "0", "", "", "0", "0", "f", "[]", "0", "0" };
+                    var ci: usize = 0;
+                    while (ci < ncols) : (ci += 1) {
+                        const fl = std.mem.readInt(u32, pg.rx[o..][0..4], .big);
+                        o += 4;
+                        if (fl == 0xFFFFFFFF) {
+                            if (ci < 9) cols[ci] = "";
+                            continue;
+                        }
+                        if (ci < 9) cols[ci] = pg.rx[o .. o + fl];
+                        o += fl;
+                    }
+                    const id_s = cols[0];
+                    const rn_s = cols[1];
+                    pg.rx_pos += mlen;
+                    if (pg.waiters.items.len > 0) {
+                        const a = $mod.pumpAlloc();
+                        const wt = &pg.waiters.items[0];
+                        if (wt.kind == 2) {
+                            // fortune: id \x01 msg \x02 record
+                            wt.buf.appendSlice(a, id_s) catch {};
+                            wt.buf.append(a, 1) catch {};
+                            wt.buf.appendSlice(a, rn_s) catch {};
+                            wt.buf.append(a, 2) catch {};
+                        } else if (wt.kind == 3) {
+                            // updates: SELECT row, then UPDATE...RETURNING —
+                            // emit only the post-write row.
+                            wt.seen += 1;
+                            if (wt.seen & 1 == 0)
+                                wt.buf.print(a, "{{\"id\":{s},\"randomNumber\":{s}}},", .{ id_s, rn_s }) catch {};
+                        } else if (wt.kind == 5) {
+                            // items row: 9 cols → nested rating, bool, jsonb
+                            // passthrough, escaped text.
+                            wt.seen += 1;
+                            wt.buf.appendSlice(a, "{\"id\":") catch {};
+                            wt.buf.appendSlice(a, cols[0]) catch {};
+                            wt.buf.appendSlice(a, ",\"name\":\"") catch {};
+                            $mod.jsonEsc(a, &wt.buf, cols[1]);
+                            wt.buf.appendSlice(a, "\",\"category\":\"") catch {};
+                            $mod.jsonEsc(a, &wt.buf, cols[2]);
+                            wt.buf.appendSlice(a, "\",\"price\":") catch {};
+                            wt.buf.appendSlice(a, cols[3]) catch {};
+                            wt.buf.appendSlice(a, ",\"quantity\":") catch {};
+                            wt.buf.appendSlice(a, cols[4]) catch {};
+                            wt.buf.appendSlice(a, ",\"active\":") catch {};
+                            wt.buf.appendSlice(a, if (cols[5].len > 0 and cols[5][0] == 't') "true" else "false") catch {};
+                            wt.buf.appendSlice(a, ",\"tags\":") catch {};
+                            wt.buf.appendSlice(a, cols[6]) catch {};
+                            wt.buf.appendSlice(a, ",\"rating\":{\"score\":") catch {};
+                            wt.buf.appendSlice(a, cols[7]) catch {};
+                            wt.buf.appendSlice(a, ",\"count\":") catch {};
+                            wt.buf.appendSlice(a, cols[8]) catch {};
+                            wt.buf.appendSlice(a, "}},") catch {};
+                        } else {
+                            wt.buf.print(a, "{{\"id\":{s},\"randomNumber\":{s}}},", .{ id_s, rn_s }) catch {};
+                        }
+                        wt.st.pg_pending -|= 1;
+                        if (wt.expected > 0) {
+                            wt.expected -= 1;
+                            if (wt.expected == 0) {
+                                var done = pg.waiters.orderedRemove(0);
+                                if (done.buf.items.len > 0 and done.buf.items[done.buf.items.len - 1] == ',')
+                                    done.buf.items.len -= 1;
+                                if (done.kind == 1 or done.kind == 3) done.buf.append(a, ']') catch {};
+                                w.pgRespond(done.st, done.buf.items);
+                                done.buf.deinit(a);
+                            }
+                        }
+                    }
+                } else if (t == 'C') {
+                    pg.rx_pos += mlen;
+                    pg.pending_binds -|= 1;
+                    if (pg.waiters.items.len > 0 and pg.waiters.items[0].kind == 2) {
+                        const a = $mod.pumpAlloc();
+                        var done = pg.waiters.orderedRemove(0);
+                        done.st.pg_pending = 0;
+                        const html = w.renderFortunes(done.buf.items);
+                        done.buf.deinit(a);
+                        w.pgRespondHtml(done.st, html);
+                    } else if (pg.waiters.items.len > 0 and pg.waiters.items[0].kind == 5) {
+                        const a = $mod.pumpAlloc();
+                        var done = pg.waiters.orderedRemove(0);
+                        done.st.pg_pending = 0;
+                        var out: std.ArrayListUnmanaged(u8) = .{};
+                        defer out.deinit(a);
+                        out.print(a, "{{\"count\":{},\"items\":[", .{done.seen}) catch {};
+                        out.appendSlice(a, done.buf.items) catch {};
+                        if (out.items.len > 0 and out.items[out.items.len - 1] == ',')
+                            out.items.len -= 1;
+                        out.appendSlice(a, "]}") catch {};
+                        done.buf.deinit(a);
+                        w.pgRespond(done.st, out.items);
+                    }
+                } else if (t == 'Z') {
+                    pg.rx_pos += mlen;
+                    // ReadyForQuery after an ErrorResponse settles nothing a
+                    // 'C' would — a still-parked waiter is an errored query.
+                    // Pop it and answer 500 so the conn never hangs.
+                    if (pg.waiters.items.len > 0) {
+                        const a = $mod.pumpAlloc();
+                        var done = pg.waiters.orderedRemove(0);
+                        done.st.pg_pending = 0;
+                        pg.pending_binds -|= 1;
+                        done.buf.deinit(a);
+                        const unavailable = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
+                        done.st.pending.appendSlice(a, unavailable) catch {
+                            w.teardown(done.st);
+                            continue;
+                        };
+                        w.advance(done.st);
+                        if (done.st.len > 0 and !done.st.ring_dead)
+                            w.dispatchReadable(done.st);
+                    }
+                } else {
+                    pg.rx_pos += mlen;
+                }
+            }
+            if (pg.rx_pos > 0) {
+                std.mem.copyForwards(u8, pg.rx[0..], pg.rx[pg.rx_pos..pg.rx_len]);
+                pg.rx_len -= pg.rx_pos;
+                pg.rx_pos = 0;
+            }
+            _ = w.ring.poll_add(cqe.user_data, pg.fd, linux.POLL.IN) catch {};
+        }
+
+        // The row resolved — stage the world JSON as the parked exchange's
+        // wire response, then resume the conn's queued requests.
+        fn pgRespond(w: *@This(), st: *$mod.ConnState, body: []const u8) void {
+            // headers into a small stack buf; body appends straight into
+            // pending — a 500-row array is ~20KB and must not bounce off a
+            // fixed stage buffer.
+            var hb: [256]u8 = undefined;
+            const dl = @import("root").koru_orisha.httpDateLine();
+            const a = $mod.pumpAlloc();
+            const hdrs = std.fmt.bufPrint(&hb,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nServer: koru-orisha\r\n{s}\r\n",
+                .{ body.len, dl[0..] }) catch return;
+            st.pending.appendSlice(a, hdrs) catch {
+                w.teardown(st);
+                return;
+            };
+            st.pending.appendSlice(a, body) catch {
+                w.teardown(st);
+                return;
+            };
+            w.advance(st);
+            if (st.pg_pending == 0 and st.len > 0 and !st.ring_dead) {
+                w.dispatchReadable(st);
+            }
+            w.advance(st);
         }
 
         fn run(port_: u16) void {
@@ -6594,6 +6951,19 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                 };
             }
 
+            // The db conns join the ring as peers — a readable CQE on one
+            // means parked exchanges can resume.
+            var pi: usize = 0;
+            while (pi < $mod.PG_POOL) : (pi += 1) {
+                if ($mod.PgConn.connect()) |pg| {
+                    w.pg[pi] = pg;
+                    _ = w.ring.poll_add($mod.URING_PG - pi, pg.fd, linux.POLL.IN) catch {
+                        std.debug.print("Pump: pg poll arm failed\n", .{});
+                    };
+                }
+            }
+            if (w.pg[0] != null) std.debug.print("Pump: pg pool armed on the ring\n", .{});
+
             // Bounded waits need IORING_FEAT_EXT_ARG (kernel 5.11+); without
             // it the only safe bound is one completion, so coalescing stays
             // off and every wait is the plain single-CQE park.
@@ -6629,6 +6999,11 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                     i += 1;
                     if (i % SUBMIT_STRIDE == 0) _ = w.ring.submit() catch {};
                     w.handleCqe(cqe);
+                }
+                // Db binds staged this batch go out as one send per conn.
+                var fi: usize = 0;
+                while (fi < $mod.PG_POOL) : (fi += 1) {
+                    if (w.pg[fi]) |pg| pg.flush();
                 }
                 // Ride the size of the last drain: a deep batch means more
                 // completions are already in flight, so the next enter can
@@ -7168,6 +7543,26 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                         out.appendSlice(a, "]}") catch {};
                         done.buf.deinit(a);
                         w.pgRespond(done.st, out.items);
+                    }
+                } else if (t == 'Z') {
+                    pg.rx_pos += mlen;
+                    // ReadyForQuery after an ErrorResponse settles nothing a
+                    // 'C' would — a still-parked waiter is an errored query.
+                    // Pop it and answer 500 so the conn never hangs.
+                    if (pg.waiters.items.len > 0) {
+                        const a = $mod.pumpAlloc();
+                        var done = pg.waiters.orderedRemove(0);
+                        done.st.pg_pending = 0;
+                        pg.pending_binds -|= 1;
+                        done.buf.deinit(a);
+                        const unavailable = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
+                        done.st.pending.appendSlice(a, unavailable) catch {
+                            w.teardown(done.st);
+                            continue;
+                        };
+                        w.advance(done.st);
+                        if (done.st.len > 0 and !done.st.ring_dead)
+                            w.dispatchReadable(done.st);
                     }
                 } else {
                     pg.rx_pos += mlen;
