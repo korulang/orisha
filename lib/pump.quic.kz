@@ -586,6 +586,7 @@ pub const QuicLane = struct {
     ready: std.ArrayListUnmanaged(H3Ready) = .{},
     ready_head: usize = 0,
     rxbuf: [65536]u8 = undefined,
+    flush_again: bool = false,
 };
 
 fn quicPopReady(lane: *QuicLane) ?H3Ready {
@@ -1809,8 +1810,10 @@ fn quicFlush(lane: *QuicLane) void {
             if (total == 0) break;
             conn.probe_pending = false;
             if (!quicSendDgram(conn, dbuf[0..total])) break;
-            if (total < QUIC_MAX_DGRAM) break; // a short datagram drains the queue
+            // keep looping while the round produces packets — a sub-1200
+            // datagram is normal (room reserves header slack), not a drain.
         }
+        lane.flush_again = guard >= 64;
     }
     quicSweepDead(lane);
 }
@@ -2008,6 +2011,7 @@ fn quicMsUntilDue(lane: *QuicLane) i64 {
     while (it.next()) |e| {
         const conn = e.value_ptr.*;
         if (conn.ack_due_now) return 0; // every 2nd ack-eliciting pkt: ack now
+        if (conn.lane.flush_again) return 0; // guard hit with data queued
         var d: i64 = conn.idle_deadline_ms;
         if (conn.state == .draining) d = @min(d, conn.draining_until_ms);
         if (conn.loss_deadline_us > 0) d = @min(d, @divTrunc(conn.loss_deadline_us, 1000));
