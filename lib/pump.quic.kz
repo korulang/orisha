@@ -1841,7 +1841,15 @@ fn quicSendDgram(conn: *QuicConn, bytes: []u8) bool {
         error.WouldBlock => return false, // socket full — stop this flush round
         error.MessageTooBig => {
             // PMTU probe overshot the path — stop the climb, drop the probe.
-            if (conn.pmtu_probe_pn >= 0) { conn.pmtu_idx = 255; conn.pmtu_probe_pn = -1; }
+            if (conn.pmtu_probe_pn >= 0) {
+                conn.pmtu_fails += 1;
+                conn.pmtu_probe_pn = -1;
+                if (conn.pmtu_fails >= 3) {
+                    conn.pmtu_fails = 0;
+                    if (conn.pmtu_idx == 0) conn.pmtu_idx = 255
+                    else conn.pmtu_retry_ms = std.time.milliTimestamp() + 10_000;
+                }
+            }
             return false;
         },
         else => {
@@ -2082,7 +2090,10 @@ fn quicTick(lane: *QuicLane) void {
                     conn.pmtu_probe_pn = -1;
                     if (conn.pmtu_fails >= 3) { // RFC 8899 MAX_PROBES
                         conn.pmtu_fails = 0;
-                        conn.pmtu_retry_ms = now_ms + 10_000; // re-attempt the climb after backoff
+                        // give up only at the smallest step; otherwise
+                        // re-attempt the whole climb after a backoff.
+                        if (conn.pmtu_idx == 0) conn.pmtu_idx = 255
+                        else conn.pmtu_retry_ms = now_ms + 10_000;
                     }
                 }
             } else {
@@ -2095,7 +2106,7 @@ fn quicTick(lane: *QuicLane) void {
                         rec.pmtu_probe = true;
                         conn.pmtu_probe_pn = @intCast(rec.pn);
                         conn.pmtu_probe_size = n;
-                        conn.pmtu_probe_deadline_us = now_us + 3 * quicPtoUs(conn) + 1_000_000;
+                        conn.pmtu_probe_deadline_us = now_us + 3 * quicPtoUs(conn);
                     }
                 }
             }
@@ -2171,7 +2182,11 @@ fn quicDetectLoss(conn: *QuicConn, space: usize, now_us: i64) void {
             (older and p.time_us > 0 and p.time_us + (if (p.pmtu_probe) 3 * thresh_us else thresh_us) <= now_us);
         if (pkt_lost and p.pmtu_probe) {
             conn.pmtu_fails += 1;
-            if (conn.pmtu_fails >= 3) { conn.pmtu_fails = 0; conn.pmtu_retry_ms = std.time.milliTimestamp() + 10_000; }
+            if (conn.pmtu_fails >= 3) {
+                conn.pmtu_fails = 0;
+                if (conn.pmtu_idx == 0) conn.pmtu_idx = 255
+                else conn.pmtu_retry_ms = std.time.milliTimestamp() + 10_000;
+            }
             conn.pmtu_probe_pn = -1;
             conn.bytes_in_flight -|= p.size;
             for (p.frames.items) |f| quicRequeueFrame(conn, space, f);
