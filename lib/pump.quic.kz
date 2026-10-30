@@ -642,7 +642,6 @@ fn qtlsYieldSecret(ssl: ?*oss.SSL, prot_level: u32, direction: c_int, secret: [*
         3 => 2,
         else => return 1, // early data / none — we refuse 0-RTT
     };
-    std.debug.print("quic: yield secret lvl={} dir={}\n", .{ prot_level, direction });
     const ks: *QKeys = if (direction == 0) &conn.keys_rx[space] else &conn.keys_tx[space];
     keysFromSecret(ks, secret[0..secret_len]);
     if (direction == 1) {
@@ -885,7 +884,6 @@ fn quicDriveTls(conn: *QuicConn) void {
         const before_tx = conn.ctx[0].items.len + conn.ctx[1].items.len + conn.ctx[2].items.len;
         _ = before_tx;
         const ret = oss.SSL_do_handshake(ssl);
-        std.debug.print("quic: do_handshake ret={} state={s}\n", .{ ret, @tagName(conn.state) });
         if (ret == 1) {
             conn.state = .app;
             // handshake complete: queue HANDSHAKE_DONE + the h3 control stream
@@ -903,13 +901,11 @@ fn quicDriveTls(conn: *QuicConn) void {
         }
         if (ret <= 0) {
             const err = oss.SSL_get_error(ssl, ret);
-            std.debug.print("quic: ssl err={}\n", .{err});
             // SSL_ERROR_WANT_READ = 2, WANT_WRITE = 3: wait for more wire data.
             if (err == 2 or err == 3) break;
             conn.close_code = 0x100;
             conn.close_pending = .{ .conn_close = .{ .code = conn.close_code, .app = false } };
             conn.state = .closing;
-            std.debug.print("quic: TLS fatal err={}\n", .{err});
             break;
         }
         break;
@@ -944,7 +940,6 @@ fn quicOnFrames(conn: *QuicConn, space: usize, pn: u64, bytes: []const u8) void 
     const a = conn.a();
     while (pos < bytes.len) {
         const ft = qvGet(bytes, &pos) orelse break;
-        std.debug.print("quic:   frame type={x} space={}\n", .{ ft, space });
         switch (ft) {
             0x00 => {}, // PADDING
             0x01 => eliciting = true, // PING
@@ -1041,12 +1036,10 @@ fn quicOnFrames(conn: *QuicConn, space: usize, pn: u64, bytes: []const u8) void 
             },
             0x1b => { eliciting = true; pos += 8; }, // PATH_RESPONSE
             0x1c, 0x1d => { // CONNECTION_CLOSE
-                const cc = qvGet(bytes, &pos) orelse return;
-                var fty: u64 = 0;
-                if (ft == 0x1c) fty = qvGet(bytes, &pos) orelse return;
+                _ = qvGet(bytes, &pos); // error code
+                if (ft == 0x1c) _ = qvGet(bytes, &pos); // frame type
                 const rlen = qvGet(bytes, &pos) orelse return;
                 pos += @intCast(rlen);
-                std.debug.print("quic: peer CONNECTION_CLOSE code={x} ft={x} app={}\n", .{ cc, fty, ft == 0x1d });
                 conn.state = .draining;
                 conn.draining_until_ms = std.time.milliTimestamp() + 3000;
                 return;
@@ -1058,9 +1051,6 @@ fn quicOnFrames(conn: *QuicConn, space: usize, pn: u64, bytes: []const u8) void 
                 conn.keys_tx[1].present = false;
             },
             else => {
-                std.debug.print("quic: UNKNOWN frame {x} at pos {} of {}\n", .{ ft, pos, bytes.len });
-                for (bytes) |bb| std.debug.print("{x:0>2}", .{bb});
-                std.debug.print("\n", .{});
                 break;
             },
         }
@@ -1229,7 +1219,6 @@ fn qpackDecode(conn: *QuicConn, block: []const u8, pairs: []HpackPair) ?usize {
 // Parse h3 frames off the contiguous receive prefix. HEADERS first, then
 // DATA until FIN; unknown frame types skipped per RFC 9114 §7.1.
 fn quicH3Parse(conn: *QuicConn, s: *QStream) void {
-    std.debug.print("quic: h3 parse stream={}\n", .{s.id});
     const a = conn.a();
     while (true) {
         const contig = rangesContig(&s.rx_ranges);
@@ -1324,7 +1313,6 @@ fn quicH3Serve(conn: *QuicConn, s: *QStream) void {
         quicClose(conn, 0x0107, true);
         return;
     }
-    std.debug.print("quic: h3 request ready stream={} raw={}B\n", .{ s.id, raw.len });
     lane.ready[lane.ready_n] = .{ .stream = s, .raw = raw };
     lane.ready_n += 1;
     // Credit: a completed request stream earns the client another one.
@@ -1352,7 +1340,6 @@ fn quicH3OpenControl(conn: *QuicConn) void {
 // ── close ────────────────────────────────────────────────────────────────────
 
 fn quicClose(conn: *QuicConn, code: u64, app: bool) void {
-    std.debug.print("quic: CLOSE code={x} app={}\n", .{ code, app });
     if (conn.state == .closing or conn.state == .draining or conn.state == .dead) return;
     conn.close_code = code;
     conn.close_pending = .{ .conn_close = .{ .code = code, .app = app } };
@@ -1415,7 +1402,6 @@ fn quicBuildPacket(conn: *QuicConn, space: usize, out: []u8, budget: usize, pad_
             // ACK alone is not ack-eliciting — do not set elicit here.
         }
     }
-    std.debug.print("quic: build space={} ctx_len={} ctx_hi={} retx={} ackpend={} keys={}\n", .{ space, conn.ctx[space].items.len, conn.ctx_hi[space], conn.ctx_retx[space].items.len, conn.rx_space[space].ack_pending, ks.present });
     // CRYPTO: retransmit ranges first, then new data.
     while (conn.ctx_retx[space].items.len > 0 and frames.items.len < room) {
         const r = conn.ctx_retx[space].orderedRemove(0);
@@ -1614,8 +1600,6 @@ fn quicBuildPacket(conn: *QuicConn, space: usize, out: []u8, budget: usize, pad_
         out[0] ^= mask[0] & (if (space == 2) @as(u8, 0x1f) else 0x0f);
         for (0..pnl) |i| out[pn_off + i] ^= mask[1 + i];
     }
-    std.debug.print("quic: SEND space={} pn={} bytes={} crypto_tx={} retx={}\n", .{ space, pn, total, conn.ctx[space].items.len, conn.ctx_retx[space].items.len });
-    for (rec.frames.items) |rf| std.debug.print("quic:   sent frame {s}\n", .{@tagName(rf)});
     ts.next_pn += 1;
     rec.pn = pn;
     rec.time_us = std.time.microTimestamp();
@@ -1810,11 +1794,9 @@ fn quicOnLongPacket(conn: *QuicConn, buf: []u8) ?usize {
     const tag: *const [16]u8 = @ptrCast(ct[ct.len - 16 ..]);
     const nonce = pnNonce(&ks.iv, pn);
     AesGcm.decrypt(pt_buf[0 .. ct.len - 16], ct[0 .. ct.len - 16], tag.*, buf[0..hdr_len], nonce, ks.key) catch {
-        std.debug.print("quic: decrypt FAIL space={} pn={}\n", .{ space, pn });
         return null;
     };
     quicRecordPn(conn, space, pn);
-    std.debug.print("quic: long pkt space={} pn={} len={}\n", .{ space, pn, ct.len });
     quicOnFrames(conn, space, pn, pt_buf[0 .. ct.len - 16]);
     return total;
 }
@@ -1842,10 +1824,8 @@ fn quicOnShort(conn: *QuicConn, buf: []u8) void {
     const tag: *const [16]u8 = @ptrCast(ct[ct.len - 16 ..]);
     const nonce = pnNonce(&ks.iv, pn);
     AesGcm.decrypt(pt_buf[0 .. ct.len - 16], ct[0 .. ct.len - 16], tag.*, buf[0..hdr_len], nonce, ks.key) catch {
-        std.debug.print("quic: 1rtt decrypt FAIL pn={}\n", .{pn});
         return;
     };
-    std.debug.print("quic: 1rtt pkt pn={} len={}\n", .{ pn, ct.len });
     // Key-phase flip by the peer — we never initiate key updates, so a new
     // phase is a protocol violation: close loudly.
     if (kbit != conn.peer_kbit) {
@@ -2074,7 +2054,6 @@ fn qpackEncodePair(out: []u8, name: []const u8, value: []const u8) usize {
 
 fn h3Reply(s: *QStream, x: *Exchange, head: []const u8, body: []const u8, delay_ms: i64) bool {
     _ = x;
-    std.debug.print("quic: h3Reply stream={} body={}B\n", .{ s.id, body.len });
     const conn = s.conn;
     if (conn.state == .dead or conn.state == .draining) return false;
     const a = conn.a();
