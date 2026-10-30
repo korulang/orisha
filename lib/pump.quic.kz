@@ -2007,6 +2007,7 @@ fn quicMsUntilDue(lane: *QuicLane) i64 {
     var it = lane.conns.iterator();
     while (it.next()) |e| {
         const conn = e.value_ptr.*;
+        if (conn.ack_due_now) return 0; // every 2nd ack-eliciting pkt: ack now
         var d: i64 = conn.idle_deadline_ms;
         if (conn.state == .draining) d = @min(d, conn.draining_until_ms);
         if (conn.loss_deadline_us > 0) d = @min(d, @divTrunc(conn.loss_deadline_us, 1000));
