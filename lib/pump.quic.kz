@@ -465,6 +465,7 @@ const QStream = struct {
     sb_acked: std.ArrayListUnmanaged(QRange) = .{},
     sb_fin: bool = false, // FIN once sb is fully out
     tx_done: bool = false, // fin sent AND acked
+    rst_acked: bool = false, // our RESET_STREAM acked
     flow_hi: u64 = 0, // peer's max_stream_data for us
     park_until: i64 = 0,
     reset: bool = false,
@@ -533,7 +534,7 @@ const QuicConn = struct {
     peer_ack_delay_exp: u64 = 3,
     peer_got_tp: bool = false,
     // our receive flow accounting
-    rx_consumed: u64 = 0,
+    rx_consumed_total: u64 = 0,
     rx_fc: u64 = 0, // fresh stream bytes received (conn-level fc check)
     rx_max_data: u64 = QUIC_MAX_DATA,
     tx_data_sent: u64 = 0, // total stream bytes sent (peer_max_data budget)
@@ -832,10 +833,9 @@ fn quicPurgeReady(lane: *QuicLane, conn: *QuicConn) void {
 // acked (data + FIN) and the receive side is done (FIN seen or reset).
 fn quicStreamMaybeFree(conn: *QuicConn, s: *QStream) void {
     if (s.stype != -2 or !s.sb_fin) return;
-    const tx_done = rangesContig(&s.sb_acked) >= s.sb.items.len + 1;
-    const rx_done = s.rx_fin_off != null or s.rx_dead;
+    const tx_done = s.rst_acked or rangesContig(&s.sb_acked) >= s.sb.items.len + 1;
+    const rx_done = s.rx_fin_off != null or s.rx_dead or s.reset;
     if (!(tx_done and rx_done)) return;
-    quicPurgeReady(conn.lane, conn); // queued replies for this stream die with it
     if (conn.streams.remove(s.id)) quicStreamDestroy(conn, s);
 }
 
@@ -1024,11 +1024,16 @@ fn quicOnFrames(conn: *QuicConn, space: usize, pn: u64, bytes: []const u8) void 
                 _ = qvGet(bytes, &pos);
                 if (quicStreamGet(conn, sid, false)) |s| s.rx_dead = true;
             },
-            0x05 => { // STOP_SENDING
+            0x05 => { // STOP_SENDING — answer with our own RESET_STREAM
                 eliciting = true;
                 const sid = qvGet(bytes, &pos) orelse return;
-                _ = qvGet(bytes, &pos);
-                if (quicStreamGet(conn, sid, false)) |s| s.reset = true;
+                const code = qvGet(bytes, &pos) orelse return;
+                if (quicStreamGet(conn, sid, false)) |s| {
+                    if (!s.reset) {
+                        s.reset = true;
+                        quicCtrlQueue(conn, .{ .reset_stream = .{ .id = sid, .code = code, .final_size = s.sb_hi } });
+                    }
+                }
             },
             0x06 => { // CRYPTO
                 eliciting = true;
@@ -1163,6 +1168,12 @@ fn quicOnAck(conn: *QuicConn, space: usize, lo: u64, hi: u64) void {
                         conn.keys_rx[1].present = false;
                         conn.keys_tx[1].present = false;
                     },
+                    .reset_stream => |rs| {
+                        if (quicStreamGet(conn, rs.id, false)) |s| {
+                            s.rst_acked = true;
+                            quicStreamMaybeFree(conn, s);
+                        }
+                    },
                     else => {},
                 }
             }
@@ -1176,23 +1187,24 @@ fn quicOnStreamData(conn: *QuicConn, id: u64, off: u64, data: []const u8, fin: b
     // client uni streams and client bidi streams only; our own uni stream
     // ids (&3==2? ours are 2,6,...) can't carry client data — ignore.
     if (id & 3 == 1 or id & 3 == 3) return; // server-initiated; client can't write
+    // a retransmitted/duplicated frame for an already-freed bidi stream must
+    // not resurrect it — client ids are monotonic, so a missing entry with
+    // seq <= top means it was closed.
+    if (id & 3 == 0 and conn.streams.get(id) == null and
+        @as(i64, @intCast(id >> 2)) <= conn.streams_bidi_top) {
+        return;
+    }
     const s = quicStreamGet(conn, id, true) orelse return;
     const end = off + data.len;
     // RFC 9000 §4.5/§4.6: enforce our advertised receive limits and the
     // final-size rule once FIN fixed the stream's length.
     if (end > s.rx_hi) { quicClose(conn, 0x03, false); return; } // FLOW_CONTROL_ERROR
     if (s.rx_fin_off != null and end > s.rx_fin_off.?) { quicClose(conn, 0x06, false); return; } // FINAL_SIZE_ERROR
-    if (fin) {
-        if (s.rx_fin_off != null and s.rx_fin_off.? != end) { quicClose(conn, 0x06, false); return; }
-        const fresh = end -| s.rx_max_off;
-        conn.rx_fc += fresh;
-        if (conn.rx_fc > conn.rx_max_data + 4 * QUIC_MAX_DGRAM) { quicClose(conn, 0x03, false); return; }
-    }
+    if (fin and s.rx_fin_off != null and s.rx_fin_off.? != end) { quicClose(conn, 0x06, false); return; }
+    conn.rx_fc += end -| s.rx_max_off;
+    s.rx_max_off = @max(s.rx_max_off, end);
+    if (conn.rx_fc > conn.rx_max_data + 4 * QUIC_MAX_DGRAM) { quicClose(conn, 0x03, false); return; }
     if (data.len > 0) {
-        const fresh_fc = end -| s.rx_max_off;
-        conn.rx_fc += fresh_fc;
-        if (conn.rx_fc > conn.rx_max_data + 4 * QUIC_MAX_DGRAM) { quicClose(conn, 0x03, false); return; }
-        s.rx_max_off = @max(s.rx_max_off, end);
         if (s.rx.items.len < end) s.rx.resize(conn.a(), @intCast(end)) catch { quicClose(conn, 0x01, false); return; };
         @memcpy(s.rx.items[@intCast(off)..@intCast(end)], data);
         const old_contig = rangesContig(&s.rx_ranges);
@@ -1200,12 +1212,12 @@ fn quicOnStreamData(conn: *QuicConn, id: u64, off: u64, data: []const u8, fin: b
         const new_contig = rangesContig(&s.rx_ranges);
         const fresh = new_contig -| @min(old_contig, new_contig);
         if (fresh > 0) {
-            conn.rx_consumed += fresh;
-            // credit: half-window replenishment
-            if (conn.rx_consumed > conn.rx_max_data / 2) {
-                conn.rx_max_data += QUIC_MAX_DATA;
+            conn.rx_consumed_total += fresh;
+            // credit: keep the advertised window ~a full MAX_DATA ahead of
+            // cumulative consumption so sustained uploads never stall.
+            if (conn.rx_max_data -| conn.rx_consumed_total < QUIC_MAX_DATA / 2) {
+                conn.rx_max_data = conn.rx_consumed_total + QUIC_MAX_DATA;
                 quicCtrlQueue(conn, .{ .max_data = conn.rx_max_data });
-                conn.rx_consumed = 0;
             }
             if (s.rx_hi < new_contig + QUIC_MAX_STREAM_DATA / 2) {
                 s.rx_hi = new_contig + QUIC_MAX_STREAM_DATA;
@@ -1472,7 +1484,7 @@ fn emitAckFrame(out: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, rs: *QRx
 
 // Write a protected packet for `space` into out[] (at most budget bytes).
 // Returns bytes written; 0 = nothing to send at this space.
-fn quicBuildPacket(conn: *QuicConn, space: usize, out: []u8, budget: usize, pad_to_1200: bool, probe: bool) usize {
+fn quicBuildPacket(conn: *QuicConn, space: usize, out: []u8, budget: usize, pad_to_1200: bool, probe: bool, ack_only: bool) usize {
     const ks = &conn.keys_tx[space];
     if (!ks.present) return 0;
     const a = conn.a();
@@ -1494,7 +1506,7 @@ fn quicBuildPacket(conn: *QuicConn, space: usize, out: []u8, budget: usize, pad_
         }
     }
     // CRYPTO: retransmit ranges first, then new data.
-    while (conn.ctx_retx[space].items.len > 0 and frames.items.len < room) {
+    while (!ack_only and conn.ctx_retx[space].items.len > 0 and frames.items.len < room) {
         const r = conn.ctx_retx[space].orderedRemove(0);
         const n = @min(r.len, room -| frames.items.len -| 16);
         if (n == 0) break;
@@ -1509,7 +1521,7 @@ fn quicBuildPacket(conn: *QuicConn, space: usize, out: []u8, budget: usize, pad_
             break;
         }
     }
-    while (conn.ctx_hi[space] < conn.ctx[space].items.len and frames.items.len < room) {
+    while (!ack_only and conn.ctx_hi[space] < conn.ctx[space].items.len and frames.items.len < room) {
         const off = conn.ctx_hi[space];
         const n = @min(conn.ctx[space].items.len - off, room -| frames.items.len -| 16);
         if (n == 0) break;
@@ -1522,7 +1534,7 @@ fn quicBuildPacket(conn: *QuicConn, space: usize, out: []u8, budget: usize, pad_
         elicit = true;
     }
     // control queue (app space only, plus close anywhere)
-    if (space == 2) {
+    if (space == 2 and !ack_only) {
         const qi: usize = 0;
         while (qi < conn.ctrl_q.items.len and frames.items.len < room) {
             const f = conn.ctrl_q.items[qi];
@@ -1583,7 +1595,7 @@ fn quicBuildPacket(conn: *QuicConn, space: usize, out: []u8, budget: usize, pad_
         }
     }
     // STREAM data (app space): retransmits then new bytes, peer-window-bound.
-    if (space == 2 and conn.close_pending == null and conn.state != .closing and conn.state != .draining) {
+    if (space == 2 and !ack_only and conn.close_pending == null and conn.state != .closing and conn.state != .draining) {
         var it = conn.streams.iterator();
         const now_ms = std.time.milliTimestamp();
         while (it.next()) |e| {
@@ -1749,13 +1761,23 @@ fn quicFlush(lane: *QuicLane) void {
             if (budget > 0) {
                 for (0..3) |sp| {
                     const pad = sp == 0 and !conn.addr_validated;
-                    const n = quicBuildPacket(conn, sp, dbuf[total .. total + budget - total], budget - total, pad, false);
+                    const n = quicBuildPacket(conn, sp, dbuf[total .. total + budget - total], budget - total, pad, false, false);
                     if (n > 0) total += n;
+                }
+            }
+            // ACK-only packets are exempt from cwnd (RFC 9002 §7).
+            if (total == 0) {
+                for (0..3) |sp| {
+                    if (conn.rx_space[sp].ack_pending) {
+                        const n = quicBuildPacket(conn, sp, dbuf[total..QUIC_MAX_DGRAM], QUIC_MAX_DGRAM - total, false, false, true);
+                        if (n > 0) total += n;
+                        break;
+                    }
                 }
             }
             // PTO probe: nothing else to send but a probe is owed
             if (total == 0 and conn.probe_pending) {
-                const n = quicBuildPacket(conn, if (conn.keys_tx[2].present) 2 else if (conn.keys_tx[1].present) 1 else 0, dbuf[0..budget], budget, false, true);
+                const n = quicBuildPacket(conn, if (conn.keys_tx[2].present) 2 else if (conn.keys_tx[1].present) 1 else 0, dbuf[0..budget], budget, false, true, false);
                 if (n > 0) total = n;
             }
             if (total == 0) break;
