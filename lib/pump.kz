@@ -25,6 +25,10 @@ const std = @import("std");
 const posix = std.posix;
 const c = std.c;
 
+// QUIC + HTTP/3 machinery lives in pump.quic.kz — packet codec, TLS
+// glue, recovery, streams, QPACK, H3 framing.
+~part quic
+
 // One request, read and waiting for its answer. `raw` borrows the pump's read
 // buffer and is valid for the duration of the `arrived` arm only.
 //
@@ -93,6 +97,10 @@ pub const Exchange = struct {
     // HTTP/2 only: the stream this exchange answers — 0 on h1. `reply` forks
     // on it to emit HEADERS+DATA frames instead of the h1 wire form.
     h2_stream: u32 = 0,
+    // HTTP/3 only: the QUIC stream ctx this exchange answers (opaque —
+    // it's a *QStream owned by pump.quic.kz), and its stream id.
+    h3: ?*anyopaque = null,
+    h3_stream: u64 = 0,
     // The obligation a handler minted instead of a response — set by
     // `answer`, discharged by the dispatcher that owns the pg pool.
     pending_kind: u8 = 0,
@@ -127,6 +135,8 @@ const URING_ACCEPT_H2TLS: u64 = URING_ACCEPT - 3;
 // Pool slot i's userdata is URING_PG - i.
 const URING_PG: u64 = URING_ACCEPT - 4;
 const PG_POOL: usize = 4;
+// UDP/QUIC lane: below the whole PG range so the PG check can't swallow it.
+const URING_QUIC: u64 = URING_PG - PG_POOL - 1;
 
 // One read is not one request.
 //
@@ -4993,7 +5003,11 @@ fn workerCount() usize {
 
             while (true) {
                 var wait_ts: std.c.timespec = undefined;
-                const park_ms = $mod.parkMsUntilDue();
+                var park_ms = $mod.parkMsUntilDue();
+                if (w.quic_fd >= 0) {
+                    const q_ms = $mod.quicMsUntilDue(&w.quic);
+                    if (q_ms < park_ms) park_ms = q_ms;
+                }
                 const ts: ?*std.c.timespec = if (park_ms == std.math.maxInt(i64)) null else blk: {
                     wait_ts = .{ .sec = @intCast(@divTrunc(park_ms, 1000)), .nsec = @intCast(@mod(park_ms, 1000) * 1000000) };
                     break :blk &wait_ts;
@@ -5390,6 +5404,7 @@ fn workerCount() usize {
                 // Same rule as the kqueue wait: a parked conn's deadline
                 // is the latest this wait may sleep.
                 const park_ms = $mod.parkMsUntilDue();
+
                 const wait_ms: i32 = if (park_ms == std.math.maxInt(i64)) -1 else @intCast(@min(park_ms, std.math.maxInt(i32) - 1));
                 const n_rc = linux.epoll_wait(epfd, &events, $mod.MAX_EVENTS, wait_ms);
                 while ($mod.parkDue()) |pst| {
@@ -5713,6 +5728,9 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
     if ($mod.maybeStartH2Tls($mod.h2TlsPortEnv(), cert_path, key_path)) |err_msg| {
         return .{ .failed = err_msg };
     }
+    if ($mod.maybeStartH3($mod.h3PortEnv(), cert_path, key_path)) |err_msg| {
+        return .{ .failed = err_msg };
+    }
     // `std.os.linux.IoUring` cannot be NAMED on a non-Linux target — it reaches
     // for `linux.E` and a macOS build has `darwin.E` instead, so this is a type
     // error, not a missing feature. The guard is comptime-known, so the body
@@ -5776,6 +5794,10 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
         // routes fall through to the app's own handler.
         pg: [$mod.PG_POOL]?*$mod.PgConn = .{null} ** $mod.PG_POOL,
         pg_rr: usize = 0,
+        // QUIC lane: the worker's UDP fd + conn table. SO_REUSEPORT keeps a
+        // client on one worker, so the whole h3 state lives here.
+        quic_fd: $mod.posix.fd_t = -1,
+        quic: $mod.QuicLane = .{},
 
         const Pool = struct {
             ring: *linux.IoUring,
@@ -6025,6 +6047,10 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
 
         fn handleCqe(w: *@This(), cqe: linux.io_uring_cqe) void {
             const ud = cqe.user_data;
+            if (ud == $mod.URING_QUIC) {
+                w.quicReadCqe(cqe);
+                return;
+            }
             if (ud <= $mod.URING_PG and ud > $mod.URING_PG - $mod.PG_POOL) {
                 w.pgReadCqe(cqe);
                 return;
@@ -6681,6 +6707,46 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
             w.advance(st);
         }
 
+        // URING_QUIC: datagrams ready on the worker's UDP socket. Drain to
+        // EAGAIN, hand each datagram to the lane, serve completed requests,
+        // then flush — same batch shape as the PG lane.
+        fn quicReadCqe(w: *@This(), cqe: linux.io_uring_cqe) void {
+            if (cqe.res >= 0) {
+                while (true) {
+                    var src: $mod.posix.sockaddr.storage = undefined;
+                    var src_len: $mod.posix.socklen_t = @sizeOf($mod.posix.sockaddr.storage);
+                    const n = $mod.posix.recvfrom(w.quic_fd, &w.quic.rxbuf, 0, @ptrCast(&src), &src_len) catch break;
+                    if (n == 0) break;
+                    $mod.quicOnDgram(&w.quic, w.quic.rxbuf[0..n], @ptrCast(&src), src_len);
+                }
+            }
+            w.quicServe();
+            $mod.quicFlush(&w.quic);
+            _ = w.ring.poll_add($mod.URING_QUIC, w.quic_fd, linux.POLL.IN) catch {};
+        }
+
+        // Completed h3 requests dispatch here — `arrived` binds only inside
+        // ~proc scope, like the h2 seam's h2_ready drain.
+        fn quicServe(w: *@This()) void {
+            while ($mod.quicPopReady(&w.quic)) |r| {
+                var head_pairs: [$mod.HEAD_PAIRS_MAX]$mod.HeadPair = undefined;
+                var head: $mod.Head = .{ .pairs = &head_pairs };
+                _ = $mod.scanRequest(r.raw, &head) orelse {
+                    $mod.pumpAlloc().free(r.raw);
+                    continue;
+                };
+                var exchange = $mod.Exchange{ .fd = @intCast(w.quic_fd), .raw = r.raw, .head = &head, .h3 = r.stream, .h3_stream = r.stream.id };
+                arrived(&exchange);
+                if (exchange.pending_kind != 0) {
+                    // db obligations are not wired on h3 — answer an honest
+                    // 503 exactly like the h1 dispatch does on a failed park.
+                    exchange.pending_kind = 0;
+                    $mod.h3Reply503(r.stream);
+                }
+                $mod.pumpAlloc().free(r.raw);
+            }
+        }
+
         // PG_READ: drain response frames; each DataRow completes the front
         // waiter's exchange — stage its response, resume its tail scan.
         fn pgReadCqe(w: *@This(), cqe: linux.io_uring_cqe) void {
@@ -6915,7 +6981,15 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                 }
             else
                 -1;
-            var w = @This(){ .ring = ring, .listen_fd = listen_fd, .tls_listen_fd = tls_listen_fd, .h2c_listen_fd = h2c_listen_fd, .h2_tls_listen_fd = h2_tls_listen_fd };
+            const quic_fd: $mod.posix.fd_t = if ($mod.h3_listen_port != 0)
+                $mod.openQuicSocket($mod.h3_listen_port) orelse {
+                    std.debug.print("Pump: io_uring worker failed to open UDP :{}\n", .{$mod.h3_listen_port});
+                    return;
+                }
+            else
+                -1;
+            var w = @This(){ .ring = ring, .listen_fd = listen_fd, .tls_listen_fd = tls_listen_fd, .h2c_listen_fd = h2c_listen_fd, .h2_tls_listen_fd = h2_tls_listen_fd, .quic_fd = quic_fd };
+            w.quic.fd = quic_fd;
             // 1024 pool buffers of 8K per worker — far more than the deepest
             // CQE batch (512) can hold hostage, since each buffer is recycled
             // the moment its CQE is processed. Requests bigger than a buffer
@@ -6950,6 +7024,12 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                     return;
                 };
             }
+            if (quic_fd >= 0) {
+                _ = w.ring.poll_add($mod.URING_QUIC, quic_fd, linux.POLL.IN) catch {
+                    std.debug.print("Pump: io_uring QUIC poll arm failed\n", .{});
+                    return;
+                };
+            }
 
             // The db conns join the ring as peers — a readable CQE on one
             // means parked exchanges can resume.
@@ -6975,7 +7055,11 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                 // A parked conn emits no CQE — when the list is non-empty the
                 // wait must be bounded by its deadline, even when the batch
                 // shape would otherwise park on a single completion forever.
-                const park_ms = $mod.parkMsUntilDue();
+                var park_ms = $mod.parkMsUntilDue();
+                if (w.quic_fd >= 0) {
+                    const q_ms = $mod.quicMsUntilDue(&w.quic);
+                    if (q_ms < park_ms) park_ms = q_ms;
+                }
                 if (park_ms == std.math.maxInt(i64)) {
                     if (wait_nr > 1) {
                         $mod.ringWaitTimeout(&w.ring, wait_nr, WAIT_COALESCE_NS) catch continue;
@@ -6992,6 +7076,10 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                 // so advance picks their staged pending up as the next send SQE.
                 while ($mod.parkDue()) |pst| {
                     w.advance(pst);
+                }
+                if (w.quic_fd >= 0) {
+                    $mod.quicTick(&w.quic);
+                    w.quicServe();
                 }
                 @import("root").koru_orisha.stampHttpDateLine();
                 var i: usize = 0;
@@ -7067,6 +7155,10 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
         // routes fall through to the app's own handler.
         pg: [$mod.PG_POOL]?*$mod.PgConn = .{null} ** $mod.PG_POOL,
         pg_rr: usize = 0,
+        // QUIC lane: the worker's UDP fd + conn table. SO_REUSEPORT keeps a
+        // client on one worker, so the whole h3 state lives here.
+        quic_fd: $mod.posix.fd_t = -1,
+        quic: $mod.QuicLane = .{},
 
         const Pool = struct {
             ring: *linux.IoUring,
@@ -7406,6 +7498,46 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
             w.advance(st);
         }
 
+        // URING_QUIC: datagrams ready on the worker's UDP socket. Drain to
+        // EAGAIN, hand each datagram to the lane, serve completed requests,
+        // then flush — same batch shape as the PG lane.
+        fn quicReadCqe(w: *@This(), cqe: linux.io_uring_cqe) void {
+            if (cqe.res >= 0) {
+                while (true) {
+                    var src: $mod.posix.sockaddr.storage = undefined;
+                    var src_len: $mod.posix.socklen_t = @sizeOf($mod.posix.sockaddr.storage);
+                    const n = $mod.posix.recvfrom(w.quic_fd, &w.quic.rxbuf, 0, @ptrCast(&src), &src_len) catch break;
+                    if (n == 0) break;
+                    $mod.quicOnDgram(&w.quic, w.quic.rxbuf[0..n], @ptrCast(&src), src_len);
+                }
+            }
+            w.quicServe();
+            $mod.quicFlush(&w.quic);
+            _ = w.ring.poll_add($mod.URING_QUIC, w.quic_fd, linux.POLL.IN) catch {};
+        }
+
+        // Completed h3 requests dispatch here — `arrived` binds only inside
+        // ~proc scope, like the h2 seam's h2_ready drain.
+        fn quicServe(w: *@This()) void {
+            while ($mod.quicPopReady(&w.quic)) |r| {
+                var head_pairs: [$mod.HEAD_PAIRS_MAX]$mod.HeadPair = undefined;
+                var head: $mod.Head = .{ .pairs = &head_pairs };
+                _ = $mod.scanRequest(r.raw, &head) orelse {
+                    $mod.pumpAlloc().free(r.raw);
+                    continue;
+                };
+                var exchange = $mod.Exchange{ .fd = @intCast(w.quic_fd), .raw = r.raw, .head = &head, .h3 = r.stream, .h3_stream = r.stream.id };
+                arrived(&exchange);
+                if (exchange.pending_kind != 0) {
+                    // db obligations are not wired on h3 — answer an honest
+                    // 503 exactly like the h1 dispatch does on a failed park.
+                    exchange.pending_kind = 0;
+                    $mod.h3Reply503(r.stream);
+                }
+                $mod.pumpAlloc().free(r.raw);
+            }
+        }
+
         // PG_READ: drain response frames; each DataRow completes the front
         // waiter's exchange — stage its response, resume its tail scan.
         fn pgReadCqe(w: *@This(), cqe: linux.io_uring_cqe) void {
@@ -7605,6 +7737,10 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
 
         fn handleCqe(w: *@This(), cqe: linux.io_uring_cqe) void {
             const ud = cqe.user_data;
+            if (ud == $mod.URING_QUIC) {
+                w.quicReadCqe(cqe);
+                return;
+            }
             if (ud <= $mod.URING_PG and ud > $mod.URING_PG - $mod.PG_POOL) {
                 w.pgReadCqe(cqe);
                 return;
@@ -8120,6 +8256,14 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
 ~proc reply|zig {
     if (x.pending_kind != 0) return .sent;
     if (hang) x.keep_alive = false;
+    // HTTP/3: the exchange answers on a QUIC stream — h3Reply re-encodes the
+    // h1-rendered head into a QPACK field section + DATA exactly like h2Reply.
+    if (x.h3) |h3s| {
+        if (!h3Reply(@ptrCast(@alignCast(h3s)), x, head, body, delay)) {
+            return .{ .broken = "stream reply failed" };
+        }
+        return .sent;
+    }
     const st = x.st orelse connState(@intCast(x.fd)) orelse {
         x.keep_alive = false;
         return .{ .broken = "write failed" };
