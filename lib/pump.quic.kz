@@ -129,10 +129,10 @@ fn qvLen(v: u64) usize {
     return 8;
 }
 
-fn qvPut(out: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, v: u64) void {
+fn qvPut(out: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, v: u64) error{OutOfMemory}!void {
     var b: [8]u8 = undefined;
     const n = qvPutSlice(&b, v);
-    out.appendSlice(a, b[0..n]) catch {};
+    try out.appendSlice(a, b[0..n]);
 }
 
 fn qvPutSlice(b: []u8, v: u64) usize {
@@ -188,7 +188,7 @@ fn qvGet(buf: []const u8, pos: *usize) ?u64 {
 
 const QRange = struct { off: u64, len: u64 };
 
-fn rangesAdd(rs: *std.ArrayListUnmanaged(QRange), a: std.mem.Allocator, off: u64, len: u64) void {
+fn rangesAdd(rs: *std.ArrayListUnmanaged(QRange), a: std.mem.Allocator, off: u64, len: u64) error{OutOfMemory}!void {
     if (len == 0) return;
     // Insertion keeps the list sorted ascending by off, merging overlaps.
     var no = off;
@@ -205,7 +205,7 @@ fn rangesAdd(rs: *std.ArrayListUnmanaged(QRange), a: std.mem.Allocator, off: u64
         ne = @max(ne, r.off + r.len);
         _ = rs.orderedRemove(i);
     }
-    rs.insert(a, i, .{ .off = no, .len = ne - no }) catch {};
+    rs.insert(a, i, .{ .off = no, .len = ne - no }) catch |e| return e;
 }
 
 fn rangesHas(rs: *const std.ArrayListUnmanaged(QRange), off: u64) bool {
@@ -576,16 +576,19 @@ pub const QuicLane = struct {
     fd: posix.fd_t = -1,
     conns: std.AutoHashMapUnmanaged(u64, *QuicConn) = .{},
     odcid_map: std.AutoHashMapUnmanaged(u64, *QuicConn) = .{},
-    ready: [64]H3Ready = undefined,
-    ready_n: usize = 0,
+    ready: std.ArrayListUnmanaged(H3Ready) = .{},
+    ready_head: usize = 0,
     rxbuf: [65536]u8 = undefined,
 };
 
 fn quicPopReady(lane: *QuicLane) ?H3Ready {
-    if (lane.ready_n == 0) return null;
-    const r = lane.ready[0];
-    for (1..lane.ready_n) |i| lane.ready[i - 1] = lane.ready[i];
-    lane.ready_n -= 1;
+    if (lane.ready_head >= lane.ready.items.len) return null;
+    const r = lane.ready.items[lane.ready_head];
+    lane.ready_head += 1;
+    if (lane.ready_head == lane.ready.items.len) {
+        lane.ready.clearRetainingCapacity();
+        lane.ready_head = 0;
+    }
     return r;
 }
 
@@ -604,7 +607,7 @@ fn qtlsCryptoSend(ssl: ?*oss.SSL, buf: [*c]const u8, buf_len: usize, consumed: [
     _ = ssl;
     const conn: *QuicConn = @ptrCast(@alignCast(arg));
     const lvl = conn.tls_tx_level;
-    conn.ctx[lvl].appendSlice(conn.a(), buf[0..buf_len]) catch return 0;
+    conn.ctx[lvl].appendSlice(conn.a(), buf[0..buf_len]) catch return 0; // 0 = not consumed → OpenSSL aborts the handshake, loud
     consumed.* = buf_len;
     return 1;
 }
@@ -708,12 +711,12 @@ const QTDIS = if (HAS_OPENSSL) [_]oss.OSSL_DISPATCH{
 
 // ── transport params we announce ─────────────────────────────────────────────
 
-fn buildTransportParams(conn: *QuicConn, out: *std.ArrayListUnmanaged(u8)) void {
+fn buildTransportParams(conn: *QuicConn, out: *std.ArrayListUnmanaged(u8)) error{OutOfMemory}!void {
     const a = conn.a();
     // original_destination_connection_id (0x00)
-    qvPut(out, a, 0x00);
-    qvPut(out, a, conn.odcid_len);
-    out.appendSlice(a, conn.odcid[0..conn.odcid_len]) catch {};
+    try qvPut(out, a, 0x00);
+    try qvPut(out, a, conn.odcid_len);
+    try out.appendSlice(a, conn.odcid[0..conn.odcid_len]);
     const ints = [_]struct { id: u64, v: u64 }{
         .{ .id = 0x01, .v = QUIC_IDLE_MS },
         .{ .id = 0x03, .v = 1452 },
@@ -728,16 +731,16 @@ fn buildTransportParams(conn: *QuicConn, out: *std.ArrayListUnmanaged(u8)) void 
         .{ .id = 0x0e, .v = 8 },
     };
     for (ints) |p| {
-        qvPut(out, a, p.id);
-        qvPut(out, a, qvLen(p.v));
-        qvPut(out, a, p.v);
+        try qvPut(out, a, p.id);
+        try qvPut(out, a, qvLen(p.v));
+        try qvPut(out, a, p.v);
     }
-    qvPut(out, a, 0x0c); // disable_active_migration
-    qvPut(out, a, 0);
+    try qvPut(out, a, 0x0c); // disable_active_migration
+    try qvPut(out, a, 0);
     // initial_source_connection_id (0x0f)
-    qvPut(out, a, 0x0f);
-    qvPut(out, a, QUIC_SCID_LEN);
-    out.appendSlice(a, &conn.scid) catch {};
+    try qvPut(out, a, 0x0f);
+    try qvPut(out, a, QUIC_SCID_LEN);
+    try out.appendSlice(a, &conn.scid);
 }
 
 // ── conn create / destroy ────────────────────────────────────────────────────
@@ -777,15 +780,28 @@ fn quicConnCreate(lane: *QuicLane, peer: *const posix.sockaddr, peer_len: posix.
     }
     // The params buffer must outlive the SSL object — OpenSSL sends it
     // lazily during the handshake, so it lives on the conn.
-    buildTransportParams(conn, &conn.tp_buf);
+    buildTransportParams(conn, &conn.tp_buf) catch {
+        oss.SSL_free(ssl);
+        a.destroy(conn);
+        return null;
+    };
     if (oss.SSL_set_quic_tls_transport_params(ssl, conn.tp_buf.items.ptr, conn.tp_buf.items.len) != 1) {
         oss.SSL_free(ssl);
         a.destroy(conn);
         return null;
     }
     oss.SSL_set_accept_state(ssl);
-    lane.conns.put(a, conn.scid_key, conn) catch {};
-    lane.odcid_map.put(a, conn.odcid_key, conn) catch {};
+    lane.conns.put(a, conn.scid_key, conn) catch {
+        oss.SSL_free(ssl);
+        a.destroy(conn);
+        return null;
+    };
+    lane.odcid_map.put(a, conn.odcid_key, conn) catch {
+        _ = lane.conns.remove(conn.scid_key);
+        oss.SSL_free(ssl);
+        a.destroy(conn);
+        return null;
+    };
     return conn;
 }
 
@@ -870,10 +886,10 @@ fn quicCryptoFeed(conn: *QuicConn, space: usize, off: u64, data: []const u8) voi
     const end = off + data.len;
     if (crx.buf.items.len < end) {
         const newlen = @as(usize, @intCast(end));
-        crx.buf.resize(conn.a(), newlen) catch return;
+        crx.buf.resize(conn.a(), newlen) catch { quicClose(conn, 0x01, false); return; };
     }
     @memcpy(crx.buf.items[@intCast(off)..@intCast(end)], data);
-    rangesAdd(&crx.ranges, conn.a(), off, data.len);
+    rangesAdd(&crx.ranges, conn.a(), off, data.len) catch { quicClose(conn, 0x01, false); return; };
     quicDriveTls(conn);
 }
 
@@ -916,7 +932,7 @@ fn quicDriveTls(conn: *QuicConn) void {
 fn quicRecordPn(conn: *QuicConn, space: usize, pn: u64) void {
     const rs = &conn.rx_space[space];
     if (rangesHas(&rs.ranges, pn)) return;
-    rangesAdd(&rs.ranges, conn.a(), pn, 1);
+    rangesAdd(&rs.ranges, conn.a(), pn, 1) catch { quicClose(conn, 0x01, false); return; };
     rs.largest = @max(rs.largest, @as(i64, @intCast(pn)));
     if (space == 1) {
         conn.hs_pkt_seen = true;
@@ -930,7 +946,7 @@ fn quicCtrlQueue(conn: *QuicConn, f: QSentFrame) void {
     // control frames ride the app space's own retry list — stash into a
     // synthetic retx range list indexed per kind via ctx_retx? Simpler:
     // dedicated queue.
-    conn.ctrl_q.append(conn.a(), f) catch {};
+    conn.ctrl_q.append(conn.a(), f) catch quicClose(conn, 0x01, false);
 }
 
 fn quicOnFrames(conn: *QuicConn, space: usize, pn: u64, bytes: []const u8) void {
@@ -1094,7 +1110,7 @@ fn quicOnAck(conn: *QuicConn, space: usize, lo: u64, hi: u64) void {
                 switch (f) {
                     .stream => |sf| {
                         if (quicStreamGet(conn, sf.id, false)) |s|
-                            rangesAdd(&s.sb_acked, conn.a(), sf.off, sf.len + @intFromBool(sf.fin));
+                            rangesAdd(&s.sb_acked, conn.a(), sf.off, sf.len + @intFromBool(sf.fin)) catch { quicClose(conn, 0x01, false); return; };
                     },
                     .handshake_done => {
                         conn.hs_confirmed = true;
@@ -1117,10 +1133,10 @@ fn quicOnStreamData(conn: *QuicConn, id: u64, off: u64, data: []const u8, fin: b
     const s = quicStreamGet(conn, id, true) orelse return;
     if (data.len > 0) {
         const end = off + data.len;
-        if (s.rx.items.len < end) s.rx.resize(conn.a(), @intCast(end)) catch return;
+        if (s.rx.items.len < end) s.rx.resize(conn.a(), @intCast(end)) catch { quicClose(conn, 0x01, false); return; };
         @memcpy(s.rx.items[@intCast(off)..@intCast(end)], data);
         const old_contig = rangesContig(&s.rx_ranges);
-        rangesAdd(&s.rx_ranges, conn.a(), off, data.len);
+        rangesAdd(&s.rx_ranges, conn.a(), off, data.len) catch { quicClose(conn, 0x01, false); return; };
         const new_contig = rangesContig(&s.rx_ranges);
         const fresh = new_contig -| @min(old_contig, new_contig);
         if (fresh > 0) {
@@ -1245,17 +1261,17 @@ fn quicH3Parse(conn: *QuicConn, s: *QStream) void {
                 };
                 if (!s.h3_headers_done) {
                     for (pairs[0..n]) |p| {
-                        if (std.mem.eql(u8, p.name, ":method"))
-                            s.h3_method.appendSlice(a, p.value) catch {}
-                        else if (std.mem.eql(u8, p.name, ":path"))
-                            s.h3_path.appendSlice(a, p.value) catch {}
-                        else if (std.mem.eql(u8, p.name, ":authority"))
-                            s.h3_authority.appendSlice(a, p.value) catch {}
-                        else if (p.name.len > 0 and p.name[0] != ':') {
-                            s.h3_headers.appendSlice(a, p.name) catch {};
-                            s.h3_headers.appendSlice(a, ": ") catch {};
-                            s.h3_headers.appendSlice(a, p.value) catch {};
-                            s.h3_headers.appendSlice(a, "\r\n") catch {};
+                        if (std.mem.eql(u8, p.name, ":method")) {
+                            s.h3_method.appendSlice(a, p.value) catch { quicClose(conn, 0x0102, true); return; };
+                        } else if (std.mem.eql(u8, p.name, ":path")) {
+                            s.h3_path.appendSlice(a, p.value) catch { quicClose(conn, 0x0102, true); return; };
+                        } else if (std.mem.eql(u8, p.name, ":authority")) {
+                            s.h3_authority.appendSlice(a, p.value) catch { quicClose(conn, 0x0102, true); return; };
+                        } else if (p.name.len > 0 and p.name[0] != ':') {
+                            s.h3_headers.appendSlice(a, p.name) catch { quicClose(conn, 0x0102, true); return; };
+                            s.h3_headers.appendSlice(a, ": ") catch { quicClose(conn, 0x0102, true); return; };
+                            s.h3_headers.appendSlice(a, p.value) catch { quicClose(conn, 0x0102, true); return; };
+                            s.h3_headers.appendSlice(a, "\r\n") catch { quicClose(conn, 0x0102, true); return; };
                         }
                     }
                     s.h3_headers_done = true;
@@ -1268,7 +1284,7 @@ fn quicH3Parse(conn: *QuicConn, s: *QStream) void {
                     quicClose(conn, 0x0105, true); // H3_FRAME_UNEXPECTED
                     return;
                 }
-                s.h3_body.appendSlice(a, payload) catch {};
+                s.h3_body.appendSlice(a, payload) catch { quicClose(conn, 0x0102, true); return; };
             },
             else => {}, // SETTINGS on request stream / unknowns: skip
         }
@@ -1294,27 +1310,25 @@ fn quicH3Serve(conn: *QuicConn, s: *QStream) void {
         return;
     }
     var rq: std.ArrayListUnmanaged(u8) = .{};
-    rq.appendSlice(a, s.h3_method.items) catch return;
-    rq.appendSlice(a, " ") catch return;
-    rq.appendSlice(a, s.h3_path.items) catch return;
-    rq.appendSlice(a, " HTTP/1.1\r\nhost: ") catch return;
-    rq.appendSlice(a, s.h3_authority.items) catch return;
-    rq.appendSlice(a, "\r\n") catch return;
-    rq.appendSlice(a, s.h3_headers.items) catch return;
+    rq.appendSlice(a, s.h3_method.items) catch { quicClose(conn, 0x0102, true); return; };
+    rq.appendSlice(a, " ") catch { quicClose(conn, 0x0102, true); return; };
+    rq.appendSlice(a, s.h3_path.items) catch { quicClose(conn, 0x0102, true); return; };
+    rq.appendSlice(a, " HTTP/1.1\r\nhost: ") catch { quicClose(conn, 0x0102, true); return; };
+    rq.appendSlice(a, s.h3_authority.items) catch { quicClose(conn, 0x0102, true); return; };
+    rq.appendSlice(a, "\r\n") catch { quicClose(conn, 0x0102, true); return; };
+    rq.appendSlice(a, s.h3_headers.items) catch { quicClose(conn, 0x0102, true); return; };
     var cl_buf: [32]u8 = undefined;
-    const cl = std.fmt.bufPrint(&cl_buf, "content-length: {}\r\n\r\n", .{s.h3_body.items.len}) catch return;
-    rq.appendSlice(a, cl) catch return;
-    rq.appendSlice(a, s.h3_body.items) catch return;
-    const raw = a.dupe(u8, rq.items) catch return;
+    const cl = std.fmt.bufPrint(&cl_buf, "content-length: {}\r\n\r\n", .{s.h3_body.items.len}) catch { quicClose(conn, 0x0102, true); return; };
+    rq.appendSlice(a, cl) catch { quicClose(conn, 0x0102, true); return; };
+    rq.appendSlice(a, s.h3_body.items) catch { quicClose(conn, 0x0102, true); return; };
+    const raw = a.dupe(u8, rq.items) catch { quicClose(conn, 0x0102, true); return; };
     rq.deinit(a);
     const lane = conn.lane;
-    if (lane.ready_n >= lane.ready.len) {
+    lane.ready.append(pumpAlloc(), .{ .stream = s, .raw = raw }) catch {
         a.free(raw);
-        quicClose(conn, 0x0107, true);
+        quicClose(conn, 0x0102, true); // H3_INTERNAL_ERROR
         return;
-    }
-    lane.ready[lane.ready_n] = .{ .stream = s, .raw = raw };
-    lane.ready_n += 1;
+    };
     // Credit: a completed request stream earns the client another one.
     conn.streams_bidi_done += 1;
     const credit = QUIC_MAX_STREAMS_BIDI + conn.streams_bidi_done;
@@ -1328,12 +1342,12 @@ fn quicH3OpenControl(conn: *QuicConn) void {
     const s = quicStreamGet(conn, conn.next_uni_id, true) orelse return;
     conn.next_uni_id += 4;
     const a = conn.a();
-    s.sb.append(a, 0x00) catch {}; // control stream type
+    s.sb.append(a, 0x00) catch { quicClose(conn, 0x01, false); return; }; // control stream type
     // SETTINGS frame: QPACK_MAX_TABLE_CAPACITY=0, QPACK_BLOCKED_STREAMS=0
     const settings = [_]u8{ 0x01, 0x00, 0x07, 0x00 };
-    s.sb.append(a, 0x04) catch {};
-    qvPut(&s.sb, a, settings.len);
-    s.sb.appendSlice(a, &settings) catch {};
+    s.sb.append(a, 0x04) catch { quicClose(conn, 0x01, false); return; };
+    qvPut(&s.sb, a, settings.len) catch { quicClose(conn, 0x01, false); return; };
+    s.sb.appendSlice(a, &settings) catch { quicClose(conn, 0x01, false); return; };
     s.flow_hi = conn.peer_imsd_uni;
 }
 
@@ -1369,8 +1383,8 @@ fn emitAckFrame(out: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, rs: *QRx
         i -= 1;
         const r = rs_list.items[i];
         // gap = unacked pns between this range's top and prev range's bottom - 1
-        qvPut(out, a, prev_off - (r.off + r.len) - 1);
-        qvPut(out, a, r.len - 1);
+        qvPut(out, a, prev_off - (r.off + r.len) - 1) catch return false;
+        qvPut(out, a, r.len - 1) catch return false;
         prev_off = r.off;
     }
     rs.ack_pending = false;
@@ -1398,7 +1412,7 @@ fn quicBuildPacket(conn: *QuicConn, space: usize, out: []u8, budget: usize, pad_
     const rs = &conn.rx_space[space];
     if (rs.ack_pending and space != 0 or (space == 0 and rs.ack_pending)) {
         if (emitAckFrame(&frames, a, rs)) {
-            rec.frames.append(a, .ack) catch {};
+            rec.frames.append(a, .ack) catch { quicClose(conn, 0x01, false); return 0; };
             // ACK alone is not ack-eliciting — do not set elicit here.
         }
     }
@@ -1407,14 +1421,14 @@ fn quicBuildPacket(conn: *QuicConn, space: usize, out: []u8, budget: usize, pad_
         const r = conn.ctx_retx[space].orderedRemove(0);
         const n = @min(r.len, room -| frames.items.len -| 16);
         if (n == 0) break;
-        frames.append(a, 0x06) catch break;
-        qvPut(&frames, a, r.off);
-        qvPut(&frames, a, n);
-        frames.appendSlice(a, conn.ctx[space].items[@intCast(r.off)..@intCast(r.off + n)]) catch break;
-        rec.frames.append(a, .{ .crypto = .{ .off = r.off, .len = n } }) catch {};
+        frames.append(a, 0x06) catch { quicClose(conn, 0x01, false); return 0; };
+        qvPut(&frames, a, r.off) catch { quicClose(conn, 0x01, false); return 0; };
+        qvPut(&frames, a, n) catch { quicClose(conn, 0x01, false); return 0; };
+        frames.appendSlice(a, conn.ctx[space].items[@intCast(r.off)..@intCast(r.off + n)]) catch { quicClose(conn, 0x01, false); return 0; };
+        rec.frames.append(a, .{ .crypto = .{ .off = r.off, .len = n } }) catch { quicClose(conn, 0x01, false); return 0; };
         elicit = true;
         if (n < r.len) {
-            conn.ctx_retx[space].insert(a, 0, .{ .off = r.off + n, .len = r.len - n }) catch {};
+            conn.ctx_retx[space].insert(a, 0, .{ .off = r.off + n, .len = r.len - n }) catch { quicClose(conn, 0x01, false); return 0; };
             break;
         }
     }
@@ -1422,12 +1436,12 @@ fn quicBuildPacket(conn: *QuicConn, space: usize, out: []u8, budget: usize, pad_
         const off = conn.ctx_hi[space];
         const n = @min(conn.ctx[space].items.len - off, room -| frames.items.len -| 16);
         if (n == 0) break;
-        frames.append(a, 0x06) catch break;
-        qvPut(&frames, a, off);
-        qvPut(&frames, a, n);
-        frames.appendSlice(a, conn.ctx[space].items[off .. off + n]) catch break;
+        frames.append(a, 0x06) catch { quicClose(conn, 0x01, false); return 0; };
+        qvPut(&frames, a, off) catch { quicClose(conn, 0x01, false); return 0; };
+        qvPut(&frames, a, n) catch { quicClose(conn, 0x01, false); return 0; };
+        frames.appendSlice(a, conn.ctx[space].items[off .. off + n]) catch { quicClose(conn, 0x01, false); return 0; };
         conn.ctx_hi[space] += n;
-        rec.frames.append(a, .{ .crypto = .{ .off = off, .len = n } }) catch {};
+        rec.frames.append(a, .{ .crypto = .{ .off = off, .len = n } }) catch { quicClose(conn, 0x01, false); return 0; };
         elicit = true;
     }
     // control queue (app space only, plus close anywhere)
@@ -1437,27 +1451,27 @@ fn quicBuildPacket(conn: *QuicConn, space: usize, out: []u8, budget: usize, pad_
             const f = conn.ctrl_q.items[qi];
             const before = frames.items.len;
             switch (f) {
-                .handshake_done => frames.append(a, 0x1e) catch {},
+                .handshake_done => frames.append(a, 0x1e) catch { quicClose(conn, 0x01, false); return 0; },
                 .max_data => |v| {
-                    frames.append(a, 0x10) catch {};
-                    qvPut(&frames, a, v);
+                    frames.append(a, 0x10) catch { quicClose(conn, 0x01, false); return 0; };
+                    qvPut(&frames, a, v) catch { quicClose(conn, 0x01, false); return 0; };
                 },
                 .max_stream_data => |md| {
-                    frames.append(a, 0x11) catch {};
-                    qvPut(&frames, a, md.id);
-                    qvPut(&frames, a, md.v);
+                    frames.append(a, 0x11) catch { quicClose(conn, 0x01, false); return 0; };
+                    qvPut(&frames, a, md.id) catch { quicClose(conn, 0x01, false); return 0; };
+                    qvPut(&frames, a, md.v) catch { quicClose(conn, 0x01, false); return 0; };
                 },
                 .max_streams_bidi => |v| {
-                    frames.append(a, 0x12) catch {};
-                    qvPut(&frames, a, v);
+                    frames.append(a, 0x12) catch { quicClose(conn, 0x01, false); return 0; };
+                    qvPut(&frames, a, v) catch { quicClose(conn, 0x01, false); return 0; };
                 },
                 .max_streams_uni => |v| {
-                    frames.append(a, 0x13) catch {};
-                    qvPut(&frames, a, v);
+                    frames.append(a, 0x13) catch { quicClose(conn, 0x01, false); return 0; };
+                    qvPut(&frames, a, v) catch { quicClose(conn, 0x01, false); return 0; };
                 },
                 .path_response => |d| {
-                    frames.append(a, 0x1b) catch {};
-                    frames.appendSlice(a, &d) catch {};
+                    frames.append(a, 0x1b) catch { quicClose(conn, 0x01, false); return 0; };
+                    frames.appendSlice(a, &d) catch { quicClose(conn, 0x01, false); return 0; };
                 },
                 else => break,
             }
@@ -1465,7 +1479,7 @@ fn quicBuildPacket(conn: *QuicConn, space: usize, out: []u8, budget: usize, pad_
                 frames.items.len = before;
                 break;
             }
-            rec.frames.append(a, f) catch {};
+            rec.frames.append(a, f) catch { quicClose(conn, 0x01, false); return 0; };
             elicit = true;
             _ = conn.ctrl_q.orderedRemove(qi);
         }
@@ -1477,14 +1491,14 @@ fn quicBuildPacket(conn: *QuicConn, space: usize, out: []u8, budget: usize, pad_
             const before = frames.items.len;
             switch (pf) {
                 .conn_close => |cc| {
-                    frames.append(a, if (cc.app) 0x1d else 0x1c) catch {};
-                    qvPut(&frames, a, cc.code);
-                    if (!cc.app) qvPut(&frames, a, 0); // frame type 0
-                    qvPut(&frames, a, 0); // reason len
+                    frames.append(a, if (cc.app) 0x1d else 0x1c) catch { quicClose(conn, 0x01, false); return 0; };
+                    qvPut(&frames, a, cc.code) catch { quicClose(conn, 0x01, false); return 0; };
+                    if (!cc.app) qvPut(&frames, a, 0) catch { quicClose(conn, 0x01, false); return 0; }; // frame type 0
+                    qvPut(&frames, a, 0) catch { quicClose(conn, 0x01, false); return 0; }; // reason len
                 },
                 else => {},
             }
-            rec.frames.append(a, pf) catch {};
+            rec.frames.append(a, pf) catch { quicClose(conn, 0x01, false); return 0; };
             _ = before;
             elicit = true;
         }
@@ -1505,11 +1519,11 @@ fn quicBuildPacket(conn: *QuicConn, space: usize, out: []u8, budget: usize, pad_
                 if (n == 0) break;
                 n = @min(n, s.sb.items.len - r.off);
                 const fin = s.sb_fin and r.off + n >= s.sb.items.len;
-                quicEmitStreamFrame(&frames, a, s.id, r.off, n, fin, s.sb.items[@intCast(r.off)..@intCast(r.off + n)]);
-                rec.frames.append(a, .{ .stream = .{ .id = s.id, .off = r.off, .len = n, .fin = fin } }) catch {};
+                quicEmitStreamFrame(&frames, a, s.id, r.off, n, fin, s.sb.items[@intCast(r.off)..@intCast(r.off + n)]) catch { quicClose(conn, 0x01, false); return 0; };
+                rec.frames.append(a, .{ .stream = .{ .id = s.id, .off = r.off, .len = n, .fin = fin } }) catch { quicClose(conn, 0x01, false); return 0; };
                 elicit = true;
                 if (n < r.len) {
-                    s.sb_retx.insert(a, 0, .{ .off = r.off + n, .len = r.len - n }) catch {};
+                    s.sb_retx.insert(a, 0, .{ .off = r.off + n, .len = r.len - n }) catch { quicClose(conn, 0x01, false); return 0; };
                 }
             }
             // new data within the peer's stream window + conn max_data
@@ -1520,8 +1534,8 @@ fn quicBuildPacket(conn: *QuicConn, space: usize, out: []u8, budget: usize, pad_
                 if (n == 0) break;
                 const off = s.sb_hi;
                 const fin = s.sb_fin and off + n >= s.sb.items.len;
-                quicEmitStreamFrame(&frames, a, s.id, off, n, fin, s.sb.items[@intCast(off)..@intCast(off + n)]);
-                rec.frames.append(a, .{ .stream = .{ .id = s.id, .off = off, .len = n, .fin = fin } }) catch {};
+                quicEmitStreamFrame(&frames, a, s.id, off, n, fin, s.sb.items[@intCast(off)..@intCast(off + n)]) catch { quicClose(conn, 0x01, false); return 0; };
+                rec.frames.append(a, .{ .stream = .{ .id = s.id, .off = off, .len = n, .fin = fin } }) catch { quicClose(conn, 0x01, false); return 0; };
                 s.sb_hi += n;
                 conn.tx_data_sent += n;
                 elicit = true;
@@ -1532,8 +1546,8 @@ fn quicBuildPacket(conn: *QuicConn, space: usize, out: []u8, budget: usize, pad_
     }
     // PTO probe: nothing to say but must elicit — PING.
     if (!elicit and probe) {
-        frames.append(a, 0x01) catch {};
-        rec.frames.append(a, .ping) catch {};
+        frames.append(a, 0x01) catch { quicClose(conn, 0x01, false); return 0; };
+        rec.frames.append(a, .ping) catch { quicClose(conn, 0x01, false); return 0; };
         elicit = true;
     }
     if (frames.items.len == 0) return 0;
@@ -1545,7 +1559,7 @@ fn quicBuildPacket(conn: *QuicConn, space: usize, out: []u8, budget: usize, pad_
         const want = budget -| (hdr_est + 16);
         if (frames.items.len < want) {
             const pad_n = want - frames.items.len;
-            frames.appendNTimes(a, 0, pad_n) catch {};
+            frames.appendNTimes(a, 0, pad_n) catch { quicClose(conn, 0x01, false); return 0; };
         }
     }
     const pnl: usize = 4;
@@ -1553,33 +1567,33 @@ fn quicBuildPacket(conn: *QuicConn, space: usize, out: []u8, budget: usize, pad_
     var hdr: std.ArrayListUnmanaged(u8) = .{};
     defer hdr.deinit(a);
     if (space == 2) {
-        hdr.append(a, 0x40 | @as(u8, @intCast(pnl - 1))) catch return 0;
-        hdr.appendSlice(a, conn.dcid[0..conn.dcid_len]) catch return 0;
+        hdr.append(a, 0x40 | @as(u8, @intCast(pnl - 1))) catch { quicClose(conn, 0x01, false); return 0; };
+        hdr.appendSlice(a, conn.dcid[0..conn.dcid_len]) catch { quicClose(conn, 0x01, false); return 0; };
     } else {
-        hdr.append(a, (if (space == 0) @as(u8, 0xc0) else 0xe0) | @as(u8, @intCast(pnl - 1))) catch return 0;
+        hdr.append(a, (if (space == 0) @as(u8, 0xc0) else 0xe0) | @as(u8, @intCast(pnl - 1))) catch { quicClose(conn, 0x01, false); return 0; };
         var b4: [4]u8 = undefined;
         std.mem.writeInt(u32, &b4, QUIC_VERSION_1, .big);
-        hdr.appendSlice(a, &b4) catch return 0;
-        hdr.append(a, conn.dcid_len) catch return 0;
-        hdr.appendSlice(a, conn.dcid[0..conn.dcid_len]) catch return 0;
-        hdr.append(a, QUIC_SCID_LEN) catch return 0;
-        hdr.appendSlice(a, &conn.scid) catch return 0;
+        hdr.appendSlice(a, &b4) catch { quicClose(conn, 0x01, false); return 0; };
+        hdr.append(a, conn.dcid_len) catch { quicClose(conn, 0x01, false); return 0; };
+        hdr.appendSlice(a, conn.dcid[0..conn.dcid_len]) catch { quicClose(conn, 0x01, false); return 0; };
+        hdr.append(a, QUIC_SCID_LEN) catch { quicClose(conn, 0x01, false); return 0; };
+        hdr.appendSlice(a, &conn.scid) catch { quicClose(conn, 0x01, false); return 0; };
         if (space == 0) {
-            hdr.append(a, 0) catch return 0; // token len 0
+            hdr.append(a, 0) catch { quicClose(conn, 0x01, false); return 0; }; // token len 0
         }
         // length placeholder — fill after payload size known
         const plen = pnl + frames.items.len + 16;
-        qvPut(&hdr, a, plen);
+        qvPut(&hdr, a, plen) catch { quicClose(conn, 0x01, false); return 0; };
     }
     const pn_off = hdr.items.len;
     var pnb: [4]u8 = undefined;
     std.mem.writeInt(u32, &pnb, @intCast(pn & 0xffffffff), .big);
-    hdr.appendSlice(a, pnb[4 - pnl ..]) catch return 0;
+    hdr.appendSlice(a, pnb[4 - pnl ..]) catch { quicClose(conn, 0x01, false); return 0; };
 
     // serialize + encrypt
     var payload: std.ArrayListUnmanaged(u8) = .{};
     defer payload.deinit(a);
-    payload.appendSlice(a, frames.items) catch return 0;
+    payload.appendSlice(a, frames.items) catch { quicClose(conn, 0x01, false); return 0; };
     const total = hdr.items.len + payload.items.len + 16;
     if (total > out.len or total > budget + 64) {
         // over budget — put everything back so nothing is lost.
@@ -1612,6 +1626,8 @@ fn quicBuildPacket(conn: *QuicConn, space: usize, out: []u8, budget: usize, pad_
     if (elicit) {
         ts.sent.append(a, rec) catch {
             rec.frames.deinit(a);
+            quicClose(conn, 0x01, false);
+            return 0;
         };
     } else {
         rec.frames.deinit(a);
@@ -1619,16 +1635,16 @@ fn quicBuildPacket(conn: *QuicConn, space: usize, out: []u8, budget: usize, pad_
     return total;
 }
 
-fn quicEmitStreamFrame(out: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, id: u64, off: u64, n: u64, fin: bool, data: []const u8) void {
+fn quicEmitStreamFrame(out: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, id: u64, off: u64, n: u64, fin: bool, data: []const u8) error{OutOfMemory}!void {
     var ft: u8 = 0x08;
     if (off != 0) ft |= 0x04;
     ft |= 0x02; // LEN always present
     if (fin) ft |= 0x01;
-    out.append(a, ft) catch return;
-    qvPut(out, a, id);
-    if (off != 0) qvPut(out, a, off);
-    qvPut(out, a, n);
-    out.appendSlice(a, data) catch {};
+    try out.append(a, ft);
+    try qvPut(out, a, id);
+    if (off != 0) try qvPut(out, a, off);
+    try qvPut(out, a, n);
+    try out.appendSlice(a, data);
 }
 
 // ── datagram assembly + flush ────────────────────────────────────────────────
@@ -1679,7 +1695,7 @@ fn quicSweepDead(lane: *QuicLane) void {
     defer dead.deinit(pumpAlloc());
     var it = lane.conns.iterator();
     while (it.next()) |e| {
-        if (e.value_ptr.*.state == .dead) dead.append(pumpAlloc(), e.value_ptr.*) catch {};
+        if (e.value_ptr.*.state == .dead) dead.append(pumpAlloc(), e.value_ptr.*) catch { std.debug.print("Pump: quic sweep OOM — dead conn leaked\n", .{}); };
     }
     for (dead.items) |conn| quicConnDestroy(conn);
 }
@@ -1932,10 +1948,10 @@ fn quicRequeueFrame(conn: *QuicConn, space: usize, f: QSentFrame) void {
     const a = conn.a();
     switch (f) {
         .ack => conn.rx_space[space].ack_pending = true,
-        .crypto => |r| rangesAdd(&conn.ctx_retx[space], a, r.off, r.len),
+        .crypto => |r| rangesAdd(&conn.ctx_retx[space], a, r.off, r.len) catch { quicClose(conn, 0x01, false); return; },
         .stream => |sf| {
             if (quicStreamGet(conn, sf.id, false)) |s|
-                rangesAdd(&s.sb_retx, a, sf.off, sf.len + @intFromBool(sf.fin));
+                rangesAdd(&s.sb_retx, a, sf.off, sf.len + @intFromBool(sf.fin)) catch { quicClose(conn, 0x01, false); return; };
         },
         .handshake_done, .max_data, .max_stream_data, .max_streams_bidi, .max_streams_uni, .path_response, .reset_stream => quicCtrlQueue(conn, f),
         .conn_close => |cc| conn.close_pending = .{ .conn_close = cc },
@@ -2084,11 +2100,11 @@ fn h3Reply(s: *QStream, x: *Exchange, head: []const u8, body: []const u8, delay_
     fs.appendSlice(a, ebuf[0..en]) catch return false;
     // HEADERS frame
     s.sb.append(a, 0x01) catch return false;
-    qvPut(&s.sb, a, fs.items.len);
+    qvPut(&s.sb, a, fs.items.len) catch return false;
     s.sb.appendSlice(a, fs.items) catch return false;
     // one DATA frame header; payload follows contiguously
     s.sb.append(a, 0x00) catch return false;
-    qvPut(&s.sb, a, body.len);
+    qvPut(&s.sb, a, body.len) catch return false;
     s.sb.appendSlice(a, body) catch return false;
     if (delay_ms > 0) s.park_until = std.time.milliTimestamp() + delay_ms;
     quicFlush(conn.lane);
