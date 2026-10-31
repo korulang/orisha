@@ -6706,6 +6706,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
         // EAGAIN, hand each datagram to the lane, serve completed requests,
         // then flush — same batch shape as the PG lane.
         fn quicReadCqe(w: *@This(), cqe: linux.io_uring_cqe) void {
+            var drained: usize = 0;
             if (cqe.res >= 0) {
                 while (true) {
                     var src: $mod.posix.sockaddr.storage = undefined;
@@ -6714,6 +6715,14 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                     if (n == 0) break;
                     $mod.quicOnDgram(&w.quic, w.quic.rxbuf[0..n], @ptrCast(&src), src_len);
                     w.quicServe();
+                    drained += 1;
+                    // A long drain accumulates a kernel-queue backlog; replies
+                    // and ACKs must not wait for the whole batch — flush
+                    // periodically so peer-visible latency stays bounded.
+                    if (drained >= 16) {
+                        $mod.quicFlush(&w.quic);
+                        drained = 0;
+                    }
                 }
             }
             w.quicServe();
