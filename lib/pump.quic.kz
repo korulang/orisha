@@ -27,9 +27,358 @@ const QUIC_K_GRANULARITY_US: i64 = 1000;
 const QUIC_PKT_THRESH: u64 = 3;
 const QUIC_CWND_INIT: usize = 10 * QUIC_MAX_DGRAM;
 
-const AesGcm = std.crypto.aead.aes_gcm.Aes128Gcm;
 const AesHp = std.crypto.core.aes.Aes128;
 const HkdfQ = std.crypto.kdf.hkdf.HkdfSha256;
+
+// ── arm64 hardware AES ───────────────────────────────────────────────────────
+// Zig 0.15.2's std.crypto.core.aes selects its armcrypto backend only when
+// builtin.cpu declares .aarch64/.aes — and zig's native CPU detection in the
+// build VM resolves "generic" (no aes), so std silently ships the software
+// T-tables path while the silicon has aese/aesmc. This is a mirror of
+// std.crypto.aes.armcrypto's AES-128 encrypt path (GCM and QUIC header
+// protection never decrypt a block — no aesd/aesimc needed) plus a mirror of
+// std.crypto.aead.aes_gcm's encrypt/decrypt with the Aes type pinned to the
+// hardware impl. Selection is a runtime oracle — getauxval(AT_HWCAP) on
+// linux, unconditional on darwin, the declared feature set elsewhere — the
+// same contract koru_std's CRC pmull fold already uses. `.arch_extension aes`
+// inside each asm block admits the crypto mnemonics the target doesn't
+// declare; the branch keeps soft-AES silicon on the std path.
+
+var qk_aes_state = std.atomic.Value(u8).init(0); // 0 unknown, 1 absent, 2 present
+
+fn qkHwAes() bool {
+    switch (qk_aes_state.load(.monotonic)) {
+        1 => return false,
+        2 => return true,
+        else => {},
+    }
+    const builtin = @import("builtin");
+    // HWCAP_AES = 1<<3 — kernel ABI bit.
+    const v = if (builtin.cpu.arch != .aarch64)
+        false
+    else switch (builtin.os.tag) {
+        .linux => std.os.linux.getauxval(std.elf.AT_HWCAP) & (1 << 3) != 0,
+        .macos => true,
+        else => std.Target.aarch64.featureSetHas(builtin.cpu.features, .aes),
+    };
+    qk_aes_state.store(if (v) 2 else 1, .monotonic);
+    return v;
+}
+
+const HwAesBlock = struct {
+    const Repr = @Vector(2, u64);
+
+    pub const block_length: usize = 16;
+
+    repr: Repr,
+
+    pub fn fromBytes(bytes: *const [16]u8) HwAesBlock {
+        const repr = std.mem.bytesToValue(Repr, bytes);
+        return HwAesBlock{ .repr = repr };
+    }
+
+    pub fn toBytes(block: HwAesBlock) [16]u8 {
+        return std.mem.toBytes(block.repr);
+    }
+
+    pub fn xorBytes(block: HwAesBlock, bytes: *const [16]u8) [16]u8 {
+        const x = block.repr ^ fromBytes(bytes).repr;
+        return std.mem.toBytes(x);
+    }
+
+    const zero = @Vector(2, u64){ 0, 0 };
+
+    pub fn encrypt(block: HwAesBlock, round_key: HwAesBlock) HwAesBlock {
+        return HwAesBlock{
+            .repr = (asm (
+                \\ .arch_extension aes
+                \\ mov   %[out].16b, %[in].16b
+                \\ aese  %[out].16b, %[zero].16b
+                \\ aesmc %[out].16b, %[out].16b
+                : [out] "=&w" (-> Repr),
+                : [in] "w" (block.repr),
+                  [zero] "w" (zero),
+            )) ^ round_key.repr,
+        };
+    }
+
+    pub fn encryptLast(block: HwAesBlock, round_key: HwAesBlock) HwAesBlock {
+        return HwAesBlock{
+            .repr = (asm (
+                \\ .arch_extension aes
+                \\ mov   %[out].16b, %[in].16b
+                \\ aese  %[out].16b, %[zero].16b
+                : [out] "=&w" (-> Repr),
+                : [in] "w" (block.repr),
+                  [zero] "w" (zero),
+            )) ^ round_key.repr,
+        };
+    }
+
+    pub fn xorBlocks(block1: HwAesBlock, block2: HwAesBlock) HwAesBlock {
+        return HwAesBlock{ .repr = block1.repr ^ block2.repr };
+    }
+
+    pub const parallel = struct {
+        pub const optimal_parallel_blocks = 6;
+
+        pub fn encryptWide(comptime count: usize, blocks: [count]HwAesBlock, round_key: HwAesBlock) [count]HwAesBlock {
+            comptime var i = 0;
+            var out: [count]HwAesBlock = undefined;
+            inline while (i < count) : (i += 1) {
+                out[i] = blocks[i].encrypt(round_key);
+            }
+            return out;
+        }
+
+        pub fn encryptLastWide(comptime count: usize, blocks: [count]HwAesBlock, round_key: HwAesBlock) [count]HwAesBlock {
+            comptime var i = 0;
+            var out: [count]HwAesBlock = undefined;
+            inline while (i < count) : (i += 1) {
+                out[i] = blocks[i].encryptLast(round_key);
+            }
+            return out;
+        }
+    };
+};
+
+const HwAes128KeySchedule = struct {
+    const rounds = 10;
+    const Repr = HwAesBlock.Repr;
+
+    const zero = @Vector(2, u64){ 0, 0 };
+    const mask1 = @Vector(16, u8){ 13, 14, 15, 12, 13, 14, 15, 12, 13, 14, 15, 12, 13, 14, 15, 12 };
+
+    round_keys: [rounds + 1]HwAesBlock,
+
+    fn drc128(comptime rc: u8, t: Repr) Repr {
+        var v1: Repr = undefined;
+        var v2: Repr = undefined;
+        var v3: Repr = undefined;
+        var v4: Repr = undefined;
+
+        return asm (
+            \\ .arch_extension aes
+            \\ movi %[v2].4s, %[rc]
+            \\ tbl  %[v4].16b, {%[t].16b}, %[mask].16b
+            \\ ext  %[r].16b, %[zero].16b, %[t].16b, #12
+            \\ aese %[v4].16b, %[zero].16b
+            \\ eor  %[v2].16b, %[r].16b, %[v2].16b
+            \\ ext  %[r].16b, %[zero].16b, %[r].16b, #12
+            \\ eor  %[v1].16b, %[v2].16b, %[t].16b
+            \\ ext  %[v3].16b, %[zero].16b, %[r].16b, #12
+            \\ eor  %[v1].16b, %[v1].16b, %[r].16b
+            \\ eor  %[r].16b, %[v1].16b, %[v3].16b
+            \\ eor  %[r].16b, %[r].16b, %[v4].16b
+            : [r] "=&w" (-> Repr),
+              [v1] "=&w" (v1),
+              [v2] "=&w" (v2),
+              [v3] "=&w" (v3),
+              [v4] "=&w" (v4),
+            : [rc] "N" (rc),
+              [t] "w" (t),
+              [zero] "w" (zero),
+              [mask] "w" (mask1),
+        );
+    }
+
+    fn expand128(t1: *HwAesBlock) HwAes128KeySchedule {
+        var round_keys: [11]HwAesBlock = undefined;
+        const rcs = [_]u8{ 1, 2, 4, 8, 16, 32, 64, 128, 27, 54 };
+        inline for (rcs, 0..) |rc, round| {
+            round_keys[round] = t1.*;
+            t1.repr = drc128(rc, t1.repr);
+        }
+        round_keys[rcs.len] = t1.*;
+        return .{ .round_keys = round_keys };
+    }
+};
+
+const HwAes128EncCtx = struct {
+    pub const block = HwAesBlock;
+    pub const block_length = block.block_length;
+    key_schedule: HwAes128KeySchedule,
+
+    pub fn init(key: [16]u8) HwAes128EncCtx {
+        var t1 = HwAesBlock.fromBytes(key[0..16]);
+        return .{ .key_schedule = HwAes128KeySchedule.expand128(&t1) };
+    }
+
+    pub fn encrypt(ctx: HwAes128EncCtx, dst: *[16]u8, src: *const [16]u8) void {
+        const round_keys = ctx.key_schedule.round_keys;
+        var t = HwAesBlock.fromBytes(src).xorBlocks(round_keys[0]);
+        comptime var i = 1;
+        inline while (i < 10) : (i += 1) {
+            t = t.encrypt(round_keys[i]);
+        }
+        t = t.encryptLast(round_keys[10]);
+        dst.* = t.toBytes();
+    }
+
+    pub fn xor(ctx: HwAes128EncCtx, dst: *[16]u8, src: *const [16]u8, counter: [16]u8) void {
+        const round_keys = ctx.key_schedule.round_keys;
+        var t = HwAesBlock.fromBytes(&counter).xorBlocks(round_keys[0]);
+        comptime var i = 1;
+        inline while (i < 10) : (i += 1) {
+            t = t.encrypt(round_keys[i]);
+        }
+        t = t.encryptLast(round_keys[10]);
+        dst.* = t.xorBytes(src);
+    }
+
+    pub fn encryptWide(ctx: HwAes128EncCtx, comptime count: usize, dst: *[16 * count]u8, src: *const [16 * count]u8) void {
+        const round_keys = ctx.key_schedule.round_keys;
+        var ts: [count]HwAesBlock = undefined;
+        comptime var j = 0;
+        inline while (j < count) : (j += 1) {
+            ts[j] = HwAesBlock.fromBytes(src[j * 16 .. j * 16 + 16][0..16]).xorBlocks(round_keys[0]);
+        }
+        comptime var i = 1;
+        inline while (i < 10) : (i += 1) {
+            ts = HwAesBlock.parallel.encryptWide(count, ts, round_keys[i]);
+        }
+        ts = HwAesBlock.parallel.encryptLastWide(count, ts, round_keys[i]);
+        j = 0;
+        inline while (j < count) : (j += 1) {
+            dst[16 * j .. 16 * j + 16].* = ts[j].toBytes();
+        }
+    }
+
+    pub fn xorWide(ctx: HwAes128EncCtx, comptime count: usize, dst: *[16 * count]u8, src: *const [16 * count]u8, counters: [16 * count]u8) void {
+        const round_keys = ctx.key_schedule.round_keys;
+        var ts: [count]HwAesBlock = undefined;
+        comptime var j = 0;
+        inline while (j < count) : (j += 1) {
+            ts[j] = HwAesBlock.fromBytes(counters[j * 16 .. j * 16 + 16][0..16]).xorBlocks(round_keys[0]);
+        }
+        comptime var i = 1;
+        inline while (i < 10) : (i += 1) {
+            ts = HwAesBlock.parallel.encryptWide(count, ts, round_keys[i]);
+        }
+        ts = HwAesBlock.parallel.encryptLastWide(count, ts, round_keys[i]);
+        j = 0;
+        inline while (j < count) : (j += 1) {
+            dst[16 * j .. 16 * j + 16].* = ts[j].xorBytes(src[16 * j .. 16 * j + 16]);
+        }
+    }
+};
+
+const HwAes128 = struct {
+    pub const key_bits: usize = 128;
+    pub const rounds = 10;
+    pub const block = HwAesBlock;
+
+    pub fn initEnc(key: [key_bits / 8]u8) HwAes128EncCtx {
+        return HwAes128EncCtx.init(key);
+    }
+};
+
+// Mirror of std.crypto.aead.aes_gcm.AesGcm — std's is a private generic we
+// cannot instantiate against HwAes128, so the body is copied with the Aes
+// type pinned. Ghash stays std's (its clmul is a private comptime pick on
+// the same builtin.cpu that missed aes — vendoring it is a separate cost).
+const HwAesGcm = struct {
+    pub const tag_length = 16;
+    pub const nonce_length = 12;
+    pub const key_length = HwAes128.key_bits / 8;
+
+    const Ghash = std.crypto.onetimeauth.Ghash;
+    const zeros = [_]u8{0} ** 16;
+
+    pub fn encrypt(ct: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, key: [key_length]u8) void {
+        std.debug.assert(ct.len == m.len);
+        std.debug.assert(m.len <= 16 * ((1 << 32) - 2));
+
+        const aes = HwAes128.initEnc(key);
+        var h: [16]u8 = undefined;
+        aes.encrypt(&h, &zeros);
+
+        var t: [16]u8 = undefined;
+        var j: [16]u8 = undefined;
+        j[0..nonce_length].* = npub;
+        std.mem.writeInt(u32, j[nonce_length..][0..4], 1, .big);
+        aes.encrypt(&t, &j);
+
+        const block_count = (std.math.divCeil(usize, ad.len, Ghash.block_length) catch unreachable) + (std.math.divCeil(usize, ct.len, Ghash.block_length) catch unreachable) + 1;
+        var mac = Ghash.initForBlockCount(&h, block_count);
+        mac.update(ad);
+        mac.pad();
+
+        std.mem.writeInt(u32, j[nonce_length..][0..4], 2, .big);
+        std.crypto.core.modes.ctr(@TypeOf(aes), aes, ct, m, j, .big);
+        mac.update(ct[0..m.len][0..]);
+        mac.pad();
+
+        var final_block = h;
+        std.mem.writeInt(u64, final_block[0..8], @as(u64, ad.len) * 8, .big);
+        std.mem.writeInt(u64, final_block[8..16], @as(u64, m.len) * 8, .big);
+        mac.update(&final_block);
+        mac.final(tag);
+        for (t, 0..) |x, i| {
+            tag[i] ^= x;
+        }
+    }
+
+    pub fn decrypt(m: []u8, ct: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, key: [key_length]u8) std.crypto.errors.AuthenticationError!void {
+        std.debug.assert(ct.len == m.len);
+
+        const aes = HwAes128.initEnc(key);
+        var h: [16]u8 = undefined;
+        aes.encrypt(&h, &zeros);
+
+        var t: [16]u8 = undefined;
+        var j: [16]u8 = undefined;
+        j[0..nonce_length].* = npub;
+        std.mem.writeInt(u32, j[nonce_length..][0..4], 1, .big);
+        aes.encrypt(&t, &j);
+
+        const block_count = (std.math.divCeil(usize, ad.len, Ghash.block_length) catch unreachable) + (std.math.divCeil(usize, ct.len, Ghash.block_length) catch unreachable) + 1;
+        var mac = Ghash.initForBlockCount(&h, block_count);
+        mac.update(ad);
+        mac.pad();
+
+        mac.update(ct);
+        mac.pad();
+
+        var final_block = h;
+        std.mem.writeInt(u64, final_block[0..8], @as(u64, ad.len) * 8, .big);
+        std.mem.writeInt(u64, final_block[8..16], @as(u64, m.len) * 8, .big);
+        mac.update(&final_block);
+        var computed_tag: [Ghash.mac_length]u8 = undefined;
+        mac.final(&computed_tag);
+        for (t, 0..) |x, i| {
+            computed_tag[i] ^= x;
+        }
+
+        const verify = std.crypto.timing_safe.eql([tag_length]u8, computed_tag, tag);
+        if (!verify) {
+            std.crypto.secureZero(u8, &computed_tag);
+            @memset(m, undefined);
+            return error.AuthenticationFailed;
+        }
+
+        std.mem.writeInt(u32, j[nonce_length..][0..4], 2, .big);
+        std.crypto.core.modes.ctr(@TypeOf(aes), aes, m, ct, j, .big);
+    }
+};
+
+// Packet-protection surface: hardware AES when the running silicon has it
+// (the oracle above), std's soft tables otherwise. One atomic load per op.
+const AesGcm = struct {
+    pub fn encrypt(ct: []u8, tag: *[16]u8, m: []const u8, ad: []const u8, npub: [12]u8, key: [16]u8) void {
+        if (comptime @import("builtin").cpu.arch == .aarch64) {
+            if (qkHwAes()) return HwAesGcm.encrypt(ct, tag, m, ad, npub, key);
+        }
+        return std.crypto.aead.aes_gcm.Aes128Gcm.encrypt(ct, tag, m, ad, npub, key);
+    }
+
+    pub fn decrypt(m: []u8, ct: []const u8, tag: [16]u8, ad: []const u8, npub: [12]u8, key: [16]u8) std.crypto.errors.AuthenticationError!void {
+        if (comptime @import("builtin").cpu.arch == .aarch64) {
+            if (qkHwAes()) return HwAesGcm.decrypt(m, ct, tag, ad, npub, key);
+        }
+        return std.crypto.aead.aes_gcm.Aes128Gcm.decrypt(m, ct, tag, ad, npub, key);
+    }
+};
 
 // ── env + ctx ────────────────────────────────────────────────────────────────
 
@@ -931,8 +1280,15 @@ fn pnExpand(wire: u64, pnl: usize, largest: i64) u64 {
 }
 
 fn hpMask(hp: *const [16]u8, sample: *const [16]u8) [16]u8 {
-    const ctx = AesHp.initEnc(hp.*);
     var out: [16]u8 = undefined;
+    if (comptime @import("builtin").cpu.arch == .aarch64) {
+        if (qkHwAes()) {
+            const ctx = HwAes128.initEnc(hp.*);
+            ctx.encrypt(&out, sample);
+            return out;
+        }
+    }
+    const ctx = AesHp.initEnc(hp.*);
     ctx.encrypt(&out, sample);
     return out;
 }
