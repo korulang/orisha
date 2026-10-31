@@ -1129,6 +1129,32 @@ fn staticRoot() []const u8 {
     return std.posix.getenv("STATIC_DIR") orelse "/data/static";
 }
 
+// Runtime-static cache. A request costs one stat, not a full read: the
+// entry is fresh while (mtime, size) match, so a mid-run rewrite still
+// lands on its next request. Replaced bodies are never freed — a sibling
+// worker may still be mid-reply on the old bytes, and the corpus bounds
+// the leak.
+const StaticFileEntry = struct { body: []u8, mtime: i128, size: u64 };
+var static_file_mu: std.Thread.Mutex = .{};
+var static_file_map: ?std.StringHashMap(StaticFileEntry) = null;
+
+fn staticFileCached(target: []const u8, st: std.fs.File.Stat) ?[]u8 {
+    static_file_mu.lock();
+    defer static_file_mu.unlock();
+    const map = if (static_file_map) |*m| m else return null;
+    const e = map.get(target) orelse return null;
+    if (e.mtime != st.mtime or e.size != st.size) return null;
+    return e.body;
+}
+
+fn staticFileStore(a: std.mem.Allocator, target: []const u8, st: std.fs.File.Stat, body: []u8) void {
+    static_file_mu.lock();
+    defer static_file_mu.unlock();
+    if (static_file_map == null) static_file_map = std.StringHashMap(StaticFileEntry).init(a);
+    const key = a.dupe(u8, target) catch return;
+    static_file_map.?.put(key, .{ .body = body, .mtime = st.mtime, .size = st.size }) catch a.free(key);
+}
+
 fn servePathAlloc(a: std.mem.Allocator, parts: []const []const u8) ?[]u8 {
     var len: usize = 0;
     for (parts) |p| len += p.len;
@@ -1185,8 +1211,15 @@ fn servePathAlloc(a: std.mem.Allocator, parts: []const []const u8) ?[]u8 {
         return .{ .status = 500, .body = "alloc failed", .content_type = "text/plain" };
     });
     defer a.free(target);
-    const body = std.fs.cwd().readFileAlloc(a, target, 64 * 1024 * 1024) catch {
+    const st = std.fs.cwd().statFile(target) catch {
         return .{ .status = 404, .body = "not found", .content_type = "text/plain" };
+    };
+    const body = $mod.staticFileCached(target, st) orelse blk: {
+        const fresh = std.fs.cwd().readFileAlloc(a, target, 64 * 1024 * 1024) catch {
+            return .{ .status = 404, .body = "not found", .content_type = "text/plain" };
+        };
+        $mod.staticFileStore(a, target, st, fresh);
+        break :blk fresh;
     };
     return .{
         .status = 200,
@@ -1194,7 +1227,7 @@ fn servePathAlloc(a: std.mem.Allocator, parts: []const []const u8) ?[]u8 {
         .content_type = mimeTypeFromPath(path),
         .content_encoding = encoding,
         .extra_headers = if (encoding != null) "Vary: Accept-Encoding\r\n" else null,
-        .body_allocated = true,
+        .body_allocated = false,
     };
 }
 
