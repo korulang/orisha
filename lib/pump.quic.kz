@@ -26,6 +26,10 @@ const QUIC_MAX_STREAM_DATA: u64 = 4 * 1024 * 1024;
 const QUIC_K_GRANULARITY_US: i64 = 1000;
 const QUIC_PKT_THRESH: u64 = 3;
 const QUIC_CWND_INIT: usize = 10 * QUIC_MAX_DGRAM;
+// Early-1RTT buffer: datagrams arriving before app RX keys are held for
+// replay rather than dropped. Bounded per conn — past this, drop (allowed).
+const QUIC_EARLY_1RTT_MAX: usize = 8;
+const QUIC_EARLY_1RTT_BYTES: usize = 16 * 1024;
 
 const AesHp = std.crypto.core.aes.Aes128;
 const HkdfQ = std.crypto.kdf.hkdf.HkdfSha256;
@@ -942,6 +946,9 @@ const QuicConn = struct {
     // builder drains the front; still-pending streams re-join at the back —
     // ngtcp2's tx.strmq pop/push cycle, minus the heap.
     tx_ready: std.ArrayListUnmanaged(*QStream) = .{},
+    // 1-RTT datagrams that arrived before keys_rx[2] — replayed on install.
+    early_1rtt: std.ArrayListUnmanaged([]u8) = .{},
+    early_1rtt_bytes: usize = 0,
     probe_pending: bool = false,
     huff: HpackTable = .{},
 
@@ -1266,6 +1273,8 @@ fn quicConnDestroy(conn: *QuicConn) void {
     for (conn.frame_pool.items) |*fl| fl.deinit(a);
     conn.frame_pool.deinit(a);
     conn.tx_ready.deinit(a);
+    for (conn.early_1rtt.items) |dgram| a.free(dgram);
+    conn.early_1rtt.deinit(a);
     conn.bidi_closed.deinit(a);
     conn.tp_buf.deinit(a);
     conn.huff.deinit(a);
@@ -2511,7 +2520,8 @@ fn quicOnDgram(lane: *QuicLane, dgram: []u8, src: *const posix.sockaddr, src_len
         const key = std.mem.readInt(u64, dgram[1..9], .big);
         const conn = lane.conns.get(key) orelse return;
         conn.rx_bytes_total += dgram.len;
-        quicOnShort(conn, dgram);
+        quicOn1RttDgram(conn, dgram);
+        quicDrainEarly(conn);
         return;
     }
     const version = std.mem.readInt(u32, dgram[1..5], .big);
@@ -2561,6 +2571,44 @@ fn quicOnDgram(lane: *QuicLane, dgram: []u8, src: *const posix.sockaddr, src_len
         const consumed = quicOnLongPacket(qc, dgram[p..]) orelse break;
         p += consumed;
     }
+    // A long-header flight can end in a coalesced 1-RTT packet (ngtcp2 sends
+    // Finished+first-request in one dgram) — the walk above stops at it.
+    // Leaving the tail on the floor drops the peer's first app packet, which
+    // is a real loss signal for their congestion control.
+    if (p < dgram.len and dgram[p] & 0x80 == 0) quicOn1RttDgram(qc, dgram[p..]);
+    // Processing above may have yielded app read keys — drain anything that
+    // arrived before them.
+    quicDrainEarly(qc);
+}
+
+// A short-header datagram, or the short-header tail of a coalesced datagram.
+// Before app RX keys exist the packet is undecryptable — buffer it (bounded)
+// instead of dropping it; quicDrainEarly replays once keys land.
+fn quicOn1RttDgram(conn: *QuicConn, dgram: []u8) void {
+    if (!conn.keys_rx[2].present) {
+        if (conn.early_1rtt.items.len >= QUIC_EARLY_1RTT_MAX or
+            conn.early_1rtt_bytes + dgram.len > QUIC_EARLY_1RTT_BYTES or
+            dgram.len > QUIC_EARLY_1RTT_BYTES) return; // bounded buffer exhausted — drop, as allowed
+        const copy = conn.a().alloc(u8, dgram.len) catch return;
+        @memcpy(copy, dgram);
+        conn.early_1rtt.append(conn.a(), copy) catch {
+            conn.a().free(copy);
+            return;
+        };
+        conn.early_1rtt_bytes += dgram.len;
+        return;
+    }
+    quicOnShort(conn, dgram);
+}
+
+fn quicDrainEarly(conn: *QuicConn) void {
+    if (!conn.keys_rx[2].present or conn.early_1rtt.items.len == 0) return;
+    for (conn.early_1rtt.items) |dgram| {
+        quicOnShort(conn, dgram);
+        conn.a().free(dgram);
+    }
+    conn.early_1rtt.clearRetainingCapacity();
+    conn.early_1rtt_bytes = 0;
 }
 
 // Parse+decrypt one long-header packet (or short, same fn shape split below).
