@@ -1,0 +1,6 @@
+name: defect-fixed
+kind: inferred
+shape: categorical
+face: in
+membrane: false
+note: a named defect fixed in the stack with measured before/after — declared when the fix landed, evidence in the commit
