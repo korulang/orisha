@@ -1158,9 +1158,12 @@ fn quicOnAck(conn: *QuicConn, space: usize, lo: u64, hi: u64) void {
     const sp = &conn.tx_space[space];
     const now = std.time.microTimestamp();
     var newly: usize = 0;
+    var w: usize = 0; // compaction write index — removals are batched,
+    // not per-packet orderedRemove memmoves (O(n^2) on deep sent lists).
     var i: usize = 0;
-    while (i < sp.sent.items.len) {
+    while (i < sp.sent.items.len) : (i += 1) {
         const p = &sp.sent.items[i];
+        var keep = true;
         if (p.pn >= lo and p.pn <= hi) {
             if (p.pn > @as(u64, @intCast(@max(sp.largest_acked, 0)))) sp.largest_acked = @intCast(p.pn);
             if (p.ack_eliciting and p.time_us > 0) {
@@ -1219,9 +1222,14 @@ fn quicOnAck(conn: *QuicConn, space: usize, lo: u64, hi: u64) void {
                 }
             }
             p.frames.deinit(conn.a());
-            _ = sp.sent.orderedRemove(i);
-        } else i += 1;
+            keep = false;
+        }
+        if (keep) {
+            if (w != i) sp.sent.items[w] = sp.sent.items[i];
+            w += 1;
+        }
     }
+    sp.sent.items.len = w;
 }
 
 fn quicOnStreamData(conn: *QuicConn, id: u64, off: u64, data: []const u8, fin: bool) void {
