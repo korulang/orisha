@@ -30,6 +30,10 @@ const QUIC_CWND_INIT: usize = 10 * QUIC_MAX_DGRAM;
 const AesGcm = std.crypto.aead.aes_gcm.Aes128Gcm;
 const AesHp = std.crypto.core.aes.Aes128;
 const HkdfQ = std.crypto.kdf.hkdf.HkdfSha256;
+const AesEncCtx = std.crypto.core.aes.AesEncryptCtx(AesHp);
+const QGhash = std.crypto.onetimeauth.Ghash;
+const QCtr = std.crypto.core.modes.ctr;
+const GCM_ZEROS = [_]u8{0} ** 16;
 
 // ── env + ctx ────────────────────────────────────────────────────────────────
 
@@ -242,6 +246,12 @@ const QKeys = struct {
     key: [16]u8 = undefined,
     iv: [12]u8 = undefined,
     hp: [16]u8 = undefined,
+    // Expanded AES contexts + the GHASH subkey, expanded once per secret.
+    // Before this, every packet paid a full AES key expansion twice: once
+    // inside AesGcm.encrypt/decrypt and once inside hpMask's initEnc.
+    enc_ctx: AesEncCtx = undefined,
+    hp_ctx: AesEncCtx = undefined,
+    ghash_h: [16]u8 = undefined, // H = E(key, 0) — depends on the key only
     present: bool = false,
 };
 
@@ -268,6 +278,9 @@ fn keysFromSecret(ks: *QKeys, secret: []const u8) void {
     hkdfLabel(secret, "quic key", &ks.key);
     hkdfLabel(secret, "quic iv", &ks.iv);
     hkdfLabel(secret, "quic hp", &ks.hp);
+    ks.enc_ctx = AesHp.initEnc(ks.key);
+    ks.hp_ctx = AesHp.initEnc(ks.hp);
+    ks.enc_ctx.encrypt(&ks.ghash_h, &GCM_ZEROS);
     ks.present = true;
 }
 
@@ -575,6 +588,9 @@ const QuicConn = struct {
     close_code: u64 = 0,
     peer_kbit: u8 = 0,
     ctrl_q: std.ArrayListUnmanaged(QSentFrame) = .{},
+    // Recycled sent-record frame lists: a packet's QSentPacket.frames buffer
+    // returns here on ack/loss instead of round-tripping malloc per packet.
+    frame_pool: std.ArrayListUnmanaged(std.ArrayListUnmanaged(QSentFrame)) = .{},
     tp_buf: std.ArrayListUnmanaged(u8) = .{},
     probe_pending: bool = false,
     huff: HpackTable = .{},
@@ -598,6 +614,10 @@ pub const QuicLane = struct {
     rxbuf: [65536]u8 = undefined,
     dbuf: [65536]u8 = undefined,
     pt_buf: [65536]u8 = undefined,
+    // quicBuildPacket scratch: one reused list instead of a fresh
+    // malloc/free for every packet built on this lane. Packets are built
+    // serially per lane, so sharing the buffer is safe.
+    build_frames: std.ArrayListUnmanaged(u8) = .{},
     flush_again: bool = false,
 };
 
@@ -881,6 +901,8 @@ fn quicConnDestroy(conn: *QuicConn) void {
         conn.ctx_retx[i].deinit(a);
     }
     conn.ctrl_q.deinit(a);
+    for (conn.frame_pool.items) |*fl| fl.deinit(a);
+    conn.frame_pool.deinit(a);
     conn.bidi_closed.deinit(a);
     conn.tp_buf.deinit(a);
     conn.huff.deinit(a);
@@ -910,6 +932,29 @@ fn quicStreamGet(conn: *QuicConn, id: u64, create: bool) ?*QStream {
     return s;
 }
 
+// Sent-record frame lists are per-packet allocations on the hot path; the
+// conn-local pool keeps the buffer alive across packets. Cap is a bound on
+// retained bytes, not correctness — a full pool just falls back to free.
+fn quicFramesScratch(conn: *QuicConn) std.ArrayListUnmanaged(QSentFrame) {
+    if (conn.frame_pool.pop()) |l| return l;
+    return .{};
+}
+
+fn quicRecycleSentFrames(conn: *QuicConn, p: *QSentPacket) void {
+    p.frames.clearRetainingCapacity();
+    if (conn.frame_pool.items.len < 128) {
+        conn.frame_pool.append(conn.a(), p.frames) catch {
+            p.frames.deinit(conn.a());
+            p.frames = .{};
+            return;
+        };
+        p.frames = .{};
+    } else {
+        p.frames.deinit(conn.a());
+        p.frames = .{};
+    }
+}
+
 // ── packet receive ───────────────────────────────────────────────────────────
 
 const QPktKind = enum { initial, handshake, app };
@@ -930,11 +975,65 @@ fn pnExpand(wire: u64, pnl: usize, largest: i64) u64 {
     return candidate;
 }
 
-fn hpMask(hp: *const [16]u8, sample: *const [16]u8) [16]u8 {
-    const ctx = AesHp.initEnc(hp.*);
+fn hpMask(ks: *const QKeys, sample: *const [16]u8) [16]u8 {
     var out: [16]u8 = undefined;
-    ctx.encrypt(&out, sample);
+    ks.hp_ctx.encrypt(&out, sample);
     return out;
+}
+
+// Aes128-GCM over a cached key schedule — std's AesGcm.encrypt/decrypt re-run
+// Aes128.initEnc and E(key,0) per call; both are key-only work, so they live
+// on QKeys now. Bodies mirror std.crypto.aead.aes_gcm.AesGcm(Aes128) exactly.
+fn gcmEncrypt(ks: *const QKeys, dst: []u8, tag: *[16]u8, m: []const u8, ad: []const u8, npub: [12]u8) void {
+    var t: [16]u8 = undefined;
+    var j: [16]u8 = undefined;
+    j[0..12].* = npub;
+    std.mem.writeInt(u32, j[12..][0..4], 1, .big);
+    ks.enc_ctx.encrypt(&t, &j);
+    const block_count = (std.math.divCeil(usize, ad.len, QGhash.block_length) catch unreachable) +
+        (std.math.divCeil(usize, dst.len, QGhash.block_length) catch unreachable) + 1;
+    var mac = QGhash.initForBlockCount(&ks.ghash_h, block_count);
+    mac.update(ad);
+    mac.pad();
+    std.mem.writeInt(u32, j[12..][0..4], 2, .big);
+    QCtr(AesEncCtx, ks.enc_ctx, dst, m, j, .big);
+    mac.update(dst);
+    mac.pad();
+    var final_block = ks.ghash_h;
+    std.mem.writeInt(u64, final_block[0..8], @as(u64, ad.len) * 8, .big);
+    std.mem.writeInt(u64, final_block[8..16], @as(u64, m.len) * 8, .big);
+    mac.update(&final_block);
+    mac.final(tag);
+    for (t, 0..) |x, i| tag[i] ^= x;
+}
+
+fn gcmDecrypt(ks: *const QKeys, m: []u8, ct: []const u8, tag: [16]u8, ad: []const u8, npub: [12]u8) error{AuthenticationFailed}!void {
+    var t: [16]u8 = undefined;
+    var j: [16]u8 = undefined;
+    j[0..12].* = npub;
+    std.mem.writeInt(u32, j[12..][0..4], 1, .big);
+    ks.enc_ctx.encrypt(&t, &j);
+    const block_count = (std.math.divCeil(usize, ad.len, QGhash.block_length) catch unreachable) +
+        (std.math.divCeil(usize, ct.len, QGhash.block_length) catch unreachable) + 1;
+    var mac = QGhash.initForBlockCount(&ks.ghash_h, block_count);
+    mac.update(ad);
+    mac.pad();
+    mac.update(ct);
+    mac.pad();
+    var final_block = ks.ghash_h;
+    std.mem.writeInt(u64, final_block[0..8], @as(u64, ad.len) * 8, .big);
+    std.mem.writeInt(u64, final_block[8..16], @as(u64, m.len) * 8, .big);
+    mac.update(&final_block);
+    var computed: [16]u8 = undefined;
+    mac.final(&computed);
+    for (t, 0..) |x, i| computed[i] ^= x;
+    if (!std.crypto.timing_safe.eql([16]u8, computed, tag)) {
+        std.crypto.secureZero(u8, &computed);
+        @memset(m, undefined);
+        return error.AuthenticationFailed;
+    }
+    std.mem.writeInt(u32, j[12..][0..4], 2, .big);
+    QCtr(AesEncCtx, ks.enc_ctx, m, ct, j, .big);
 }
 
 // Feed received CRYPTO bytes into the level's reassembly, then drive the TLS.
@@ -1231,7 +1330,7 @@ fn quicOnAck(conn: *QuicConn, space: usize, lo: u64, hi: u64) void {
                     else => {},
                 }
             }
-            p.frames.deinit(conn.a());
+            quicRecycleSentFrames(conn, p);
             keep = false;
         }
         if (keep) {
@@ -1551,9 +1650,15 @@ fn quicBuildPacket(conn: *QuicConn, space: usize, out: []u8, budget: usize, pad_
     if (!ks.present) return 0;
     const a = conn.a();
     const ts = &conn.tx_space[space];
-    var frames: std.ArrayListUnmanaged(u8) = .{};
-    defer frames.deinit(a);
-    var rec: QSentPacket = .{};
+    // Frame bytes go to the lane's reused scratch list — serial per lane —
+    // and the header is serialized straight into `out`. Nothing below
+    // allocates on the packet path except the sent record's frame list,
+    // which itself comes from the conn's pool of recycled buffers.
+    const frames = &conn.lane.build_frames;
+    frames.clearRetainingCapacity();
+    var rec: QSentPacket = .{ .frames = quicFramesScratch(conn) };
+    var rec_stored = false;
+    defer if (!rec_stored) quicRecycleSentFrames(conn, &rec);
     var elicit = false;
 
     const room = budget -| 64; // header + tag slack
@@ -1562,7 +1667,7 @@ fn quicBuildPacket(conn: *QuicConn, space: usize, out: []u8, budget: usize, pad_
     // ACK
     const rs = &conn.rx_space[space];
     if (rs.ack_pending and space != 0 or (space == 0 and rs.ack_pending)) {
-        if (emitAckFrame(&frames, a, rs)) {
+        if (emitAckFrame(frames, a, rs)) {
             rec.frames.append(a, .ack) catch { quicClose(conn, 0x01, false); return 0; };
             // ACK alone is not ack-eliciting — do not set elicit here.
         }
@@ -1573,8 +1678,8 @@ fn quicBuildPacket(conn: *QuicConn, space: usize, out: []u8, budget: usize, pad_
         const n = @min(r.len, room -| frames.items.len -| 16);
         if (n == 0) break;
         frames.append(a, 0x06) catch { quicClose(conn, 0x01, false); return 0; };
-        qvPut(&frames, a, r.off) catch { quicClose(conn, 0x01, false); return 0; };
-        qvPut(&frames, a, n) catch { quicClose(conn, 0x01, false); return 0; };
+        qvPut(frames, a, r.off) catch { quicClose(conn, 0x01, false); return 0; };
+        qvPut(frames, a, n) catch { quicClose(conn, 0x01, false); return 0; };
         frames.appendSlice(a, conn.ctx[space].items[@intCast(r.off)..@intCast(r.off + n)]) catch { quicClose(conn, 0x01, false); return 0; };
         rec.frames.append(a, .{ .crypto = .{ .off = r.off, .len = n } }) catch { quicClose(conn, 0x01, false); return 0; };
         elicit = true;
@@ -1588,8 +1693,8 @@ fn quicBuildPacket(conn: *QuicConn, space: usize, out: []u8, budget: usize, pad_
         const n = @min(conn.ctx[space].items.len - off, room -| frames.items.len -| 16);
         if (n == 0) break;
         frames.append(a, 0x06) catch { quicClose(conn, 0x01, false); return 0; };
-        qvPut(&frames, a, off) catch { quicClose(conn, 0x01, false); return 0; };
-        qvPut(&frames, a, n) catch { quicClose(conn, 0x01, false); return 0; };
+        qvPut(frames, a, off) catch { quicClose(conn, 0x01, false); return 0; };
+        qvPut(frames, a, n) catch { quicClose(conn, 0x01, false); return 0; };
         frames.appendSlice(a, conn.ctx[space].items[off .. off + n]) catch { quicClose(conn, 0x01, false); return 0; };
         conn.ctx_hi[space] += n;
         rec.frames.append(a, .{ .crypto = .{ .off = off, .len = n } }) catch { quicClose(conn, 0x01, false); return 0; };
@@ -1607,21 +1712,21 @@ fn quicBuildPacket(conn: *QuicConn, space: usize, out: []u8, budget: usize, pad_
                     // retransmits must carry the CURRENT credit, not the
                     // value captured when the frame was first queued.
                     frames.append(a, 0x10) catch { quicClose(conn, 0x01, false); return 0; };
-                    qvPut(&frames, a, conn.rx_max_data) catch { quicClose(conn, 0x01, false); return 0; };
+                    qvPut(frames, a, conn.rx_max_data) catch { quicClose(conn, 0x01, false); return 0; };
                 },
                 .max_stream_data => |md| {
                     frames.append(a, 0x11) catch { quicClose(conn, 0x01, false); return 0; };
-                    qvPut(&frames, a, md.id) catch { quicClose(conn, 0x01, false); return 0; };
+                    qvPut(frames, a, md.id) catch { quicClose(conn, 0x01, false); return 0; };
                     const cur: u64 = if (quicStreamGet(conn, md.id, false)) |st| st.rx_hi else md.v;
-                    qvPut(&frames, a, cur) catch { quicClose(conn, 0x01, false); return 0; };
+                    qvPut(frames, a, cur) catch { quicClose(conn, 0x01, false); return 0; };
                 },
                 .max_streams_bidi => {
                     frames.append(a, 0x12) catch { quicClose(conn, 0x01, false); return 0; };
-                    qvPut(&frames, a, conn.streams_bidi_credit) catch { quicClose(conn, 0x01, false); return 0; };
+                    qvPut(frames, a, conn.streams_bidi_credit) catch { quicClose(conn, 0x01, false); return 0; };
                 },
                 .max_streams_uni => |v| {
                     frames.append(a, 0x13) catch { quicClose(conn, 0x01, false); return 0; };
-                    qvPut(&frames, a, v) catch { quicClose(conn, 0x01, false); return 0; };
+                    qvPut(frames, a, v) catch { quicClose(conn, 0x01, false); return 0; };
                 },
                 .path_response => |d| {
                     frames.append(a, 0x1b) catch { quicClose(conn, 0x01, false); return 0; };
@@ -1648,9 +1753,9 @@ fn quicBuildPacket(conn: *QuicConn, space: usize, out: []u8, budget: usize, pad_
                     // RFC 9000 §10.2.3: an app close must be re-encoded as a
                     // transport close in Initial/Handshake space.
                     frames.append(a, if (cc.app and space == 2) 0x1d else 0x1c) catch { quicClose(conn, 0x01, false); return 0; };
-                    qvPut(&frames, a, cc.code) catch { quicClose(conn, 0x01, false); return 0; };
-                    if (!cc.app) qvPut(&frames, a, 0) catch { quicClose(conn, 0x01, false); return 0; }; // frame type 0
-                    qvPut(&frames, a, 0) catch { quicClose(conn, 0x01, false); return 0; }; // reason len
+                    qvPut(frames, a, cc.code) catch { quicClose(conn, 0x01, false); return 0; };
+                    if (!cc.app) qvPut(frames, a, 0) catch { quicClose(conn, 0x01, false); return 0; }; // frame type 0
+                    qvPut(frames, a, 0) catch { quicClose(conn, 0x01, false); return 0; }; // reason len
                 },
                 else => {},
             }
@@ -1675,7 +1780,7 @@ fn quicBuildPacket(conn: *QuicConn, space: usize, out: []u8, budget: usize, pad_
                 if (n == 0) break;
                 n = @min(n, s.sb.items.len - r.off);
                 const fin = s.sb_fin and r.off + n >= s.sb.items.len;
-                quicEmitStreamFrame(&frames, a, s.id, r.off, n, fin, s.sb.items[@intCast(r.off)..@intCast(r.off + n)]) catch { quicClose(conn, 0x01, false); return 0; };
+                quicEmitStreamFrame(frames, a, s.id, r.off, n, fin, s.sb.items[@intCast(r.off)..@intCast(r.off + n)]) catch { quicClose(conn, 0x01, false); return 0; };
                 rec.frames.append(a, .{ .stream = .{ .id = s.id, .off = r.off, .len = n, .fin = fin } }) catch { quicClose(conn, 0x01, false); return 0; };
                 elicit = true;
                 if (n < r.len) {
@@ -1690,7 +1795,7 @@ fn quicBuildPacket(conn: *QuicConn, space: usize, out: []u8, budget: usize, pad_
                 if (n == 0) break;
                 const off = s.sb_hi;
                 const fin = s.sb_fin and off + n >= s.sb.items.len;
-                quicEmitStreamFrame(&frames, a, s.id, off, n, fin, s.sb.items[@intCast(off)..@intCast(off + n)]) catch { quicClose(conn, 0x01, false); return 0; };
+                quicEmitStreamFrame(frames, a, s.id, off, n, fin, s.sb.items[@intCast(off)..@intCast(off + n)]) catch { quicClose(conn, 0x01, false); return 0; };
                 rec.frames.append(a, .{ .stream = .{ .id = s.id, .off = off, .len = n, .fin = fin } }) catch { quicClose(conn, 0x01, false); return 0; };
                 s.sb_hi += n;
                 conn.tx_data_sent += n;
@@ -1720,53 +1825,55 @@ fn quicBuildPacket(conn: *QuicConn, space: usize, out: []u8, budget: usize, pad_
     }
     const pnl: usize = 4;
     const pn = ts.next_pn;
-    var hdr: std.ArrayListUnmanaged(u8) = .{};
-    defer hdr.deinit(a);
+    // The header is ≤61 bytes and out.len is `budget` at every call site
+    // (room>=16 pinned budget>=80), so it serializes straight into `out`.
+    var hl: usize = 0;
     if (space == 2) {
-        hdr.append(a, 0x40 | @as(u8, @intCast(pnl - 1))) catch { quicClose(conn, 0x01, false); return 0; };
-        hdr.appendSlice(a, conn.dcid[0..conn.dcid_len]) catch { quicClose(conn, 0x01, false); return 0; };
+        out[hl] = 0x40 | @as(u8, @intCast(pnl - 1));
+        hl += 1;
+        @memcpy(out[hl .. hl + conn.dcid_len], conn.dcid[0..conn.dcid_len]);
+        hl += conn.dcid_len;
     } else {
-        hdr.append(a, (if (space == 0) @as(u8, 0xc0) else 0xe0) | @as(u8, @intCast(pnl - 1))) catch { quicClose(conn, 0x01, false); return 0; };
-        var b4: [4]u8 = undefined;
-        std.mem.writeInt(u32, &b4, QUIC_VERSION_1, .big);
-        hdr.appendSlice(a, &b4) catch { quicClose(conn, 0x01, false); return 0; };
-        hdr.append(a, conn.dcid_len) catch { quicClose(conn, 0x01, false); return 0; };
-        hdr.appendSlice(a, conn.dcid[0..conn.dcid_len]) catch { quicClose(conn, 0x01, false); return 0; };
-        hdr.append(a, QUIC_SCID_LEN) catch { quicClose(conn, 0x01, false); return 0; };
-        hdr.appendSlice(a, &conn.scid) catch { quicClose(conn, 0x01, false); return 0; };
+        out[hl] = (if (space == 0) @as(u8, 0xc0) else 0xe0) | @as(u8, @intCast(pnl - 1));
+        hl += 1;
+        std.mem.writeInt(u32, out[hl..][0..4], QUIC_VERSION_1, .big);
+        hl += 4;
+        out[hl] = conn.dcid_len;
+        hl += 1;
+        @memcpy(out[hl .. hl + conn.dcid_len], conn.dcid[0..conn.dcid_len]);
+        hl += conn.dcid_len;
+        out[hl] = QUIC_SCID_LEN;
+        hl += 1;
+        @memcpy(out[hl .. hl + QUIC_SCID_LEN], &conn.scid);
+        hl += QUIC_SCID_LEN;
         if (space == 0) {
-            hdr.append(a, 0) catch { quicClose(conn, 0x01, false); return 0; }; // token len 0
+            out[hl] = 0; // token len 0
+            hl += 1;
         }
-        // length placeholder — fill after payload size known
-        const plen = pnl + frames.items.len + 16;
-        qvPut(&hdr, a, plen) catch { quicClose(conn, 0x01, false); return 0; };
+        hl += qvPutSlice(out[hl..], pnl + frames.items.len + 16);
     }
-    const pn_off = hdr.items.len;
+    const pn_off = hl;
     var pnb: [4]u8 = undefined;
     std.mem.writeInt(u32, &pnb, @intCast(pn & 0xffffffff), .big);
-    hdr.appendSlice(a, pnb[4 - pnl ..]) catch { quicClose(conn, 0x01, false); return 0; };
+    @memcpy(out[pn_off .. pn_off + pnl], pnb[4 - pnl ..]);
+    hl += pnl;
 
-    // serialize + encrypt
-    var payload: std.ArrayListUnmanaged(u8) = .{};
-    defer payload.deinit(a);
-    payload.appendSlice(a, frames.items) catch { quicClose(conn, 0x01, false); return 0; };
-    const total = hdr.items.len + payload.items.len + 16;
+    // encrypt frames straight into the datagram — no payload copy
+    const total = hl + frames.items.len + 16;
     if (total > out.len or total > budget + 64) {
         // over budget — put everything back so nothing is lost.
         for (rec.frames.items) |f| quicRequeueFrame(conn, space, f);
-        rec.frames.deinit(a);
         return 0;
     }
-    @memcpy(out[0..hdr.items.len], hdr.items);
     var tag: [16]u8 = undefined;
     const nonce = pnNonce(&ks.iv, pn);
-    AesGcm.encrypt(out[hdr.items.len .. hdr.items.len + payload.items.len], &tag, payload.items, out[0..hdr.items.len], nonce, ks.key);
-    @memcpy(out[hdr.items.len + payload.items.len ..][0..16], &tag);
+    gcmEncrypt(ks, out[hl .. hl + frames.items.len], &tag, frames.items, out[0..hl], nonce);
+    @memcpy(out[hl + frames.items.len ..][0..16], &tag);
     // header protection: sample 16 bytes starting pn_off+4
     if (pn_off + 4 + 16 <= total) {
         var sample: [16]u8 = undefined;
         @memcpy(&sample, out[pn_off + 4 .. pn_off + 20]);
-        const mask = hpMask(&ks.hp, &sample);
+        const mask = hpMask(ks, &sample);
         out[0] ^= mask[0] & (if (space == 2) @as(u8, 0x1f) else 0x0f);
         for (0..pnl) |i| out[pn_off + i] ^= mask[1 + i];
     }
@@ -1781,12 +1888,10 @@ fn quicBuildPacket(conn: *QuicConn, space: usize, out: []u8, budget: usize, pad_
     // never acked, so tracking it would loop retransmit forever.
     if (elicit) {
         ts.sent.append(a, rec) catch {
-            rec.frames.deinit(a);
             quicClose(conn, 0x01, false);
-            return 0;
+            return 0; // defer recycles rec.frames
         };
-    } else {
-        rec.frames.deinit(a);
+        rec_stored = true;
     }
     return total;
 }
@@ -1989,7 +2094,7 @@ fn quicOnLongPacket(conn: *QuicConn, buf: []u8) ?usize {
     if (pn_off + 4 + 16 > total) return null;
     var sample: [16]u8 = undefined;
     @memcpy(&sample, buf[pn_off + 4 .. pn_off + 20]);
-    const mask = hpMask(&ks.hp, &sample);
+    const mask = hpMask(ks, &sample);
     buf[0] ^= mask[0] & 0x0f;
     const pnl: usize = @intCast((buf[0] & 3) + 1);
     if (pn_off + pnl > total) return null;
@@ -2004,7 +2109,7 @@ fn quicOnLongPacket(conn: *QuicConn, buf: []u8) ?usize {
     if (ct.len - 16 > pt_buf.len) return null;
     const tag: *const [16]u8 = @ptrCast(ct[ct.len - 16 ..]);
     const nonce = pnNonce(&ks.iv, pn);
-    AesGcm.decrypt(pt_buf[0 .. ct.len - 16], ct[0 .. ct.len - 16], tag.*, buf[0..hdr_len], nonce, ks.key) catch {
+    gcmDecrypt(ks, pt_buf[0 .. ct.len - 16], ct[0 .. ct.len - 16], tag.*, buf[0..hdr_len], nonce) catch {
         return null;
     };
     quicRecordPn(conn, space, pn);
@@ -2020,7 +2125,7 @@ fn quicOnShort(conn: *QuicConn, buf: []u8) void {
     if (buf.len < pn_off + 4 + 16) return;
     var sample: [16]u8 = undefined;
     @memcpy(&sample, buf[pn_off + 4 .. pn_off + 20]);
-    const mask = hpMask(&ks.hp, &sample);
+    const mask = hpMask(ks, &sample);
     buf[0] ^= mask[0] & 0x1f;
     const kbit = buf[0] & 0x04;
     const pnl: usize = @intCast((buf[0] & 3) + 1);
@@ -2035,7 +2140,7 @@ fn quicOnShort(conn: *QuicConn, buf: []u8) void {
     if (ct.len - 16 > pt_buf.len) return;
     const tag: *const [16]u8 = @ptrCast(ct[ct.len - 16 ..]);
     const nonce = pnNonce(&ks.iv, pn);
-    AesGcm.decrypt(pt_buf[0 .. ct.len - 16], ct[0 .. ct.len - 16], tag.*, buf[0..hdr_len], nonce, ks.key) catch {
+    gcmDecrypt(ks, pt_buf[0 .. ct.len - 16], ct[0 .. ct.len - 16], tag.*, buf[0..hdr_len], nonce) catch {
         return;
     };
     // Key-phase flip by the peer — we never initiate key updates, so a new
@@ -2168,7 +2273,7 @@ fn quicRequeueOldest(conn: *QuicConn, space: usize) void {
     for (p.frames.items) |f| quicRequeueFrame(conn, space, f);
     p.time_us = 0;
     conn.bytes_in_flight -|= p.size;
-    p.frames.deinit(conn.a());
+    quicRecycleSentFrames(conn, p);
     _ = sp.sent.orderedRemove(0);
 }
 
@@ -2212,13 +2317,13 @@ fn quicDetectLoss(conn: *QuicConn, space: usize, now_us: i64) void {
             conn.pmtu_probe_pn = -1;
             conn.bytes_in_flight -|= p.size;
             for (p.frames.items) |f| quicRequeueFrame(conn, space, f);
-            p.frames.deinit(conn.a());
+            quicRecycleSentFrames(conn, p);
             _ = sp.sent.orderedRemove(i);
         } else if (pkt_lost) {
             lost_any = true;
             for (p.frames.items) |f| quicRequeueFrame(conn, space, f);
             conn.bytes_in_flight -|= p.size;
-            p.frames.deinit(conn.a());
+            quicRecycleSentFrames(conn, p);
             _ = sp.sent.orderedRemove(i);
         } else i += 1;
     }
