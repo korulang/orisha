@@ -486,6 +486,7 @@ const QStream = struct {
     flow_hi: u64 = 0, // peer's max_stream_data for us
     park_until: i64 = 0,
     reset: bool = false,
+    tx_queued: bool = false, // a slot in conn.tx_ready is ours
 
     fn deinit(s: *QStream, a: std.mem.Allocator) void {
         s.rx.deinit(a);
@@ -592,6 +593,10 @@ const QuicConn = struct {
     // returns here on ack/loss instead of round-tripping malloc per packet.
     frame_pool: std.ArrayListUnmanaged(std.ArrayListUnmanaged(QSentFrame)) = .{},
     tp_buf: std.ArrayListUnmanaged(u8) = .{},
+    // Streams holding unemitted send bytes (sb or sb_retx). The packet
+    // builder drains the front; still-pending streams re-join at the back —
+    // ngtcp2's tx.strmq pop/push cycle, minus the heap.
+    tx_ready: std.ArrayListUnmanaged(*QStream) = .{},
     probe_pending: bool = false,
     huff: HpackTable = .{},
 
@@ -850,6 +855,18 @@ fn quicConnCreate(lane: *QuicLane, peer: *const posix.sockaddr, peer_len: posix.
 }
 
 fn quicStreamDestroy(conn: *QuicConn, s: *QStream) void {
+    // Pull the stream's tx_ready slot before its memory goes — a queued
+    // pointer to freed stream memory is a UAF in the packet builder.
+    if (s.tx_queued) {
+        var i: usize = 0;
+        while (i < conn.tx_ready.items.len) : (i += 1) {
+            if (conn.tx_ready.items[i] == s) {
+                _ = conn.tx_ready.orderedRemove(i);
+                break;
+            }
+        }
+        s.tx_queued = false;
+    }
     s.deinit(conn.a());
 }
 
@@ -903,6 +920,7 @@ fn quicConnDestroy(conn: *QuicConn) void {
     conn.ctrl_q.deinit(a);
     for (conn.frame_pool.items) |*fl| fl.deinit(a);
     conn.frame_pool.deinit(a);
+    conn.tx_ready.deinit(a);
     conn.bidi_closed.deinit(a);
     conn.tp_buf.deinit(a);
     conn.huff.deinit(a);
@@ -1105,6 +1123,14 @@ fn quicRecordPn(conn: *QuicConn, space: usize, pn: u64) void {
     conn.idle_deadline_ms = std.time.milliTimestamp() + QUIC_IDLE_MS;
 }
 
+// Mark a stream as having unemitted send bytes. Queued once — the packet
+// builder drops the flag when the stream drains.
+fn quicTxQueue(conn: *QuicConn, s: *QStream) void {
+    if (s.tx_queued) return;
+    s.tx_queued = true;
+    conn.tx_ready.append(conn.a(), s) catch { quicClose(conn, 0x01, false); };
+}
+
 fn quicCtrlQueue(conn: *QuicConn, f: QSentFrame) void {
     // credit frames are self-superseding: keep ONE pending entry holding
     // the latest value — a flood of requests must not emit a flood of
@@ -1138,17 +1164,28 @@ fn quicOnFrames(conn: *QuicConn, space: usize, pn: u64, bytes: []const u8) void 
                 _ = delay;
                 const n_ranges = qvGet(bytes, &pos) orelse return;
                 const first_range = qvGet(bytes, &pos) orelse return;
+                // Collect the wire's descending ranges, then make ONE pass
+                // over the sent list — a pass per range is O(ranges×sent).
+                var ars: [64]QAckRange = undefined;
+                var arn: usize = 0;
                 var lo = largest -| first_range;
                 var hi = largest;
-                quicOnAck(conn, space, lo, hi);
+                ars[0] = .{ .lo = lo, .hi = hi };
+                arn = 1;
                 var i: u64 = 0;
                 while (i < n_ranges) : (i += 1) {
                     const gap = qvGet(bytes, &pos) orelse return;
                     const rlen = qvGet(bytes, &pos) orelse return;
                     hi = lo -| (gap + 2);
                     lo = hi -| rlen;
-                    quicOnAck(conn, space, lo, hi);
+                    if (arn == ars.len) {
+                        quicOnAckRanges(conn, space, ars[0..arn]);
+                        arn = 0;
+                    }
+                    ars[arn] = .{ .lo = lo, .hi = hi };
+                    arn += 1;
                 }
+                quicOnAckRanges(conn, space, ars[0..arn]);
                 if (ft == 0x03) {
                     _ = qvGet(bytes, &pos); // ect0
                     _ = qvGet(bytes, &pos); // ect1
@@ -1263,17 +1300,26 @@ fn quicOnFrames(conn: *QuicConn, space: usize, pn: u64, bytes: []const u8) void 
     _ = a;
 }
 
-fn quicOnAck(conn: *QuicConn, space: usize, lo: u64, hi: u64) void {
+const QAckRange = struct { lo: u64, hi: u64 };
+
+// One pass over the sent list for a whole run of wire-ack ranges. The list
+// is pn-ascending and ranges arrive pn-descending, so a single cursor over
+// the reversed ranges answers membership in O(1) amortized per packet;
+// removals share one compaction write index, not per-packet memmoves.
+fn quicOnAckRanges(conn: *QuicConn, space: usize, ranges: []const QAckRange) void {
+    if (ranges.len == 0) return;
     const sp = &conn.tx_space[space];
     const now = std.time.microTimestamp();
-    var newly: usize = 0;
-    var w: usize = 0; // compaction write index — removals are batched,
-    // not per-packet orderedRemove memmoves (O(n^2) on deep sent lists).
+    var w: usize = 0;
     var i: usize = 0;
+    var ri: usize = ranges.len;
     while (i < sp.sent.items.len) : (i += 1) {
         const p = &sp.sent.items[i];
-        var keep = true;
-        if (p.pn >= lo and p.pn <= hi) {
+        // advance the cursor past every range that ends below this pn;
+        // what remains has hi >= p.pn, so lo <= p.pn decides membership.
+        while (ri > 0 and ranges[ri - 1].hi < p.pn) ri -= 1;
+        const keep = !(ri > 0 and p.pn >= ranges[ri - 1].lo);
+        if (!keep) {
             if (p.pn > @as(u64, @intCast(@max(sp.largest_acked, 0)))) sp.largest_acked = @intCast(p.pn);
             if (p.ack_eliciting and p.time_us > 0) {
                 conn.latest_rtt_us = now - p.time_us;
@@ -1294,7 +1340,6 @@ fn quicOnAck(conn: *QuicConn, space: usize, lo: u64, hi: u64) void {
                     conn.pmtu_probe_pn = -1;
                 }
                 conn.bytes_in_flight -|= p.size;
-                newly += p.size;
                 // RFC 9002 §7.4: recovery ends when a packet sent after
                 // recovery_start is acked; pre-recovery packets don't grow.
                 if (conn.in_recovery and p.time_us > 0 and p.time_us > conn.recovery_start_us) {
@@ -1331,9 +1376,7 @@ fn quicOnAck(conn: *QuicConn, space: usize, lo: u64, hi: u64) void {
                 }
             }
             quicRecycleSentFrames(conn, p);
-            keep = false;
-        }
-        if (keep) {
+        } else {
             if (w != i) sp.sent.items[w] = sp.sent.items[i];
             w += 1;
         }
@@ -1590,6 +1633,7 @@ fn quicH3OpenControl(conn: *QuicConn) void {
     qvPut(&s.sb, a, settings.len) catch { quicClose(conn, 0x01, false); return; };
     s.sb.appendSlice(a, &settings) catch { quicClose(conn, 0x01, false); return; };
     s.flow_hi = conn.peer_imsd_uni;
+    quicTxQueue(conn, s);
 }
 
 // ── close ────────────────────────────────────────────────────────────────────
@@ -1765,12 +1809,32 @@ fn quicBuildPacket(conn: *QuicConn, space: usize, out: []u8, budget: usize, pad_
         }
     }
     // STREAM data (app space): retransmits then new bytes, peer-window-bound.
+    // Only tx_ready streams are visited — not every stream on the conn.
+    // Each packet gives the queue's snapshot one pass; a stream still
+    // holding unemitted bytes re-joins at the back (round-robin, the same
+    // pop→push shape as ngtcp2's tx.strmq cycle).
     if (space == 2 and !ack_only and conn.close_pending == null and conn.state != .closing and conn.state != .draining) {
-        var it = conn.streams.iterator();
         const now_ms = std.time.milliTimestamp();
-        while (it.next()) |e| {
-            const s = e.value_ptr.*;
-            if (s.park_until > now_ms or s.reset) continue;
+        // Snapshot pass over the queue's head; survivors compact left
+        // in-place (order preserved, O(queue) per packet — not a
+        // pop-front memmove per stream).
+        const qlen = conn.tx_ready.items.len;
+        var qw: usize = 0; // survivor write index
+        var qi: usize = 0;
+        while (qi < qlen and frames.items.len < room) : (qi += 1) {
+            const s = conn.tx_ready.items[qi];
+            if (s.park_until > now_ms or s.reset) {
+                // Parked / resetting streams keep their queue slot only while
+                // bytes remain — a parked reply still emits once the park
+                // expires; a drained or reset one drops out for good.
+                if (!s.reset and (s.sb_retx.items.len > 0 or s.sb_hi < s.sb.items.len)) {
+                    conn.tx_ready.items[qw] = s;
+                    qw += 1;
+                } else {
+                    s.tx_queued = false;
+                }
+                continue;
+            }
             // retransmit ranges
             while (s.sb_retx.items.len > 0 and frames.items.len < room) {
                 const r = s.sb_retx.orderedRemove(0);
@@ -1802,8 +1866,20 @@ fn quicBuildPacket(conn: *QuicConn, space: usize, out: []u8, budget: usize, pad_
                 elicit = true;
                 if (fin) s.tx_done = false; // becomes done when acked
             }
-            if (frames.items.len >= room) break;
+            if (!s.reset and (s.sb_retx.items.len > 0 or s.sb_hi < s.sb.items.len)) {
+                conn.tx_ready.items[qw] = s;
+                qw += 1;
+            } else {
+                s.tx_queued = false;
+            }
         }
+        // Entries past qi never got visited (room ran out) — they stay
+        // queued, shifted down behind the survivors.
+        if (qi < qlen) {
+            std.mem.copyForwards(*QStream, conn.tx_ready.items[qw .. qw + qlen - qi], conn.tx_ready.items[qi..qlen]);
+            qw += qlen - qi;
+        }
+        conn.tx_ready.items.len = qw;
     }
     // PTO probe: nothing to say but must elicit — PING.
     if (!elicit and probe) {
@@ -1910,6 +1986,11 @@ fn quicEmitStreamFrame(out: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, i
 
 // ── datagram assembly + flush ────────────────────────────────────────────────
 
+// Max datagrams batched into one sendmmsg — ngtcp2's write_aggregate_pkt
+// shape: the flush loop keeps producing packets until the burst fills or a
+// round yields nothing, then ONE syscall emits the burst.
+const QUIC_SEND_BURST: usize = 32;
+
 fn quicFlush(lane: *QuicLane) void {
     lane.flush_again = false;
     var it = lane.conns.iterator();
@@ -1922,18 +2003,31 @@ fn quicFlush(lane: *QuicLane) void {
             if (now_ms >= conn.draining_until_ms) conn.state = .dead;
             continue;
         }
+        var burst_lens: [QUIC_SEND_BURST]usize = undefined;
+        var burst_n: usize = 0; // datagrams staged in dbuf
+        var burst_off: usize = 0; // bytes consumed in dbuf
+        var pending_limited: u64 = 0; // staged-not-yet-sent bytes (anti-amp check)
         var guard: usize = 0;
         while (guard < 64) : (guard += 1) {
-            var total: usize = 0;
             // RFC 9002 §7.2: ack-eliciting sends gated on cwnd (probes exempt).
             const budget: usize = @min(conn.pmtu, conn.cwnd -| conn.bytes_in_flight);
-            // anti-amplification: 3x received until the address validates
-            if (!conn.addr_validated and conn.tx_bytes_limited + budget > 3 * conn.rx_bytes_total) break;
+            // anti-amplification: 3x received until the address validates —
+            // staged-but-unsent datagrams count against the budget.
+            if (!conn.addr_validated and conn.tx_bytes_limited + pending_limited + budget > 3 * conn.rx_bytes_total) break;
+            if (burst_n > 0 and (burst_n == QUIC_SEND_BURST or dbuf.len - burst_off < conn.pmtu + 64)) {
+                // burst full (msgs or buffer) — drain before building more
+                if (!quicSendBurst(conn, dbuf[0..burst_off], burst_lens[0..burst_n])) break;
+                burst_n = 0;
+                burst_off = 0;
+                pending_limited = 0;
+                continue;
+            }
+            var total: usize = 0;
             conn.ack_due_now = false;
             if (budget > 0) {
                 for (0..3) |sp| {
                     const pad = sp == 0 and !conn.addr_validated;
-                    const n = quicBuildPacket(conn, sp, dbuf[total .. total + budget - total], budget - total, pad, false, false);
+                    const n = quicBuildPacket(conn, sp, dbuf[burst_off + total ..][0 .. budget -| total], budget -| total, pad, false, false);
                     if (n > 0) total += n;
                 }
             }
@@ -1941,7 +2035,7 @@ fn quicFlush(lane: *QuicLane) void {
             if (total == 0) {
                 for (0..3) |sp| {
                     if (conn.rx_space[sp].ack_pending) {
-                        const n = quicBuildPacket(conn, sp, dbuf[total..conn.pmtu], conn.pmtu - total, false, false, true);
+                        const n = quicBuildPacket(conn, sp, dbuf[burst_off..][0..conn.pmtu], conn.pmtu, false, false, true);
                         if (n > 0) total += n;
                         break;
                     }
@@ -1949,18 +2043,67 @@ fn quicFlush(lane: *QuicLane) void {
             }
             // PTO probe: nothing else to send but a probe is owed
             if (total == 0 and conn.probe_pending) {
-                const n = quicBuildPacket(conn, if (conn.keys_tx[2].present) 2 else if (conn.keys_tx[1].present) 1 else 0, dbuf[0..budget], budget, false, true, false);
+                const n = quicBuildPacket(conn, if (conn.keys_tx[2].present) 2 else if (conn.keys_tx[1].present) 1 else 0, dbuf[burst_off..][0..budget], budget, false, true, false);
                 if (n > 0) total = n;
             }
             if (total == 0) break;
             conn.probe_pending = false;
-            if (!quicSendDgram(conn, dbuf[0..total])) break;
+            burst_lens[burst_n] = total;
+            burst_n += 1;
+            burst_off += total;
+            pending_limited += total;
             // keep looping while the round produces packets — a sub-1200
             // datagram is normal (room reserves header slack), not a drain.
         }
+        if (burst_n > 0) _ = quicSendBurst(conn, dbuf[0..burst_off], burst_lens[0..burst_n]);
         lane.flush_again = lane.flush_again or guard >= 64;
     }
     quicSweepDead(lane);
+}
+
+// Emit a staged burst of whole datagrams for one conn. Linux: sendmmsg
+// drains them in one syscall — the wire sees exactly what per-dgram sendto
+// would send. Other targets have no sendmmsg; the sendto loop IS their
+// send API, not a degraded path.
+fn quicSendBurst(conn: *QuicConn, buf: []const u8, lens: []const usize) bool {
+    if (@import("builtin").os.tag != .linux) {
+        var off: usize = 0;
+        for (lens) |l| {
+            if (!quicSendDgram(conn, buf[off .. off + l])) return false;
+            off += l;
+        }
+        return true;
+    }
+    var msgs: [QUIC_SEND_BURST]std.os.linux.mmsghdr_const = undefined;
+    var iovs: [QUIC_SEND_BURST]posix.iovec_const = undefined;
+    var off: usize = 0;
+    for (lens, 0..) |l, i| {
+        iovs[i] = .{ .base = buf.ptr + off, .len = l };
+        msgs[i] = .{
+            .hdr = .{
+                .name = @ptrCast(&conn.peer),
+                .namelen = conn.peer_len,
+                .iov = iovs[i..].ptr,
+                .iovlen = 1,
+                .control = null,
+                .controllen = 0,
+                .flags = 0,
+            },
+            .len = 0,
+        };
+        off += l;
+    }
+    var sent: usize = 0;
+    while (sent < lens.len) {
+        const rc = std.os.linux.sendmmsg(conn.lane.fd, msgs[sent..].ptr, @intCast(lens.len - sent), 0);
+        if (std.os.linux.E.init(rc) != .SUCCESS) return false; // socket full/dead — stop this flush round
+        if (rc == 0) return false;
+        // only fully-sent datagrams count against the anti-amplification cap
+        var i = sent;
+        while (i < sent + rc) : (i += 1) conn.tx_bytes_limited += lens[i];
+        sent += rc;
+    }
+    return true;
 }
 
 fn quicSendDgram(conn: *QuicConn, bytes: []u8) bool {
@@ -2240,9 +2383,12 @@ fn quicTick(lane: *QuicLane) void {
         }
         // PTO: if unacked ack-eliciting exists and pto expired → probe
         var any_eliciting = false;
-        for (0..3) |sp_chk| {
+        chk: for (0..3) |sp_chk| {
             for (conn.tx_space[sp_chk].sent.items) |pkt| {
-                if (pkt.ack_eliciting) any_eliciting = true;
+                if (pkt.ack_eliciting) {
+                    any_eliciting = true;
+                    break :chk;
+                }
             }
         }
         if (!any_eliciting) conn.pto_base_us = 0;
@@ -2283,8 +2429,10 @@ fn quicRequeueFrame(conn: *QuicConn, space: usize, f: QSentFrame) void {
         .ack => conn.rx_space[space].ack_pending = true,
         .crypto => |r| rangesAdd(&conn.ctx_retx[space], a, r.off, r.len) catch { quicClose(conn, 0x01, false); return; },
         .stream => |sf| {
-            if (quicStreamGet(conn, sf.id, false)) |s|
+            if (quicStreamGet(conn, sf.id, false)) |s| {
                 rangesAdd(&s.sb_retx, a, sf.off, sf.len + @intFromBool(sf.fin)) catch { quicClose(conn, 0x01, false); return; };
+                quicTxQueue(conn, s);
+            }
         },
         .handshake_done, .max_data, .max_stream_data, .max_streams_bidi, .max_streams_uni, .path_response, .reset_stream => quicCtrlQueue(conn, f),
         .conn_close => |cc| conn.close_pending = .{ .conn_close = cc },
@@ -2299,15 +2447,22 @@ fn quicDetectLoss(conn: *QuicConn, space: usize, now_us: i64) void {
     const thresh_us = @divTrunc(9 * @max(conn.latest_rtt_us, srtt), 8) + QUIC_K_GRANULARITY_US;
     const largest_acked = sp.largest_acked;
     var i: usize = 0;
+    var w: usize = 0; // compaction write index — same batched-removal shape
+    // as quicOnAckRanges, not per-loss orderedRemove memmoves.
     var lost_any = false;
-    while (i < sp.sent.items.len) {
+    while (i < sp.sent.items.len) : (i += 1) {
         const p = &sp.sent.items[i];
         // RFC 9002 §6.1: only packets sent before largest_acked can be lost —
         // time-threshold on newer packets would spuriously retransmit.
         const older = largest_acked >= 0 and p.pn < @as(u64, @intCast(largest_acked));
         const pkt_lost = (!p.pmtu_probe and largest_acked >= 0 and p.pn + QUIC_PKT_THRESH <= @as(u64, @intCast(largest_acked))) or
             (older and p.time_us > 0 and p.time_us + (if (p.pmtu_probe) 3 * thresh_us else thresh_us) <= now_us);
-        if (pkt_lost and p.pmtu_probe) {
+        if (!pkt_lost) {
+            if (w != i) sp.sent.items[w] = sp.sent.items[i];
+            w += 1;
+            continue;
+        }
+        if (p.pmtu_probe) {
             conn.pmtu_fails += 1;
             if (conn.pmtu_fails >= 3) {
                 conn.pmtu_fails = 0;
@@ -2315,18 +2470,14 @@ fn quicDetectLoss(conn: *QuicConn, space: usize, now_us: i64) void {
                 else conn.pmtu_retry_ms = std.time.milliTimestamp() + 10_000;
             }
             conn.pmtu_probe_pn = -1;
-            conn.bytes_in_flight -|= p.size;
-            for (p.frames.items) |f| quicRequeueFrame(conn, space, f);
-            quicRecycleSentFrames(conn, p);
-            _ = sp.sent.orderedRemove(i);
-        } else if (pkt_lost) {
+        } else {
             lost_any = true;
-            for (p.frames.items) |f| quicRequeueFrame(conn, space, f);
-            conn.bytes_in_flight -|= p.size;
-            quicRecycleSentFrames(conn, p);
-            _ = sp.sent.orderedRemove(i);
-        } else i += 1;
+        }
+        for (p.frames.items) |f| quicRequeueFrame(conn, space, f);
+        conn.bytes_in_flight -|= p.size;
+        quicRecycleSentFrames(conn, p);
     }
+    sp.sent.items.len = w;
     if (lost_any) {
         // congestion: enter recovery once per round trip
         if (conn.recovery_start_us < now_us -| conn.smoothed_rtt_us or !conn.in_recovery) {
@@ -2483,6 +2634,7 @@ fn h3Reply(s: *QStream, x: *Exchange, head: []const u8, body: []const u8, delay_
     qvPut(&s.sb, a, body.len) catch return false;
     s.sb.appendSlice(a, body) catch return false;
     if (delay_ms > 0) s.park_until = std.time.milliTimestamp() + delay_ms;
+    quicTxQueue(conn, s);
     return true;
 }
 
