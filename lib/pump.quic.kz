@@ -1007,9 +1007,19 @@ fn quicRecordPn(conn: *QuicConn, space: usize, pn: u64) void {
 }
 
 fn quicCtrlQueue(conn: *QuicConn, f: QSentFrame) void {
-    // control frames ride the app space's own retry list — stash into a
-    // synthetic retx range list indexed per kind via ctx_retx? Simpler:
-    // dedicated queue.
+    // credit frames are self-superseding: keep ONE pending entry holding
+    // the latest value — a flood of requests must not emit a flood of
+    // MAX_STREAMS/MAX_DATA. Retx of a lost one re-queues a stale value;
+    // emit always reads the conn's current values, so it self-heals.
+    for (conn.ctrl_q.items) |*q| {
+        switch (f) {
+            .max_data => if (q.* == .max_data) { q.max_data = f.max_data; return; },
+            .max_streams_bidi => if (q.* == .max_streams_bidi) { q.max_streams_bidi = f.max_streams_bidi; return; },
+            .max_streams_uni => if (q.* == .max_streams_uni) { q.max_streams_uni = f.max_streams_uni; return; },
+            .max_stream_data => |msd| if (q.* == .max_stream_data and q.max_stream_data.id == msd.id) { q.max_stream_data.v = msd.v; return; },
+            else => {},
+        }
+    }
     conn.ctrl_q.append(conn.a(), f) catch quicClose(conn, 0x01, false);
 }
 
@@ -1593,18 +1603,21 @@ fn quicBuildPacket(conn: *QuicConn, space: usize, out: []u8, budget: usize, pad_
             const before = frames.items.len;
             switch (f) {
                 .handshake_done => frames.append(a, 0x1e) catch { quicClose(conn, 0x01, false); return 0; },
-                .max_data => |v| {
+                .max_data => {
+                    // retransmits must carry the CURRENT credit, not the
+                    // value captured when the frame was first queued.
                     frames.append(a, 0x10) catch { quicClose(conn, 0x01, false); return 0; };
-                    qvPut(&frames, a, v) catch { quicClose(conn, 0x01, false); return 0; };
+                    qvPut(&frames, a, conn.rx_max_data) catch { quicClose(conn, 0x01, false); return 0; };
                 },
                 .max_stream_data => |md| {
                     frames.append(a, 0x11) catch { quicClose(conn, 0x01, false); return 0; };
                     qvPut(&frames, a, md.id) catch { quicClose(conn, 0x01, false); return 0; };
-                    qvPut(&frames, a, md.v) catch { quicClose(conn, 0x01, false); return 0; };
+                    const cur: u64 = if (quicStreamGet(conn, md.id, false)) |st| st.rx_hi else md.v;
+                    qvPut(&frames, a, cur) catch { quicClose(conn, 0x01, false); return 0; };
                 },
-                .max_streams_bidi => |v| {
+                .max_streams_bidi => {
                     frames.append(a, 0x12) catch { quicClose(conn, 0x01, false); return 0; };
-                    qvPut(&frames, a, v) catch { quicClose(conn, 0x01, false); return 0; };
+                    qvPut(&frames, a, conn.streams_bidi_credit) catch { quicClose(conn, 0x01, false); return 0; };
                 },
                 .max_streams_uni => |v| {
                     frames.append(a, 0x13) catch { quicClose(conn, 0x01, false); return 0; };
@@ -2365,7 +2378,6 @@ fn h3Reply(s: *QStream, x: *Exchange, head: []const u8, body: []const u8, delay_
     qvPut(&s.sb, a, body.len) catch return false;
     s.sb.appendSlice(a, body) catch return false;
     if (delay_ms > 0) s.park_until = std.time.milliTimestamp() + delay_ms;
-    quicFlush(conn.lane);
     return true;
 }
 
