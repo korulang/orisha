@@ -1976,17 +1976,28 @@ fn indexOfWord(code: []const u8, word: []const u8) ?usize {
         method_groups.items[idx].append(allocator, pi) catch unreachable;
     }
 
-    // handler-lite table — the pre-Request dispatch. A route arm that is a
-    // `-> { ... }` literal (a `.branch_constructor` produce) is request-free
-    // by construction UNLESS its body still names `req` — checked on the
-    // generated code, not the AST, so a `req.path` inside a field literal
-    // quietly disqualifies the arm instead of silently dispatching past it.
-    // A literal arm joins the table only when no earlier pattern in its own
-    // method group could match its path — earlier dynamic routes keep their
-    // first-match semantics because lite-miss falls through to the full
-    // chain, which still contains every route in order.
+    // handler-lite table — the pre-Request dispatch. An arm joins when its
+    // generated code cannot name the request at all — not only literal
+    // `-> { ... }` produces (request-free by construction) but handler-call
+    // arms too: `req` (or whatever spelling the site passed) is the ONLY
+    // handle request fields move through, since every orisha accessor takes
+    // it explicitly and a callee sees it only as an argument, which spells
+    // the name at the call site. The check runs on generated code, not the
+    // AST, so a `req.path` inside a field literal or a `req`-fed helper call
+    // anywhere in the chain quietly disqualifies the arm instead of
+    // silently dispatching past it. An arm joins the table only when no
+    // earlier pattern in its own method group could match its path —
+    // earlier dynamic routes keep their first-match semantics because
+    // lite-miss falls through to the full chain, which still contains every
+    // route in order.
+    // ORISHA_NO_LITE: setting it skips admission entirely — the A/B lever
+    // that builds the all-full-path reference a lite binary diffs against.
     var lite_route_pis: std.ArrayList(usize) = .empty;
-    {
+    const lite_disabled = if (std.process.getEnvVarOwned(allocator, "ORISHA_NO_LITE")) |v| blk: {
+        allocator.free(v);
+        break :blk true;
+    } else |_| false;
+    if (!lite_disabled) {
         for (method_names.items, 0..) |_, mi| {
             for (method_groups.items[mi].items, 0..) |pi, gi| {
                 const pp = &parsed_patterns.items[pi];
@@ -2000,27 +2011,36 @@ fn indexOfWord(code: []const u8, word: []const u8) ?usize {
                 }
                 if (has_star) continue;
 
-                // Literal arm check + req-independence, on the generated code.
+                // Req-independence, on the generated code. `req_expr` is the
+                // site's spelling; the handler prologue also binds a `req`
+                // local and `__koru_event_input` carries the request — an arm
+                // naming any of the three keeps the full path. The lite impl's
+                // params are `method`/`path`, so an arm redeclaring either
+                // name would shadow a param in the emitted build — it keeps
+                // the full path too.
                 const cont = find_cont: {
                     for (pattern_conts.items) |pc| {
                         if (std.mem.eql(u8, pc.pattern, pp.raw)) break :find_cont pc.cont;
                     }
                     break :find_cont null;
-                };
-                const pc_node = if (cont) |c| c.node else null;
-                const is_literal = if (pc_node) |n| n == .branch_constructor else false;
-                if (!is_literal) continue;
+                } orelse continue;
 
                 var lite_counter: usize = 0;
                 const arm_code = continuation_codegen.generateContinuationChainWithItems(
                     allocator,
-                    cont.?,
+                    cont,
                     program.main_module_name,
                     &lite_counter,
                     2,
                     program.items,
                 ) catch unreachable;
                 if (indexOfWord(arm_code, req_expr) != null) continue;
+                if (!std.mem.eql(u8, req_expr, "req") and indexOfWord(arm_code, "req") != null) continue;
+                if (indexOfWord(arm_code, "__koru_event_input") != null) continue;
+                if (indexOfWord(arm_code, "const method") != null or
+                    indexOfWord(arm_code, "const path") != null or
+                    indexOfWord(arm_code, "var method") != null or
+                    indexOfWord(arm_code, "var path") != null) continue;
 
                 // Shadow check: an earlier pattern in this method group that
                 // is not itself an admitted literal route must not be able to
