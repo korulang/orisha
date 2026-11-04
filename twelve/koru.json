@@ -1,0 +1,12 @@
+{
+    "name": "twelve-orisha",
+    "version": "0.1.0",
+    "description": "Twelve Dollar Server Challenge — feed API over Orisha + libs/sqlite3",
+    "paths": {
+        "std": "../../koru/koru_std",
+        "orisha": "../lib",
+        "libs": "../../koru-libs",
+        "koru": "../../koru-libs",
+        "twelve": "."
+    }
+}

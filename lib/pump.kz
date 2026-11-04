@@ -391,7 +391,7 @@ fn scanRequestLite(buf: []const u8, head: *Head) ?usize {
 // replies against its own outstanding requests is desynchronised from then on,
 // and what it renders depends on where the split happened to land. That is the
 // "sometimes it works" shape.
-const REQUEST_BUFFER = 16 * 1024;
+const REQUEST_BUFFER = 4 * 1024;
 // The fd table is indexed by descriptor value, so the bound must cover the
 // socket numbers a burst actually issues — the harness runs profiles at
 // 16384 conns with nofile=1048576, and every fd past the old 4096 cap was
@@ -466,6 +466,25 @@ const WsSeg = struct {
     next: std.atomic.Value(?*WsSeg) = .init(null),
 };
 
+// Capability-gated conn state: upgrade-path storage is sized to zero when
+// the build variant doesn't carry that protocol. `[0]T` keeps every field
+// access spelling valid (iterating a dead group is a zero-trip loop, a slot
+// lookup returns null), so shared code paths compile unchanged and only the
+// upgrade ENTRY sites need a `CAPS.x` gate. Selection across builds is the
+// deferred koru feature — for now the const is the knob.
+const ConnCaps = struct {
+    h2: bool = true,
+    ws: bool = true,
+    plan: bool = true,
+    pool: bool = true,
+};
+const CAPS: ConnCaps = .{ .h2 = false, .ws = false, .plan = false, .pool = false };
+
+// Provided-buffer recv pool sizing — counts in-flight receives, not conns.
+// A dry pool degrades to one-shot recvs (ms_off), never a dropped conn.
+const POOL_BUFS: u32 = if (CAPS.pool) 8192 else 4096;
+const POOL_COUNT: u16 = if (CAPS.pool) 1024 else 512;
+
 pub const ConnState = struct {
     fd: c_int = -1,
     ssl: ?*ServerTls = null,
@@ -483,7 +502,7 @@ pub const ConnState = struct {
     // h2_send_window_conn is the RFC 7540 §6.9 connection send window —
     // every DATA frame we emit decrements it; only WINDOW_UPDATE on
     // stream 0 refills it.
-    h2_streams: [H2_STREAMS_MAX]H2Stream = @splat(.{}),
+    h2_streams: [if (CAPS.h2) H2_STREAMS_MAX else 1]H2Stream = @splat(.{}),
     h2_send_window_conn: i64 = 65535,
     h2_peer_initial_window: i64 = 65535,
     h2_peer_max_frame: usize = 16384,
@@ -492,7 +511,7 @@ pub const ConnState = struct {
     // Requests completed inside h2cProcess — the `arrived` effect only
     // binds inside ~proc scopes, so completions queue here and the
     // dispatch site in the ~proc body fires one arm per entry.
-    h2_ready: [16]H2Ready = undefined,
+    h2_ready: [if (CAPS.h2) 16 else 1]H2Ready = undefined,
     h2_ready_n: usize = 0,
     // Async delay: a handler's `delay_ms` stages its whole response and
     // parks the conn — no read or write arm — until this timestamp. The
@@ -521,7 +540,7 @@ pub const ConnState = struct {
     ws_msg_open: bool = false,
     // Control payloads are ≤125 bytes by spec (RFC 6455 §5.5) — they get their
     // own fixed buffer so a ping mid-fragment never joins the message.
-    ws_ctrl: [125]u8 = undefined,
+    ws_ctrl: [if ($mod.CAPS.ws) 125 else 1]u8 = undefined,
     ws_ctrl_len: usize = 0,
     // TLS handshake still in flight. The fd registered with the reactor
     // BEFORE SSL_accept finished — the owning worker steps it once per
@@ -603,10 +622,10 @@ pub const ConnState = struct {
     // send_buf — offsets, not pointers, so a mid-stage realloc cannot kill
     // them. At promote time the plan materializes into send_iov and the
     // send goes out as one writev SQE.
-    send_plan: [SEND_PLAN_MAX]SendPlanEntry = undefined,
+    send_plan: [if (CAPS.plan) SEND_PLAN_MAX else 1]SendPlanEntry = undefined,
     send_plan_n: usize = 0,
     // +1: a drained pending span older than the plan precedes its entries.
-    send_iov: [SEND_PLAN_MAX + 1]posix.iovec_const = undefined,
+    send_iov: [if (CAPS.plan) SEND_PLAN_MAX + 1 else 2]posix.iovec_const = undefined,
     send_iov_n: usize = 0,
     send_iov_pos: usize = 0,
     // Pending bytes appended while a plan window was open are NEWER than the
@@ -1115,11 +1134,6 @@ fn connState(fd: posix.fd_t) ?*ConnState {
     if (conn_states[idx]) |s| return s;
     const s = pumpAlloc().create(ConnState) catch return null;
     s.* = .{ .fd = fd };
-    s.buf = pumpAlloc().alloc(u8, REQUEST_BUFFER) catch {
-        conn_states[idx] = null;
-        pumpAlloc().destroy(s);
-        return null;
-    };
     s.wsq_head = &s.wsq_stub;
     s.wsq_tail.store(&s.wsq_stub, .monotonic);
     conn_states[idx] = s;
@@ -1244,8 +1258,31 @@ fn parkDue() ?*ConnState {
     return head;
 }
 
-fn growReqBuf(st: *ConnState) bool {
-    const want = @min(st.buf.len * 4, REQ_BUF_MAX);
+// st.buf starts EMPTY now — a conn costs its struct alone until bytes arrive
+// that outlive a provided-buffer slot. Any hand that writes into st.buf (a
+// read syscall, a recv SQE) must call this first: a zero-length tail slice to
+// read() answers 0, which every caller reads as a closed peer.
+fn ensureReqRoom(st: *ConnState) bool {
+    while (st.len == st.buf.len) {
+        if (!growReqBuf(st, REQUEST_BUFFER)) return false;
+    }
+    return true;
+}
+
+// One-shot recv arms straight into st.buf — floor it small: requests bigger
+// than the arm simply land across successive recvs, the same shape as a
+// multishot spill. The assembly floor stays REQUEST_BUFFER.
+const ONESHOT_BUF = 1024;
+
+fn ensureOneshotRoom(st: *ConnState) bool {
+    while (st.buf.len - st.len < ONESHOT_BUF) {
+        if (!growReqBuf(st, ONESHOT_BUF)) return false;
+    }
+    return true;
+}
+
+fn growReqBuf(st: *ConnState, floor: usize) bool {
+    const want = @min(@max(st.buf.len * 4, floor), REQ_BUF_MAX);
     if (want <= st.buf.len) return false;
     const nb = pumpAlloc().alloc(u8, want) catch return false;
     @memcpy(nb[0..st.len], st.buf[0..st.len]);
@@ -1271,6 +1308,40 @@ fn parkRemove(st: *ConnState) void {
     st.park_next = null;
     st.parked = false;
     st.park_until = 0;
+}
+
+// Idle-conn diet: buffers are lazily allocated per need and retained for
+// the conn's life — on a held-connections workload that's ~9KB/conn of dead
+// heap. Called where a conn is verifiably quiescent (advance's idle
+// fall-through): no send in flight, nothing staged, nothing pending, no
+// undispatched request tail. Buffers re-allocate on next use.
+fn shrinkConnIdle(st: *ConnState) void {
+    if (st.send_len == 0 and st.send_iov_n == 0 and st.send_staged == 0 and
+        st.send_buf.len > 0)
+    {
+        pumpAlloc().free(st.send_buf);
+        st.send_buf = &.{};
+    }
+    // An armed one-shot recv has st.buf baked into its SQE — freeing under
+    // it is a UAF. Only shrink when nothing is armed into the buffer.
+    if (st.len == 0 and st.buf.len > 0 and !st.recv_oneshot_armed) {
+        pumpAlloc().free(st.buf);
+        st.buf = &.{};
+    }
+    // ws producers append to pending off-thread — a deinit here would race
+    // them. h1 has no off-thread writers, so the empty check is decisive.
+    if (st.mode != .ws) {
+        if (st.pending.items.len == 0 and st.pending.capacity > 0) {
+            st.pending.deinit(pumpAlloc());
+            st.pending = .{};
+            st.pending_off = 0;
+        }
+        if (st.recv_hold.items.len == 0 and st.recv_hold.capacity > 0) {
+            st.recv_hold.deinit(pumpAlloc());
+            st.recv_hold = .{};
+            st.recv_hold_off = 0;
+        }
+    }
 }
 
 fn closeConnMem(st: *ConnState) void {
@@ -1582,7 +1653,7 @@ fn appendPending(st: *ConnState, segments: []const []const u8) bool {
             const plan_mode = st.send_plan_n > 0;
             for (segments, 0..) |seg, si| {
                 if (seg.len == 0) continue;
-                if (plan_mode and st.send_plan_n == SEND_PLAN_MAX)
+                if (plan_mode and st.send_plan_n == st.send_plan.len)
                     return spillToPending(st, segments[si..]);
                 if (!stageIntoSendBuf(st, seg, plan_mode)) return false;
             }
@@ -1670,12 +1741,12 @@ fn appendPair(st: *ConnState, a: []const u8, b: []const u8) bool {
         if (st.send_len == 0 and st.send_iov_n == 0 and st.mode != .ws and !st.tls_sockbio) {
             const plan_mode = st.send_plan_n > 0;
             if (a.len != 0) {
-                if (plan_mode and st.send_plan_n == SEND_PLAN_MAX)
+                if (plan_mode and st.send_plan_n == st.send_plan.len)
                     return spillToPending(st, &.{ a, b });
                 if (!stageIntoSendBuf(st, a, plan_mode)) return false;
             }
             if (b.len != 0) {
-                if (plan_mode and st.send_plan_n == SEND_PLAN_MAX)
+                if (plan_mode and st.send_plan_n == st.send_plan.len)
                     return spillToPending(st, &.{b});
                 if (!stageIntoSendBuf(st, b, plan_mode)) return false;
             }
@@ -1756,7 +1827,7 @@ fn stageIovStatic(st: *ConnState, head: []const u8, body: []const u8, date_hole:
         planRecord(st, .{ .base = st.send_base, .len = st.send_staged - st.send_base, .buf = true });
 
     const need: usize = @as(usize, if (date_hole != 0) 3 else 1) + @intFromBool(body.len != 0);
-    if (st.send_plan_n + need > SEND_PLAN_MAX) {
+    if (st.send_plan_n + need > st.send_plan.len) {
         const segs: [4][]const u8 = if (date_hole != 0)
             .{ head[0..date_hole], date_line, head[date_hole..], body }
         else
@@ -4213,8 +4284,8 @@ fn workerCount() usize {
                 // A full st.buf would hand SSL_read a zero-length window —
                 // OpenSSL treats that as an error and the conn dies mid-body.
                 // Grow before every read so a large body always has room.
-                if (st.len == st.buf.len and !$mod.growReqBuf(st)) return if (got_any) .more else .gone;
-                const rc = mod.c.SSL_read(s, @ptrCast(st.buf[st.len..].ptr), @intCast(st.buf.len - st.len));
+                if (st.len == st.buf.len and !$mod.growReqBuf(st, $mod.REQUEST_BUFFER)) return if (got_any) .more else .gone;
+            const rc = mod.c.SSL_read(s, @ptrCast(st.buf[st.len..].ptr), @intCast(st.buf.len - st.len));
                 if (rc > 0) {
                     st.len += @intCast(rc);
                     got_any = true;
@@ -4228,6 +4299,7 @@ fn workerCount() usize {
             }
         }
     }
+    if (!$mod.ensureReqRoom(st)) return .gone;
     const n = $mod.posix.read(@intCast(st.fd), st.buf[st.len..]) catch |err| switch (err) {
         error.WouldBlock => return .idle,
         else => return .gone,
@@ -4245,6 +4317,7 @@ fn workerCount() usize {
 // calls `fill` after `poll` said the socket was readable, so "nothing to read"
 // is not a case it reaches. Both fold to `gone`.
 ~proc fill|unikraft {
+    if (!$mod.ensureReqRoom(st)) return .gone;
     const got = $mod.recv(st.fd, @ptrCast(&st.buf[st.len]), st.buf.len - st.len, 0);
     if (got <= 0) return .gone;
     st.len += @intCast(got);
@@ -4405,7 +4478,7 @@ fn workerCount() usize {
                         if (!ws_alive) break;
                     }
                     st.len = $mod.retainTail(st.buf, st.len, ws_consumed);
-                    if (ws_alive and st.len == st.buf.len) ws_alive = $mod.growReqBuf(st);
+                    if (ws_alive and st.len == st.buf.len) ws_alive = $mod.growReqBuf(st, $mod.REQUEST_BUFFER);
                     if (!ws_alive) {
                         if ($mod.hasWork(st)) {
                             st.close_when_drained = true;
@@ -4428,14 +4501,14 @@ fn workerCount() usize {
                 var consumed: usize = 0;
                 var alive = true;
                 var head_pairs: [$mod.HEAD_PAIRS_MAX]$mod.HeadPair = undefined;
-                if (!st.preface_checked) {
+                if ($mod.CAPS.h2 and !st.preface_checked) {
                     switch ($mod.h2cSniffPreface(st.buf[0..st.len])) {
                         .h2c => { st.mode = .h2c; st.preface_checked = true; },
                         .h1 => st.preface_checked = true,
                         .wait => {},
                     }
                 }
-                if (st.mode == .h2c) {
+                if ($mod.CAPS.h2 and st.mode == .h2c) {
                     // Frames, not request bytes — h2cProcess consumes what it
                     // can and queues completed requests; arrived fires here
                     // because the effect only binds in ~proc scope.
@@ -4450,7 +4523,7 @@ fn workerCount() usize {
                         arrived(&exchange);
                         $mod.pumpAlloc().free(r.raw);
                     }
-                } else if (st.preface_checked) { while (consumed < st.len) {
+                } else if (!$mod.CAPS.h2 or st.preface_checked) { while (consumed < st.len) {
                     var head: $mod.Head = .{ .pairs = &head_pairs };
                     const take = $mod.scanRequest(st.buf[consumed..st.len], &head) orelse break;
                     var exchange = $mod.Exchange{ .fd = fd, .st = st, .raw = st.buf[consumed .. consumed + take], .head = &head };
@@ -4467,7 +4540,7 @@ fn workerCount() usize {
                 st.len = $mod.retainTail(st.buf, st.len, consumed);
 
                 // Headers that never end are not a request this server can answer.
-                if (alive and st.len == st.buf.len) alive = $mod.growReqBuf(st);
+                if (alive and st.len == st.buf.len) alive = $mod.growReqBuf(st, $mod.REQUEST_BUFFER);
 
                 if (!alive) {
                     if ($mod.hasWork(st)) {
@@ -4520,7 +4593,7 @@ fn workerCount() usize {
             return .{ .failed = "Failed to spawn TLS accept thread" };
     }
 
-    if ($mod.h2c_listen_port != 0) {
+    if ($mod.CAPS.h2 and $mod.h2c_listen_port != 0) {
         const H2cAccept = struct {
             fn loop(kqs_ptr: *[$mod.MAX_WORKERS]i32, n: usize, next_ptr: *usize) void {
                 var h2c_listener = $mod.openListener($mod.h2c_listen_port) orelse return;
@@ -5115,7 +5188,7 @@ fn workerCount() usize {
                             if (!ws_alive) break;
                         }
                         st.len = $mod.retainTail(st.buf, st.len, ws_consumed);
-                        if (ws_alive and st.len == st.buf.len) ws_alive = $mod.growReqBuf(st);
+                        if (ws_alive and st.len == st.buf.len) ws_alive = $mod.growReqBuf(st, $mod.REQUEST_BUFFER);
                         if (!ws_alive) {
                             if ($mod.hasWork(st)) {
                                 st.close_when_drained = true;
@@ -5138,14 +5211,14 @@ fn workerCount() usize {
                     var consumed: usize = 0;
                     var alive = true;
                     var head_pairs: [$mod.HEAD_PAIRS_MAX]$mod.HeadPair = undefined;
-                    if (!st.preface_checked) {
+                    if ($mod.CAPS.h2 and !st.preface_checked) {
                         switch ($mod.h2cSniffPreface(st.buf[0..st.len])) {
                             .h2c => { st.mode = .h2c; st.preface_checked = true; },
                             .h1 => st.preface_checked = true,
                             .wait => {},
                         }
                     }
-                    if (st.mode == .h2c) {
+                    if ($mod.CAPS.h2 and st.mode == .h2c) {
                         consumed = $mod.h2cProcess(st, st.buf[0..st.len]);
                         while ($mod.h2cPopReady(st)) |r| {
                             var head: $mod.Head = .{ .pairs = &head_pairs };
@@ -5157,7 +5230,7 @@ fn workerCount() usize {
                             arrived(&exchange);
                             $mod.pumpAlloc().free(r.raw);
                         }
-                    } else if (st.preface_checked) { while (consumed < st.len) {
+                    } else if (!$mod.CAPS.h2 or st.preface_checked) { while (consumed < st.len) {
                         var head: $mod.Head = .{ .pairs = &head_pairs };
                         const take = $mod.scanRequest(st.buf[consumed..st.len], &head) orelse break;
                         var exchange = $mod.Exchange{ .fd = fd, .st = st, .raw = st.buf[consumed .. consumed + take], .head = &head };
@@ -5174,7 +5247,7 @@ fn workerCount() usize {
                     st.len = $mod.retainTail(st.buf, st.len, consumed);
 
                     // Headers that never end are not a request this server can answer.
-                    if (alive and st.len == st.buf.len) alive = $mod.growReqBuf(st);
+                    if (alive and st.len == st.buf.len) alive = $mod.growReqBuf(st, $mod.REQUEST_BUFFER);
 
                     if (!alive) {
                         // A closing answer still in the queue drains first —
@@ -5224,7 +5297,7 @@ fn workerCount() usize {
             return .{ .failed = "Failed to spawn TLS accept thread" };
     }
 
-    if ($mod.h2c_listen_port != 0) {
+    if ($mod.CAPS.h2 and $mod.h2c_listen_port != 0) {
         const H2cAccept = struct {
             fn loop(kqs_ptr: *[$mod.MAX_WORKERS]i32, n: usize, next_ptr: *usize) void {
                 var h2c_listener = $mod.openListener($mod.h2c_listen_port) orelse return;
@@ -5527,7 +5600,7 @@ fn workerCount() usize {
                             if (!ws_alive) break;
                         }
                         st.len = $mod.retainTail(st.buf, st.len, ws_consumed);
-                        if (ws_alive and st.len == st.buf.len) ws_alive = $mod.growReqBuf(st);
+                        if (ws_alive and st.len == st.buf.len) ws_alive = $mod.growReqBuf(st, $mod.REQUEST_BUFFER);
                         if (!ws_alive) {
                             if ($mod.hasWork(st)) {
                                 st.close_when_drained = true;
@@ -5550,14 +5623,14 @@ fn workerCount() usize {
                     var consumed: usize = 0;
                     var alive = true;
                     var head_pairs: [$mod.HEAD_PAIRS_MAX]$mod.HeadPair = undefined;
-                    if (!st.preface_checked) {
+                    if ($mod.CAPS.h2 and !st.preface_checked) {
                         switch ($mod.h2cSniffPreface(st.buf[0..st.len])) {
                             .h2c => { st.mode = .h2c; st.preface_checked = true; },
                             .h1 => st.preface_checked = true,
                             .wait => {},
                         }
                     }
-                    if (st.mode == .h2c) {
+                    if ($mod.CAPS.h2 and st.mode == .h2c) {
                         consumed = $mod.h2cProcess(st, st.buf[0..st.len]);
                         while ($mod.h2cPopReady(st)) |r| {
                             var head: $mod.Head = .{ .pairs = &head_pairs };
@@ -5569,7 +5642,7 @@ fn workerCount() usize {
                             arrived(&exchange);
                             $mod.pumpAlloc().free(r.raw);
                         }
-                    } else if (st.preface_checked) { while (consumed < st.len) {
+                    } else if (!$mod.CAPS.h2 or st.preface_checked) { while (consumed < st.len) {
                         var head: $mod.Head = .{ .pairs = &head_pairs };
                         const take = $mod.scanRequest(st.buf[consumed..st.len], &head) orelse break;
                         var exchange = $mod.Exchange{ .fd = fd, .st = st, .raw = st.buf[consumed .. consumed + take], .head = &head };
@@ -5584,7 +5657,7 @@ fn workerCount() usize {
                     st.batching = false;
                     _ = $mod.flushPending(st);
                     st.len = $mod.retainTail(st.buf, st.len, consumed);
-                    if (alive and st.len == st.buf.len) alive = $mod.growReqBuf(st);
+                    if (alive and st.len == st.buf.len) alive = $mod.growReqBuf(st, $mod.REQUEST_BUFFER);
 
                     if (!alive) {
                         // A closing answer still in the queue drains first —
@@ -5771,6 +5844,11 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
         // semantics. A plain ring keeps each CQE = one fresh buffer.
         bufgrp: ?*Pool = null,
         ms_seen: bool = false,
+        // Some kernels let the multishot acceptor arm and deliver a few CQEs,
+        // then retire it and refuse every re-arm (Ubuntu 6.8 stock). When that
+        // happens the worker flips to one accept SQE per CQE — one extra SQE
+        // per connect, still in-ring, vs a dead listener.
+        accept_plain: bool = false,
         // The worker's db pool — conns share the parked-exchange load;
         // null slots mean PG_HOST was unreachable at startup and the db
         // routes fall through to the app's own handler.
@@ -5900,6 +5978,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                     return true;
                 }
             }
+            if (!$mod.ensureOneshotRoom(st)) return false;
             const buf = st.buf[st.len..];
             _ = w.ring.recv(@intFromPtr(st), st.fd, .{ .buffer = buf }, 0) catch {
                 _ = w.ring.submit() catch {};
@@ -6016,10 +6095,11 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                 }
                 return;
             }
-            if (st.ring_dead or (st.len == st.buf.len and !$mod.growReqBuf(st))) {
+            if (st.ring_dead or (st.len == st.buf.len and !$mod.growReqBuf(st, $mod.REQUEST_BUFFER))) {
                 w.teardown(st);
                 return;
             }
+            $mod.shrinkConnIdle(st);
             if (!w.submitRecv(st)) w.teardown(st);
         }
 
@@ -6089,10 +6169,20 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                     // quarter of the port (SO_REUSEPORT keeps hashing conns
                     // to it), so a full SQ is not an acceptable answer: push
                     // what's staged and try again.
-                    _ = w.ring.accept_multishot(ud, accept_fd, null, null, 0) catch {
-                        _ = w.ring.submit() catch {};
-                        _ = w.ring.accept_multishot(ud, accept_fd, null, null, 0) catch {};
-                    };
+                    if (w.accept_plain) {
+                        _ = w.ring.accept(ud, accept_fd, null, null, 0) catch |e|
+                            std.debug.print("Pump: plain accept re-arm refused ({s})\n", .{@errorName(e)});
+                    } else {
+                        _ = w.ring.accept_multishot(ud, accept_fd, null, null, 0) catch |e| {
+                            std.debug.print("Pump: accept re-arm refused ({s}) res={d} — retry after submit\n", .{ @errorName(e), cqe.res });
+                            _ = w.ring.submit() catch {};
+                            _ = w.ring.accept_multishot(ud, accept_fd, null, null, 0) catch |e2| {
+                                std.debug.print("Pump: multishot accept dead ({s}) — falling back to one-shot accept\n", .{@errorName(e2)});
+                                w.accept_plain = true;
+                                _ = w.ring.accept(ud, accept_fd, null, null, 0) catch {};
+                            };
+                        };
+                    }
                 }
                 return;
             }
@@ -6208,7 +6298,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                         if (consumed < buf.len and !st.ring_dead) {
                             const tail = buf[consumed..];
                             if (tail.len > st.buf.len) {
-                                while (st.buf.len < tail.len and $mod.growReqBuf(st)) {}
+                                while (st.buf.len < tail.len and $mod.growReqBuf(st, $mod.REQUEST_BUFFER)) {}
                                 if (tail.len > st.buf.len) st.ring_dead = true;
                             }
                             if (tail.len <= st.buf.len and !st.ring_dead) {
@@ -6268,7 +6358,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
         // wire. Each dispatch may free room; drain what fits and re-dispatch
         // until the hold empties or the buffer genuinely fills.
         fn drainRecvHold(w: *@This(), st: *$mod.ConnState) void {
-            while (!st.ring_dead and (st.len < st.buf.len or $mod.growReqBuf(st)) and st.recv_hold_off < st.recv_hold.items.len) {
+            while (!st.ring_dead and (st.len < st.buf.len or $mod.growReqBuf(st, $mod.REQUEST_BUFFER)) and st.recv_hold_off < st.recv_hold.items.len) {
                 const room = st.buf.len - st.len;
                 const avail = st.recv_hold.items.len - st.recv_hold_off;
                 const n = @min(room, avail);
@@ -6315,14 +6405,14 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                     if (!ws_alive) break;
                 }
                 st.len = $mod.retainTail(st.buf, st.len, ws_consumed);
-                if (ws_alive and st.len == st.buf.len) ws_alive = $mod.growReqBuf(st);
+                if (ws_alive and st.len == st.buf.len) ws_alive = $mod.growReqBuf(st, $mod.REQUEST_BUFFER);
                 if (!ws_alive) st.ring_dead = true;
                 return;
             }
 
             const consumed = w.dispatchHttpSlice(st, st.buf[0..st.len]);
             st.len = $mod.retainTail(st.buf, st.len, consumed);
-            if (!st.ring_dead and st.len == st.buf.len and !$mod.growReqBuf(st)) st.ring_dead = true;
+            if (!st.ring_dead and st.len == st.buf.len and !$mod.growReqBuf(st, $mod.REQUEST_BUFFER)) st.ring_dead = true;
         }
 
         // A poll CQE on a socket-BIO TLS conn. Handshake-era CQEs step
@@ -6351,7 +6441,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                             // want_read means OpenSSL is holding nothing.
                             const tls = st.ssl.?;
                             if (tls.ssl) |s| {
-                                while (st.len < st.buf.len or $mod.growReqBuf(st)) {
+                                while (st.len < st.buf.len or $mod.growReqBuf(st, $mod.REQUEST_BUFFER)) {
                                     switch (mod.sslMemRead(s, st.buf[st.len..])) {
                                         .read => |n| st.len += n,
                                         else => break,
@@ -6415,7 +6505,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                 st.ring_dead = true;
                 return;
             };
-            while (st.len < st.buf.len or $mod.growReqBuf(st)) {
+            while (st.len < st.buf.len or $mod.growReqBuf(st, $mod.REQUEST_BUFFER)) {
                 switch (mod.sslMemRead(s, st.buf[st.len..])) {
                     .read => |n| {
                         st.len += n;
@@ -6452,7 +6542,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                     .drained => {},
                 }
             }
-            if (st.ring_dead or (st.len == st.buf.len and !$mod.growReqBuf(st))) {
+            if (st.ring_dead or (st.len == st.buf.len and !$mod.growReqBuf(st, $mod.REQUEST_BUFFER))) {
                 w.teardown(st);
                 return;
             }
@@ -6465,7 +6555,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
         // ConnState.buf borrows carry today. Returns bytes consumed; a dying
         // conn sets st.ring_dead rather than reporting it out of band.
         fn dispatchHttpSlice(w: *@This(), st: *$mod.ConnState, bytes: []const u8) usize {
-            if (!st.preface_checked) {
+            if ($mod.CAPS.h2 and !st.preface_checked) {
                 switch ($mod.h2cSniffPreface(bytes)) {
                     .h2c => { st.mode = .h2c; st.preface_checked = true; },
                     .h1 => st.preface_checked = true,
@@ -6474,7 +6564,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                     .wait => return 0,
                 }
             }
-            if (st.mode == .h2c) {
+            if ($mod.CAPS.h2 and st.mode == .h2c) {
                 const taken = $mod.h2cProcess(st, bytes);
                 // Completions queue inside h2cProcess — the `arrived` arm
                 // only binds in ~proc scope, so they fire here.
@@ -6904,11 +6994,11 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                 }
             else
                 -1;
-            const h2c_listen_fd: $mod.posix.fd_t = if ($mod.h2c_listen_port != 0)
+            const h2c_listen_fd: $mod.posix.fd_t = if ($mod.CAPS.h2 and $mod.h2c_listen_port != 0)
                 $mod.openReusePortListener($mod.h2c_listen_port) orelse
                     std.debug.panic("Pump: io_uring worker failed to listen on :{}\n", .{$mod.h2c_listen_port})
             else -1;
-            const h2_tls_listen_fd: $mod.posix.fd_t = if ($mod.h2_tls_listen_port != 0)
+            const h2_tls_listen_fd: $mod.posix.fd_t = if ($mod.CAPS.h2 and $mod.h2_tls_listen_port != 0)
                 $mod.openReusePortListener($mod.h2_tls_listen_port) orelse {
                     std.debug.print("Pump: io_uring worker failed to listen on :{}\n", .{$mod.h2_tls_listen_port});
                     return;
@@ -6916,11 +7006,14 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
             else
                 -1;
             var w = @This(){ .ring = ring, .listen_fd = listen_fd, .tls_listen_fd = tls_listen_fd, .h2c_listen_fd = h2c_listen_fd, .h2_tls_listen_fd = h2_tls_listen_fd };
-            // 1024 pool buffers of 8K per worker — far more than the deepest
-            // CQE batch (512) can hold hostage, since each buffer is recycled
-            // the moment its CQE is processed. Requests bigger than a buffer
+            // POOL_COUNT pool buffers of POOL_BUFS per worker — far more than
+            // a CQE batch can hold hostage, since each buffer is recycled the
+            // moment its CQE is processed. Requests bigger than a buffer
             // simply arrive as several CQEs; st.buf accumulates them.
-            var bg_store: ?Pool = Pool.init(&w.ring, 8192, 1024) catch |e| blk: {
+            var bg_store: ?Pool = if ($mod.posix.getenv("KORU_PUMP_NOPOOL") != null) blk: {
+                std.debug.print("Pump: provided-buffer pool skipped (KORU_PUMP_NOPOOL) — conns use one-shot recv\n", .{});
+                break :blk null;
+            } else Pool.init(&w.ring, $mod.POOL_BUFS, $mod.POOL_COUNT) catch |e| blk: {
                 std.debug.print("Pump: provided-buffer pool refused ({s}) — conns use one-shot recv\n", .{@errorName(e)});
                 break :blk null;
             };
@@ -6928,10 +7021,15 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                 w.bufgrp = bg;
                 std.debug.print("Pump: buffer pool armed\n", .{});
             }
-            _ = w.ring.accept_multishot($mod.URING_ACCEPT, listen_fd, null, null, 0) catch {
-                std.debug.print("Pump: io_uring accept arm failed\n", .{});
-                return;
-            };
+            w.accept_plain = $mod.posix.getenv("KORU_PUMP_PLAINACCEPT") != null;
+            if (w.accept_plain or (w.ring.accept_multishot($mod.URING_ACCEPT, listen_fd, null, null, 0) catch null) == null) {
+                if (!w.accept_plain) std.debug.print("Pump: multishot accept refused at arm — using plain accept\n", .{});
+                w.accept_plain = true;
+                _ = w.ring.accept($mod.URING_ACCEPT, listen_fd, null, null, 0) catch {
+                    std.debug.print("Pump: io_uring accept arm failed\n", .{});
+                    return;
+                };
+            }
             if (h2c_listen_fd >= 0) {
                 _ = w.ring.accept_multishot($mod.URING_ACCEPT_H2C, h2c_listen_fd, null, null, 0) catch {
                     std.debug.print("Pump: io_uring h2c accept arm failed\n", .{});
@@ -7062,6 +7160,11 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
         // back to one-shot st.buf recvs.
         bufgrp: ?*Pool = null,
         ms_seen: bool = false,
+        // Some kernels let the multishot acceptor arm and deliver a few CQEs,
+        // then retire it and refuse every re-arm (Ubuntu 6.8 stock). When that
+        // happens the worker flips to one accept SQE per CQE — one extra SQE
+        // per connect, still in-ring, vs a dead listener.
+        accept_plain: bool = false,
         // The worker's db pool — conns share the parked-exchange load;
         // null slots mean PG_HOST was unreachable at startup and the db
         // routes fall through to the app's own handler.
@@ -7174,6 +7277,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                     return true;
                 }
             }
+            if (!$mod.ensureOneshotRoom(st)) return false;
             const buf = st.buf[st.len..];
             _ = w.ring.recv(@intFromPtr(st), st.fd, .{ .buffer = buf }, 0) catch {
                 _ = w.ring.submit() catch {};
@@ -7271,7 +7375,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                 }
                 return;
             }
-            if (st.ring_dead or (st.len == st.buf.len and !$mod.growReqBuf(st))) {
+            if (st.ring_dead or (st.len == st.buf.len and !$mod.growReqBuf(st, $mod.REQUEST_BUFFER))) {
                 w.teardown(st);
                 return;
             }
@@ -7627,10 +7731,20 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                     }
                 }
                 if (cqe.flags & linux.IORING_CQE_F_MORE == 0) {
-                    _ = w.ring.accept_multishot(ud, w.listen_fd, null, null, 0) catch {
-                        _ = w.ring.submit() catch {};
-                        _ = w.ring.accept_multishot(ud, w.listen_fd, null, null, 0) catch {};
-                    };
+                    if (w.accept_plain) {
+                        _ = w.ring.accept(ud, w.listen_fd, null, null, 0) catch |e|
+                            std.debug.print("Pump: plain accept re-arm refused ({s})\n", .{@errorName(e)});
+                    } else {
+                        _ = w.ring.accept_multishot(ud, w.listen_fd, null, null, 0) catch |e| {
+                            std.debug.print("Pump: accept re-arm refused ({s}) res={d} — retry after submit\n", .{ @errorName(e), cqe.res });
+                            _ = w.ring.submit() catch {};
+                            _ = w.ring.accept_multishot(ud, w.listen_fd, null, null, 0) catch |e2| {
+                                std.debug.print("Pump: multishot accept dead ({s}) — falling back to one-shot accept\n", .{@errorName(e2)});
+                                w.accept_plain = true;
+                                _ = w.ring.accept(ud, w.listen_fd, null, null, 0) catch {};
+                            };
+                        };
+                    }
                 }
                 return;
             }
@@ -7721,7 +7835,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                         if (consumed < buf.len and !st.ring_dead) {
                             const tail = buf[consumed..];
                             if (tail.len > st.buf.len) {
-                                while (st.buf.len < tail.len and $mod.growReqBuf(st)) {}
+                                while (st.buf.len < tail.len and $mod.growReqBuf(st, $mod.REQUEST_BUFFER)) {}
                                 if (tail.len > st.buf.len) st.ring_dead = true;
                             }
                             if (tail.len <= st.buf.len and !st.ring_dead) {
@@ -7768,7 +7882,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
         }
 
         fn drainRecvHold(w: *@This(), st: *$mod.ConnState) void {
-            while (!st.ring_dead and (st.len < st.buf.len or $mod.growReqBuf(st)) and st.recv_hold_off < st.recv_hold.items.len) {
+            while (!st.ring_dead and (st.len < st.buf.len or $mod.growReqBuf(st, $mod.REQUEST_BUFFER)) and st.recv_hold_off < st.recv_hold.items.len) {
                 const room = st.buf.len - st.len;
                 const avail = st.recv_hold.items.len - st.recv_hold_off;
                 const n = @min(room, avail);
@@ -7786,7 +7900,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
         fn dispatchReadable(w: *@This(), st: *$mod.ConnState) void {
             const consumed = w.dispatchH1(st, st.buf[0..st.len]);
             st.len = $mod.retainTail(st.buf, st.len, consumed);
-            if (!st.ring_dead and st.len == st.buf.len and !$mod.growReqBuf(st)) st.ring_dead = true;
+            if (!st.ring_dead and st.len == st.buf.len and !$mod.growReqBuf(st, $mod.REQUEST_BUFFER)) st.ring_dead = true;
         }
 
         // h1 only — no preface sniff, no h2c, no ws. Same scan loop as
@@ -7882,10 +7996,15 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
                 w.bufgrp = bg;
                 std.debug.print("Pump: buffer pool armed\n", .{});
             }
-            _ = w.ring.accept_multishot($mod.URING_ACCEPT, listen_fd, null, null, 0) catch {
-                std.debug.print("Pump: io_uring accept arm failed\n", .{});
-                return;
-            };
+            w.accept_plain = $mod.posix.getenv("KORU_PUMP_PLAINACCEPT") != null;
+            if (w.accept_plain or (w.ring.accept_multishot($mod.URING_ACCEPT, listen_fd, null, null, 0) catch null) == null) {
+                if (!w.accept_plain) std.debug.print("Pump: multishot accept refused at arm — using plain accept\n", .{});
+                w.accept_plain = true;
+                _ = w.ring.accept($mod.URING_ACCEPT, listen_fd, null, null, 0) catch {
+                    std.debug.print("Pump: io_uring accept arm failed\n", .{});
+                    return;
+                };
+            }
 
             // The db conn joins the ring as a peer — a readable CQE on it
             // means parked exchanges can resume. Blocking only through the
@@ -8143,7 +8262,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
             x.keep_alive = false;
             return .{ .broken = "write failed" };
         }
-        st.mode = .ws;
+        if ($mod.CAPS.ws) st.mode = .ws;
         // Frames must not join a still-batching queue: wsSendFrame holds ws_mu,
         // and appendPending's ws-mode guard would try to take it again. The
         // head is flushed now — order on the wire is head, then this frame.
@@ -8230,7 +8349,7 @@ fn ringWaitTimeout(ring: *std.os.linux.IoUring, wait_nr: u32, timeout_ns: i64) !
     // 101 it is websocket payload, framed, never raw bytes on the wire.
     if (head.len >= 13 and std.mem.eql(u8, head[0..13], "HTTP/1.1 101 ")) {
         if (x.st) |st| {
-            st.mode = .ws;
+            if ($mod.CAPS.ws) st.mode = .ws;
             if (body.len > 0) {
                 if (!$mod.wsSendUk(st, 0x1, body)) x.keep_alive = false;
             }
